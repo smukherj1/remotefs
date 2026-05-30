@@ -140,6 +140,8 @@ The MVP ships as Linux x86_64 binaries for self-hosted runners with FUSE support
 - `rfs`, the user-facing CLI.
 - `rfsd`, the mount daemon that owns the FUSE mount and local session state.
 
+The MVP supports at most one active RemoteFS mount per `RFS_HOME` on a machine. Starting another mount with the same `RFS_HOME` while a session is active must fail with a clear error. Operators that need concurrent mounts during MVP evaluation can use separate `RFS_HOME` values.
+
 The CLI must cover both ingestion and materialization workflows:
 
 - Upload a local directory and return a root digest.
@@ -207,7 +209,7 @@ If a job uploads the entire working directory, unchanged remote-backed source fi
 ### Incremental Snapshot Creation
 
 - The client must be able to snapshot the full merged workspace.
-- Snapshot creation must upload only blobs and tree nodes missing from the project.
+- Snapshot creation must upload only blobs and tree nodes missing from the configured Remote Execution API CAS instance.
 - Unchanged remote-backed content must remain referenced by digest.
 - Creates, modifies, deletes, renames, and metadata changes should rewrite only affected Merkle tree nodes and their ancestors.
 - Upload should be parallel, streaming, and able to handle large directories without loading all file contents into memory.
