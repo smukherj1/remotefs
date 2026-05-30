@@ -8,7 +8,7 @@ The core product idea is to replace expensive repeated checkout and cache restor
 
 - File blobs are addressed by SHA-256 of their byte contents.
 - Filesystem snapshots are represented as Merkle trees of directory metadata and child references.
-- A snapshot is identified only by its root digest.
+- A snapshot is identified only by its structured root digest, represented to users as `sha256:<hex>/<size>`.
 - CI/CD systems are responsible for maintaining their own mapping from commits, branches, builds, cache keys, or job IDs to RemoteFS root digests.
 
 The MVP is intended to validate whether lazy CI workspace materialization and incremental snapshot upload can materially reduce CI setup time, remote data transfer, and incremental build time.
@@ -19,8 +19,8 @@ The primary users are CI/CD infrastructure and build platform teams operating Li
 
 These teams are responsible for:
 
-- Installing and operating the RemoteFS service.
-- Installing the RemoteFS CLI/FUSE client on runners.
+- Installing and operating a Remote Execution API compatible content-addressable storage service.
+- Installing the RemoteFS CLI/FUSE client and mount daemon on runners.
 - Deciding which source and output snapshots to use for a job.
 - Persisting root digests in their own CI metadata systems.
 - Comparing RemoteFS-backed builds against existing checkout/cache workflows.
@@ -48,7 +48,7 @@ RemoteFS should allow a CI job to begin with a usable filesystem view immediatel
 - Upload local changes and new outputs as a new immutable snapshot without re-uploading unchanged content.
 - Reuse existing blobs and unchanged Merkle subtrees by digest.
 - Support repeated CI jobs that reuse previous source and output snapshots for incremental builds.
-- Provide enough client-side and service-side observability for CI infrastructure teams to evaluate performance and diagnose failures.
+- Provide enough client-side observability, and enough visibility into the configured CAS, for CI infrastructure teams to evaluate performance and diagnose failures.
 - Keep the MVP lean by avoiding CI metadata ownership, hosted-runner support, enterprise security, retention, and managed-service concerns.
 
 ## Non-Goals
@@ -63,6 +63,7 @@ The MVP will not provide:
 - Service-managed snapshot names, refs, aliases, metadata search, or lifecycle state.
 - Authentication, authorization, TLS, SSO, audit logs, or enterprise security controls.
 - Snapshot retention policies or garbage collection.
+- A custom RemoteFS storage service.
 - Managed SaaS deployment.
 - High availability, replication, or cross-node durability guarantees.
 - Block-level copy-on-write.
@@ -75,13 +76,15 @@ These items may be addressed after the MVP if the core workflow proves valuable.
 
 ### Blobs
 
-Regular file contents are stored as content-addressed blobs. A blob digest is the SHA-256 hash of the file bytes only.
+Regular file contents are stored as content-addressed blobs in a Remote Execution API compatible content-addressable store. A blob digest contains both the SHA-256 hash of the file bytes and the blob size.
 
 Identical file contents should deduplicate even when the files appear at different paths or have different filesystem metadata.
 
 ### Filesystem Snapshots
 
 A filesystem snapshot is an immutable Merkle tree rooted at a digest.
+
+MVP snapshots use the Remote Execution API `Directory` model as their tree encoding. RemoteFS defines a constrained profile of that model for supported node types, metadata, and digest behavior.
 
 Directory/tree nodes include enough metadata to reconstruct the supported filesystem view, including:
 
@@ -95,11 +98,11 @@ Directory/tree nodes include enough metadata to reconstruct the supported filesy
 
 Mtimes are part of snapshot state because many incremental build systems use timestamps for correctness.
 
-The exact Merkle encoding is a technical design concern, but snapshots created by MVP clients must remain readable by later MVP versions.
+Snapshots created by MVP clients must remain readable by later MVP versions.
 
 ### Snapshot Identity
 
-The root digest is the only RemoteFS-provided snapshot identifier.
+The root digest is the only RemoteFS-provided snapshot identifier. It is represented as `sha256:<64-lowercase-hex>/<decimal-size-bytes>`.
 
 RemoteFS must not own CI/CD naming, metadata, refs, aliases, or lookup semantics. CI/CD systems are responsible for storing mappings such as:
 
@@ -110,28 +113,32 @@ RemoteFS must not own CI/CD naming, metadata, refs, aliases, or lookup semantics
 
 RemoteFS may provide direct validation or lookup by digest, but it must not become a metadata database.
 
+Root digests are capability references, not durable backup handles. A root digest can be mounted only while the configured content-addressable store still contains the root object and all reachable child objects. MVP deployments must disable remote CAS eviction or provision enough remote CAS capacity for snapshots they intend to reuse.
+
 ## MVP Components
 
-### RemoteFS Service
+### Remote Execution API CAS
 
-The service stores blobs and Merkle tree nodes for one logical project namespace.
+RemoteFS uses an external Remote Execution API compatible content-addressable storage service for blobs and Merkle tree nodes.
 
-MVP deployment is customer self-hosted. The initial supported storage backend is local filesystem disk. The storage layer should be designed as pluggable, but no production object-store backend is required for MVP.
+The default MVP evaluation target is `bazel-remote`. Buildbarn storage is the secondary compatibility target.
 
-The service must support:
+The configured CAS must support:
 
-- Uploading blobs addressed by SHA-256 digest.
+- Uploading blobs addressed by SHA-256 digest and size.
 - Uploading and retrieving Merkle tree nodes.
 - Retrieving blobs and tree nodes by digest.
 - Batch existence checks by digest to support deduplicating uploads.
-- Creating new snapshot roots from uploaded or composed tree data.
 - Concurrent reads of immutable snapshots.
 - Idempotent concurrent uploads of the same blob or tree node.
 - Single-node crash-safe object writes so completed objects are not corrupted by process failure.
 
-### Linux CLI/FUSE Client
+### Linux CLI/FUSE Client and Daemon
 
-The MVP client ships primarily as a single Linux CLI binary for x86_64 self-hosted runners with FUSE support.
+The MVP ships as Linux x86_64 binaries for self-hosted runners with FUSE support:
+
+- `rfs`, the user-facing CLI.
+- `rfsd`, the mount daemon that owns the FUSE mount and local session state.
 
 The CLI must cover both ingestion and materialization workflows:
 
@@ -139,9 +146,9 @@ The CLI must cover both ingestion and materialization workflows:
 - Mount a root digest at a local mount point as a lazy filesystem.
 - Present a writable copy-on-write view over the immutable remote snapshot.
 - Snapshot a mounted or local workspace and return a new root digest.
-- Expose diagnostics for service reachability, cache behavior, mount state, and transfer behavior.
+- Expose diagnostics for CAS reachability, cache behavior, mount state, and transfer behavior.
 
-The underlying service protocol is experimental and may change during MVP. The CLI workflow is the main product interface.
+The storage protocol is the Remote Execution API. The CLI workflow is the main product interface.
 
 ## Core Workflows
 
@@ -160,12 +167,12 @@ RemoteFS does not need to improve first-build performance. The MVP optimizes rep
 A repeat build can use RemoteFS snapshots:
 
 1. CI/CD system resolves the desired root digest from its own metadata.
-2. Runner starts the RemoteFS service/client configuration for the project.
-3. CLI mounts the root digest into the job workspace.
+2. Runner has access to a configured Remote Execution API CAS endpoint.
+3. `rfs mount` mounts the root digest into the job workspace.
 4. Build tools access the mounted filesystem normally.
 5. Directory metadata and file contents are fetched lazily as needed.
 6. Writes are captured in a local copy-on-write overlay.
-7. At the end of the job, the CLI snapshots selected paths or the full merged workspace.
+7. At the end of the job, the CLI snapshots the full merged workspace.
 8. The CLI uploads only new or changed content and returns a new root digest.
 9. CI/CD system records that digest externally for future jobs.
 
@@ -180,7 +187,7 @@ If a job uploads the entire working directory, unchanged remote-backed source fi
 ### Lazy Mounting
 
 - Mounting an existing root digest must not eagerly download file contents.
-- Mounting should complete in under 2 seconds for snapshots up to 1 million files, assuming a healthy runner and reachable service.
+- Mounting should complete in under 2 seconds for snapshots up to 1 million files, assuming a healthy runner and reachable CAS.
 - Directory metadata should be fetched lazily during lookup and directory traversal.
 - Directory metadata should be cached locally after fetch.
 - File contents should be fetched on first read unless already present in the local cache.
@@ -199,7 +206,7 @@ If a job uploads the entire working directory, unchanged remote-backed source fi
 
 ### Incremental Snapshot Creation
 
-- The client must be able to snapshot selected paths or the full merged workspace.
+- The client must be able to snapshot the full merged workspace.
 - Snapshot creation must upload only blobs and tree nodes missing from the project.
 - Unchanged remote-backed content must remain referenced by digest.
 - Creates, modifies, deletes, renames, and metadata changes should rewrite only affected Merkle tree nodes and their ancestors.
@@ -219,7 +226,7 @@ The MVP must support:
 
 The MVP excludes:
 
-- Hard links.
+- Hard-link identity. Hard-linked regular files may deduplicate by content digest, but link identity is not preserved.
 - Device files.
 - FIFOs.
 - Sockets.
@@ -242,7 +249,8 @@ For supported features, a build run against a RemoteFS copy-on-write mount shoul
 - The FUSE client must maintain a persistent runner-local cache across CI jobs.
 - Blob cache entries are keyed by content digest.
 - Directory/tree metadata cache entries are keyed by tree digest.
-- Cache size and eviction policy must be configurable.
+- Cache location must be configurable.
+- Automatic local cache eviction may be deferred in the earliest MVP, but evaluation-ready builds must provide a bounded local cache or documented manual pruning workflow.
 - Cache hit/miss behavior must be observable.
 
 ### Failure Behavior
@@ -268,7 +276,7 @@ The client should emit structured logs and metrics for:
 - Digest verification failures.
 - Slow paths or high-latency operations.
 
-The service should expose basic metrics for:
+The configured CAS may expose its own metrics for:
 
 - Request count and latency.
 - Error rates.
@@ -305,10 +313,10 @@ MVP success should be measured by:
 
 ## Deployment Assumptions
 
-- Customer runs the RemoteFS service themselves.
-- Service initially stores data on local filesystem disk.
+- Customer runs a Remote Execution API compatible CAS themselves.
+- The default MVP CAS deployment uses `bazel-remote` with remote eviction disabled or enough capacity for retained evaluation snapshots.
 - Runners are Linux x86_64 machines with FUSE support.
-- CI jobs can install and execute the RemoteFS CLI.
+- CI jobs can install and execute `rfs` and `rfsd`.
 - CI/CD systems maintain their own root-digest metadata.
 - MVP environments are trusted enough that auth, TLS, and multi-user security are not required for initial validation.
 
@@ -329,10 +337,33 @@ The following should be considered soon after MVP validation:
 - Broader POSIX metadata support.
 - High availability and replicated durability.
 
+## Milestones
+
+### Milestone 1: Read-Only Lazy Mount
+
+The first implementation milestone should prove the end-to-end storage and filesystem path:
+
+1. Upload a local directory into the configured CAS.
+2. Return a root digest in `sha256:<hex>/<size>` form.
+3. Mount that root digest read-only.
+4. Fetch directory metadata lazily.
+5. Fetch and verify file blobs on first read.
+6. Remount the uploaded root successfully.
+
+### Milestone 2: Writable Copy-on-Write Workspace
+
+The second implementation milestone should add writable workspace behavior:
+
+1. Track local creates, writes, deletes, renames, and metadata changes.
+2. Use whole-file copy-on-write for first mutation of remote-backed files.
+3. Snapshot the full merged workspace through the live mount daemon.
+4. Upload only missing blobs and directory nodes.
+5. Return a new root digest that can be mounted by a later job.
+
 ## Open Questions
 
 - What concrete baseline repositories and build workloads will be used to validate MVP performance?
-- What cache eviction policy should be the default for self-hosted runners?
+- What local runner cache eviction policy should be the default for self-hosted runners?
 - Should snapshot composition from existing subtree digests be exposed as an explicit CLI capability in MVP, or only emerge through upload/snapshot behavior?
 - What minimum Linux kernel and FUSE versions should be supported?
 - What is the acceptable local disk overhead for overlay data and persistent cache during a CI job?
