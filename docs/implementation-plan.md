@@ -1,6 +1,6 @@
 # RemoteFS Implementation Plan
 
-This plan breaks the PRD and technical design into small implementation steps. Each step should leave the repo buildable, add tests at the lowest useful layer first, and then add integration or end-to-end coverage as soon as the behavior crosses a process, CAS, daemon, or FUSE boundary.
+This plan breaks the PRD.md and docs/technical-design.md into small implementation steps. Each step should leave the repo buildable, add tests at the lowest useful layer first, and then add integration or end-to-end coverage as soon as the behavior crosses a process, CAS, daemon, or FUSE boundary.
 
 The intended implementation order is:
 

@@ -1,0 +1,27 @@
+version: '3'
+
+tasks:
+  fmt:
+    desc: Format the codebase
+    cmds:
+      - cargo fmt --all -- --check
+
+  lint:
+    desc: Lint the codebase
+    cmds:
+      - cargo clippy --all-targets -- -D warnings
+
+  build:
+    desc: Build both rfs and rfsd binaries
+    cmds:
+      - cargo build
+
+  test:
+    desc: Run all tests (unit and integration)
+    cmds:
+      - cargo test
+
+  test:unit:
+    desc: Run only unit tests
+    cmds:
+      - cargo test --lib
