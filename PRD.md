@@ -147,7 +147,7 @@ The CLI must cover both ingestion and materialization workflows:
 - Upload a local directory and return a root digest.
 - Mount a root digest at a local mount point as a lazy filesystem.
 - Present a writable copy-on-write view over the immutable remote snapshot.
-- Snapshot a mounted or local workspace and return a new root digest.
+- Snapshot a mounted RemoteFS workspace through the live daemon and return a new root digest.
 - Expose diagnostics for CAS reachability, cache behavior, mount state, and transfer behavior.
 
 The storage protocol is the Remote Execution API. The CLI workflow is the main product interface.

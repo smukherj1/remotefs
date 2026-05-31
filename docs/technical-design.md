@@ -50,15 +50,42 @@ The MVP profile excludes:
 
 Entries must use REAPI canonical ordering. Upload and snapshot must share the same encoder so bootstrap uploads and mounted workspace snapshots produce compatible trees.
 
+Upload and snapshot also share a narrow tree-writer abstraction for canonical directory encoding, deterministic digest calculation, CAS existence checks, batch/ByteStream upload selection, counters, and metadata warnings. Input traversal remains separate: `rfs upload` walks a local directory, while daemon snapshot walks the merged overlay graph after the snapshot barrier.
+
 ## CAS Target
 
 The default development and evaluation target is `bazel-remote`.
 
-RemoteFS uses the Remote Execution API `instance_name` field as the CAS namespace selector. The MVP supports a configurable `--instance-name`, defaulting to the empty instance name for simple `bazel-remote` development setups. RemoteFS should not introduce a separate storage namespace concept such as "project"; CI/CD systems remain responsible for mapping their own projects, repositories, commits, cache keys, and builds to root digests and CAS instance configuration.
+RemoteFS uses the Remote Execution API `instance_name` field as the CAS namespace selector. The MVP requires a non-empty `--instance-name`; there is no RemoteFS-level default empty instance. RemoteFS should not introduce a separate storage namespace concept such as "project"; CI/CD systems remain responsible for mapping their own projects, repositories, commits, cache keys, and builds to root digests and CAS instance configuration.
+
+ByteStream resource names use the standard uncompressed REAPI forms:
+
+- Read: `{instance_name}/blobs/{hash}/{size}`
+- Write: `{instance_name}/uploads/{uuid}/blobs/{hash}/{size}`
+
+RemoteFS generates a fresh UUID v4 per ByteStream upload attempt. The MVP does not use compressed ByteStream resource names, digest-function prefixes, or optional metadata. `instance_name` validation rejects empty values and path segments that equal reserved REAPI resource keywords such as `blobs`, `uploads`, and `compressed-blobs`.
 
 MVP deployments must run the remote CAS with eviction disabled or enough capacity to keep all objects reachable from snapshots they intend to reuse. REAPI CAS does not provide snapshot retention roots or safe reachability garbage collection by itself.
 
 Root digests are therefore capability references. They are valid only while the CAS still contains the root object and all reachable descendants.
+
+CAS client calls use conservative retry and timeout defaults for CI network resilience:
+
+- Per-attempt timeouts default to 10 seconds for `FindMissingBlobs` and 30 seconds for `BatchReadBlobs` and `BatchUpdateBlobs`.
+- ByteStream read/write uses a 30 second idle timeout rather than one whole-stream timeout in the MVP.
+- Retries are limited to transient transport or server failures: unavailable, deadline exceeded, resource exhausted, aborted, and internal errors that indicate a transport reset.
+- Semantic and authorization failures are not retried: not found after mount validation, invalid argument, permission denied, unauthenticated, digest mismatch, and failed precondition.
+- Exponential backoff with jitter starts at 100 ms, then 250 ms, 500 ms, and 1 second, with at most 5 attempts by default.
+- ByteStream retries restart from byte 0 in the MVP. Partial stream resume is deferred.
+- Final errors include the operation name, digest or resource name when relevant, attempt count, CAS URL, and `instance_name`.
+
+Small blob and directory uploads use `BatchUpdateBlobs` packing to reduce RPC overhead:
+
+- The default batch/ByteStream split is 4 MiB.
+- The default serialized batch request budget is 3.5 MiB and is configurable for compatibility testing.
+- Small blob and directory-node entries are packed into a request until the next entry would exceed the serialized budget, then a new request starts.
+- A near-threshold entry that cannot fit in the serialized batch budget by itself is uploaded through ByteStream.
+- Entry order within a `BatchUpdateBlobs` request is not semantically significant and is not part of RemoteFS determinism guarantees. Determinism is required for tree encoding, root digests, and user-visible summaries.
 
 ## Process Model
 
@@ -71,7 +98,6 @@ rfs snapshot [mountpoint]
 rfs unmount [mountpoint]
 rfs status [mountpoint]
 rfs cleanup
-rfs doctor
 ```
 
 `rfsd` owns:
@@ -88,7 +114,15 @@ rfs doctor
 
 The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires an active-session lock under `RFS_HOME` before starting `rfsd`; if another live session owns that lock, the mount fails and reports the active session metadata. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts can still be run by using distinct `RFS_HOME` values.
 
-`rfs snapshot`, `rfs status`, and `rfs unmount` talk to the live daemon through the active session's Unix control socket discovered from `RFS_HOME`. Their mountpoint argument is optional in the MVP. If supplied, the CLI validates that it matches the active session mountpoint before sending the request.
+`rfs snapshot`, `rfs status`, and `rfs unmount` discover session state from `RFS_HOME`. Their mountpoint argument is optional in the MVP. If supplied, the CLI validates that it matches the active session mountpoint before sending the request.
+
+`rfs status` reports only session state:
+
+- If a live active session exists, it talks to the daemon through the active session's Unix control socket and reports mountpoint, root digest, daemon pid/socket, cache/session paths, counters, dirty state, and snapshot blockers.
+- If no live session exists but previous `RFS_HOME/active/` state remains, it reports previous/stale session metadata and cleanup guidance.
+- If no live or previous session state exists, it reports a clean no-session state.
+
+RemoteFS does not include `rfs doctor` in the MVP. Configuration, CAS, path, FUSE, and root-digest validation happen in the commands that need them: `upload`, `mount`, `snapshot`, and `unmount`.
 
 ## Local State Layout
 
@@ -108,7 +142,8 @@ $HOME/.rfs/
     overlay/
     control.sock
     metadata.json
-  logs/
+    logs/
+      rfsd.log
 ```
 
 Config overrides:
@@ -128,7 +163,7 @@ Active session state is isolated under `RFS_HOME/active/`:
 - Control socket.
 - Session logs and metadata.
 
-Only one active session may exist for an `RFS_HOME` at a time. Clean unmount leaves `RFS_HOME/active/` in place for inspection, including the session database, logs, and overlay data. A later `rfs mount` fails if stale active state exists without a live lock and tells the operator to run `rfs cleanup`. `rfs cleanup` refuses to run while a live active-session lock exists, and removes stale `RFS_HOME/active/` when no session is active.
+Only one active session may exist for an `RFS_HOME` at a time. Clean unmount leaves `RFS_HOME/active/` in place for inspection, including the session database, logs, and overlay data. A later `rfs mount` fails if stale active state exists without a live lock and tells the operator to run `rfs cleanup`. `rfs status` can inspect and report that previous/stale state. `rfs cleanup` refuses to run while a live active-session lock exists, and removes stale `RFS_HOME/active/` when no session is active.
 
 Local cache eviction is deferred. The earliest MVP may provide manual pruning only. Remote CAS eviction is a deployment concern and must be disabled or capacity-provisioned during MVP evaluation.
 
@@ -208,6 +243,15 @@ The physical overlay data directory stores local file contents. It is not the on
 
 Writes only mark file content dirty. Dirty and new files are hashed at snapshot time.
 
+SQLite remains the source of truth for visible overlay state. Each logical filesystem mutation uses one SQLite transaction, but large file IO and remote fetches stay outside SQLite transactions where possible:
+
+- Metadata-only operations such as `chmod`, `utimens`, `mkdir`, unlink/tombstone, and rename metadata commit as one SQLite transaction.
+- Local file create, truncate, and write update file data first, then commit metadata and dirty-state in one SQLite transaction after the file operation succeeds.
+- First-write copy-up ensures the verified blob cache, copies the remote blob to a temporary overlay file, applies the requested write or truncate, atomically renames the temp file into the overlay data directory, then commits one SQLite transaction recording copied-up state, dirty content, and dirty ancestors.
+- If the SQLite commit fails after overlay file rename, the orphan overlay file is not visible without database state. A cleanup path may remove unreferenced overlay files later.
+- Rename and delete directory mutations update all affected overlay rows and dirty ancestors in one SQLite transaction.
+- Snapshot opens a short read transaction only after the snapshot barrier passes, so it sees a consistent overlay graph.
+
 ## Copy-on-Write
 
 Remote snapshots are immutable.
@@ -219,7 +263,7 @@ The first mutation of a remote-backed file performs whole-file copy-on-write:
 3. Apply the write, truncate, or metadata mutation locally.
 4. Mark the file and affected ancestors dirty in SQLite.
 
-Whole-file COW is the only MVP write strategy. Large-file COW should emit structured diagnostics and may later support a configurable size guardrail.
+Whole-file COW is the only MVP write strategy. Large-file COW emits structured warnings by default and proceeds with copy-up; a configurable hard size guardrail can be added later as an explicit opt-in.
 
 ## Delete and Rename
 
@@ -228,11 +272,17 @@ Deletes are tombstone-based and session-local. They never remove objects from re
 Rename semantics are scoped to one mounted workspace:
 
 - File rename within the same mount is supported.
-- Directory rename within the same mount is supported.
+- Empty-directory rename within the same mount is supported.
+- Directory rename within the same mount is supported when the destination does not exist.
 - Rename over existing files follows normal Unix replacement behavior.
 - Rename over non-empty directories is rejected.
+- File-over-directory and directory-over-file renames are rejected with normal Unix-style errors.
+- Moving a directory into itself or one of its descendants is rejected.
 - Cross-mount atomic rename is unsupported and should return a clear cross-device error if encountered.
+- Rename preserves inode identity for the renamed source within one mounted workspace.
+- If the destination existed, its old path becomes tombstoned/replaced in overlay state.
 - Snapshot reflects final path state, not rename history.
+- Open file handles follow Unix semantics: an already-open file handle remains usable for that file object, while path lookup observes the new name or replacement.
 
 ## Symlinks and Hard Links
 
@@ -257,14 +307,29 @@ Mtime preservation is mandatory for supported files and directories.
 
 Implementation rules:
 
-- Store timestamps as seconds and nanoseconds internally.
+- Store timestamps internally as signed seconds plus normalized nanoseconds, where nanoseconds are always `0..999_999_999`.
 - Store SQLite timestamp fields as integer seconds and integer nanoseconds, not text.
+- Preserve valid pre-1970 mtimes; negative timestamp seconds represent times before the Unix epoch.
+- Encode mtimes into REAPI `NodeProperties` using protobuf `Timestamp`.
+- Reject timestamps outside the protobuf `Timestamp` range or with invalid nanoseconds using structured unsupported-metadata errors.
+- Do not silently clamp or truncate timestamp values.
 - Preserve source filesystem mtimes on upload.
 - Report mtimes through FUSE `getattr`.
 - Support explicit timestamp updates through FUSE operations.
-- Determine and document public precision guarantees after tests cover upload, mount, COW, snapshot, and remount.
+- Preserve exactly the precision reported by the local OS/filesystem, including nanosecond precision when available.
 
 Unix mode is represented primarily by `NodeProperties.unix_mode`. `FileNode.is_executable` is derived for compatibility.
+
+Mode rules:
+
+- File type is represented by the REAPI node kind, not by the stored mode contract.
+- Preserve permission bits `0o777` for regular files, directories, and symlinks where the platform reports symlink mode.
+- Preserve sticky bit `0o1000` on directories.
+- Do not preserve setuid `0o4000` or setgid `0o2000` in the MVP. Mask them out and emit a warning/count on upload or snapshot.
+- Ignore UID/GID ownership in the MVP.
+- Derive `FileNode.is_executable` from any executable bit in the final stored regular-file mode: `(mode & 0o111) != 0`.
+- Expose stored modes through FUSE `getattr`, subject to normal FUSE/kernel behavior.
+- `chmod` through the mounted workspace updates only supported mode bits. Attempts to set setuid or setgid are masked with a warning or clear unsupported-metadata response.
 
 ## Snapshot
 
@@ -274,12 +339,16 @@ Mounted workspace snapshotting goes through the live `rfsd` process.
 
 1. Discovers the active session from `RFS_HOME`, optionally validates the supplied mountpoint, and sends a snapshot request over the Unix control socket.
 2. Daemon enters a short snapshot barrier.
-3. If writable handles or pending writes are active, snapshot fails.
+3. If writable handles or in-flight mutations are active, snapshot fails.
 4. Daemon walks the overlay graph and dirty ancestors.
 5. Unchanged remote-backed blobs and subtrees reuse existing digests.
 6. Dirty/new files are streamed, hashed, checked with `FindMissingBlobs`, and uploaded if missing.
 7. New or changed `Directory` nodes are encoded canonically and uploaded if missing.
 8. Daemon returns the new root digest.
+
+`rfs snapshot` is daemon-session-only in the MVP. If no active RemoteFS session exists, it fails clearly and points users to `rfs upload <local-dir>` for ordinary local directories. `rfs snapshot <local-dir>` is not an alias for upload.
+
+The daemon tracks FUSE file handles in memory. Handles opened with write capability block snapshot until release, even if no write has happened. Read-only handles and read-only mmap do not block snapshot. Each mutation call commits its own SQLite dirty-state before returning; RemoteFS does not defer overlay metadata commits to `flush` or `fsync`. `flush` and `fsync` only synchronize already-written local overlay file bytes and surface local IO errors. Snapshot blocking is based on writable handles and currently executing mutation calls, not flush/fsync state.
 
 Earliest writable MVP snapshots the full workspace only. Path selection and include/exclude filters are deferred.
 
@@ -291,16 +360,36 @@ Upload walks the local filesystem directly and uses the same canonical tree enco
 
 Upload does not follow symlinks by default.
 
+Upload uses a bounded deterministic pipeline:
+
+1. A single filesystem walker records metadata and path structure without following symlinks.
+2. A bounded hashing worker pool streams regular files from disk. The default worker count is `min(available_parallelism, 8)`, with a minimum of 2.
+3. `FindMissingBlobs` runs after digests are known so uploads can skip existing blobs.
+4. Missing small blobs are uploaded with `BatchUpdateBlobs`; larger blobs use ByteStream with a separate default concurrency cap of 4.
+5. Channels and in-flight byte accounting bound memory use. The default buffered in-flight payload budget is 64 MiB.
+6. Large ByteStream uploads reread from disk instead of buffering whole files in memory.
+
+Worker completion order must not affect output. Directory encoding, the root digest, and JSON summaries are stable through canonical path and entry ordering.
+
 ## Observability
 
 Structured logs and command summaries are the first observability layer.
 
 MVP should support:
 
-- Human logs by default.
-- JSON logs via flag.
+- CLI logs go to stderr only. Command results and JSON summaries go to stdout.
+- `rfsd` logs go to `RFS_HOME/active/logs/rfsd.log` and remain inspectable with the active or previous session until `rfs cleanup`.
+- Human-readable compact text logs by default.
+- JSON Lines logs via `--log-format json`; text logs via `--log-format text`.
+- `--log-level` and `--log-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.
+- Effective daemon log level and format are written into session metadata so `rfs status` can report them.
+- No log rotation in the MVP.
 - `rfs status`.
 - `rfs status --json`.
+- `--json` command summaries for `status`, `upload`, and `snapshot`.
+- JSON command summaries use a stable envelope with `schema_version`, `command`, `ok`, `warnings`, `error`, and command-specific `data`.
+- JSON field names and types are stable within a schema version. Later versions may add optional fields, but removing or changing existing fields requires bumping `schema_version`.
+- On `--json` failure, commands print one JSON object for machine consumers; logs remain separate.
 - Per-session counters for:
   - Directory nodes fetched.
   - Blobs fetched.
@@ -314,6 +403,8 @@ MVP should support:
   - Digest verification failures.
 
 A metrics endpoint is secondary.
+
+Daemon log events should include at least timestamp, level, target/module, session id, operation when available, path or digest when relevant, and message.
 
 ## Milestones
 
