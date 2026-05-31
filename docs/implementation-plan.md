@@ -29,9 +29,10 @@ The intended implementation order is:
 - `rfs upload <local-dir>` is the only plain local-directory ingestion command.
 - `rfs snapshot [mountpoint]` is daemon-session-only and requires an active RemoteFS session under `RFS_HOME`.
 - `--instance-name` is required and non-empty for CAS and ByteStream requests.
+- `--cas-url` requires an explicit URI scheme. MVP supports `grpc://`; `grpcs://` is deferred.
 - The default local CAS for development and evaluation is `bazel-remote`; Buildbarn remains a documented secondary compatibility target until the main REAPI path is stable.
 - SQLite state uses `rusqlite` in daemon-owned blocking sections.
-- Generated Rust proto code is produced during build from checked-in pinned proto sources.
+- Generated Rust proto code is produced during build from checked-in pinned proto sources under `third_party/remote-apis/`.
 - Process exit codes are simple: `0` for success and `1` for any error.
 - Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence.
 
@@ -83,8 +84,10 @@ Definition of done:
 Deliverables:
 
 - Add pinned Remote Execution API and ByteStream protos.
+- Vendor the pinned REAPI source files under `third_party/remote-apis/`.
 - Add RemoteFS-owned protobuf definitions for the local daemon control API.
 - Generate Rust code with `tonic-build` and `prost-build`.
+- Pin `prost` and `tonic` versions.
 - Include only the proto surface needed by the MVP:
   - `build.bazel.remote.execution.v2.Digest`
   - `Directory`, `FileNode`, `DirectoryNode`, `SymlinkNode`
@@ -98,9 +101,6 @@ Deliverables:
   - protocol/version metadata
 - Document how protos are pinned and updated.
 
-Recommended approach:
-
-- Vendor a pinned copy under `third_party/remote-apis/` or use a pinned proto fetch task that writes into a checked-in directory.
 - Check in proto source files, not generated Rust, unless build reproducibility becomes painful.
 
 Task targets:
@@ -114,6 +114,7 @@ task build
 Tests:
 
 - Unit: encode a minimal `Directory` and verify the resulting digest is stable.
+- Unit: representative encoded `Directory` objects have golden digests.
 - Unit: verify canonical digest string formatting as `sha256:<hash>/<size>`.
 - Unit: control service request/response messages encode and decode expected fields.
 
@@ -229,6 +230,8 @@ Deliverables:
   - Executable bit.
   - Mtime signed seconds and normalized nanoseconds.
   - Symlink target.
+- Require UTF-8 path component names and symlink targets because REAPI stores them as protobuf strings.
+- Encode empty directories as normal `Directory` objects that must exist in CAS.
 - Timestamp rules:
   - Preserve nanosecond precision when reported by the local OS/filesystem.
   - Preserve valid pre-1970 mtimes; negative timestamp seconds represent times before the Unix epoch.
@@ -243,6 +246,7 @@ Deliverables:
   - Ignore UID/GID ownership.
   - Derive `FileNode.is_executable` from `(mode & 0o111) != 0` for regular files.
 - Reject or warn on unsupported file types according to CLI mode.
+- Preserve symlinks exactly, including absolute and escaping targets; emit warning counts for risky targets.
 
 Task targets:
 
@@ -261,6 +265,9 @@ Tests:
 - Unit: pre-epoch, epoch, nanosecond, and far-future valid mtimes have stable golden digests.
 - Unit: out-of-range timestamps return structured unsupported-metadata errors.
 - Unit: symlink targets are stored as symlink nodes and are not followed.
+- Unit: absolute and escaping symlinks round-trip with warnings.
+- Unit: non-UTF-8 names or symlink targets return structured unsupported-metadata errors.
+- Unit: empty directories encode to stable `Directory` digests.
 - Unit: unsupported node types return structured errors.
 - Integration: upload encoded tree nodes to CAS and fetch/decode them by digest.
 
@@ -281,6 +288,7 @@ Deliverables:
   - `rfs unmount [mountpoint]`
   - `rfs status [mountpoint]`
   - `rfs cleanup`
+- Do not include `rfs doctor` in the MVP; command-specific validation lives in the commands and test targets that need it.
 - Implement common flags:
   - `--cas-url`
   - `--instance-name`
@@ -290,6 +298,7 @@ Deliverables:
   - `--cache-dir`
   - `--session-dir`
 - Use simple process exit codes: `0` for success and `1` for any error. Put detailed error categories in human and JSON diagnostics instead of numeric exit codes.
+- Validate `--cas-url` with an explicit scheme; accept `grpc://` in the MVP and reserve `grpcs://`.
 
 Task targets:
 
@@ -303,6 +312,7 @@ Tests:
 
 - Unit: config precedence from CLI flags and environment variables.
 - Unit: configuration rejects missing or empty `--instance-name`.
+- Unit: configuration rejects missing CAS URL schemes and unsupported schemes.
 - Unit: CAS URL and REAPI `instance_name` are included in every CAS and ByteStream request.
 - Unit: command parsing for every expected command.
 - Unit: optional mountpoint arguments validate against active-session metadata when supplied.
@@ -318,6 +328,9 @@ Definition of done:
 Deliverables:
 
 - Walk local directories without following symlinks.
+- Include every entry under the supplied directory; no include/exclude or `.gitignore` semantics in the MVP.
+- Fail on unsupported filesystem nodes by default.
+- Detect hard links, warn/count them, and store each path as an ordinary file.
 - Feed local filesystem entries into the shared tree-writer abstraction; keep local traversal separate from mounted overlay traversal.
 - Hash and upload file blobs through a bounded deterministic pipeline:
   - Use one filesystem walker to record metadata and path structure.
@@ -343,6 +356,8 @@ task fixture:upload
 Tests:
 
 - Unit: filesystem walker handles regular files, dirs, symlinks, mtimes, executable bit, unsupported types.
+- Unit: unsupported nodes fail upload by default.
+- Unit: hard links are counted and represented as ordinary files.
 - Unit: tree encoder produces identical root digest for identical trees.
 - Unit: worker completion order does not affect root digest or JSON summary ordering.
 - Unit: upload backpressure enforces the configured in-flight byte budget.
@@ -371,6 +386,7 @@ Deliverables:
 - Add an active-session lock so at most one `rfsd` can own an `RFS_HOME` at a time.
 - Preserve `RFS_HOME/active/` after clean unmount for inspection.
 - Implement `rfs cleanup` to remove stale `RFS_HOME/active/` only when no live active-session lock exists.
+- `rfs cleanup` does not prune shared blob or directory caches; cache pruning is a future separate command.
 - Add SQLite schema migrations for:
   - Session metadata.
   - Inode table.
@@ -447,7 +463,7 @@ Definition of done:
 Deliverables:
 
 - Implement a core filesystem model that can:
-  - Validate root directory digest on mount.
+  - Validate the root `Directory` object on mount; recursive verification is deferred.
   - Lazily fetch directory objects.
   - Allocate session-stable inodes for materialized entries.
   - Resolve lookup and readdir from remote tree metadata.
@@ -491,6 +507,7 @@ Deliverables:
   - `readlink`
   - read-only errors for mutation attempts.
 - Implement `rfs mount <root-digest> <mountpoint>` starting `rfsd`.
+- Keep `rfsd` usable in foreground mode for tests and manual debugging.
 - Return from `rfs mount` only after root validation, FUSE mount readiness, and control socket readiness.
 - Implement `rfs unmount`.
 
@@ -790,7 +807,7 @@ Deliverables:
 - Normalize errors across CLI, daemon, CAS, and FUSE paths.
 - Include path, digest, operation, and remote context where available.
 - Ensure no empty, partial, or unverified content is served after fetch failures.
-- Add manual cache pruning command or documented cleanup workflow if bounded eviction remains deferred.
+- Document that automatic cache eviction and cache pruning are deferred; `rfs cleanup` only removes stale session state.
 
 Task targets:
 
@@ -906,6 +923,7 @@ These are intentionally deferred until the core MVP path is working:
 
 - Buildbarn compatibility smoke tests beyond documented secondary-target intent.
 - Bounded automatic local cache eviction.
+- Manual cache pruning command.
 - Configurable hard guardrails for large-file copy-up.
 - Recursive root verification command.
 - Cache verification command for already-admitted local cache entries.
