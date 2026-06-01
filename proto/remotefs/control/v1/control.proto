@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package remotefs.control.v1;
+
+service Control {
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  rpc Unmount(UnmountRequest) returns (UnmountResponse);
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  bool mounted = 1;
+  string root_digest = 2;
+  string mountpoint = 3;
+  uint64 cached_blobs = 4;
+  uint64 dirty_files = 5;
+}
+
+message SnapshotRequest {}
+
+message SnapshotResponse {
+  string root_digest = 1;
+  uint64 uploaded_blobs = 2;
+  uint64 uploaded_bytes = 3;
+}
+
+message UnmountRequest {}
+
+message UnmountResponse {}

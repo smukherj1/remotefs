@@ -43,6 +43,16 @@ impl Digest {
     pub fn size_bytes(&self) -> i64 {
         self.size_bytes
     }
+
+    pub fn for_bytes(bytes: &[u8]) -> Self {
+        use sha2::{Digest as ShaDigest, Sha256};
+
+        let hash = hex::encode(Sha256::digest(bytes));
+        Digest {
+            hash,
+            size_bytes: bytes.len() as i64,
+        }
+    }
 }
 
 impl FromStr for Digest {
@@ -150,5 +160,14 @@ mod tests {
             s.parse::<Digest>(),
             Err(DigestError::InvalidSize(_))
         ));
+    }
+
+    #[test]
+    fn test_digest_for_bytes_formats_canonical_sha256() {
+        let digest = Digest::for_bytes(b"");
+        assert_eq!(
+            digest.to_string(),
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0"
+        );
     }
 }

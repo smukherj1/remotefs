@@ -25,3 +25,13 @@ tasks:
     desc: Run only unit tests
     cmds:
       - cargo test --lib
+
+  proto:check:
+    desc: Check that pinned REAPI, ByteStream, and RemoteFS control protos generate cleanly
+    cmds:
+      - cargo check
+
+  proto:generate:
+    desc: Generate Rust protobuf bindings into Cargo OUT_DIR during a normal build
+    cmds:
+      - cargo build
