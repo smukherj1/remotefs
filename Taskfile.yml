@@ -1,5 +1,11 @@
 version: '3'
 
+vars:
+  HOST_UID:
+    sh: id -u
+  HOST_GID:
+    sh: id -g
+
 tasks:
   fmt:
     desc: Format the codebase
@@ -35,3 +41,31 @@ tasks:
     desc: Generate Rust protobuf bindings into Cargo OUT_DIR during a normal build
     cmds:
       - cargo build
+
+  cas:up:
+    desc: Start the local bazel-remote CAS at grpc://127.0.0.1:9092
+    cmds:
+      - mkdir -p .dev/bazel-remote-cache
+      - REMOTEFS_DOCKER_UID={{.HOST_UID}} REMOTEFS_DOCKER_GID={{.HOST_GID}} docker compose up -d bazel-remote
+
+  cas:down:
+    desc: Stop the local bazel-remote CAS
+    cmds:
+      - docker compose down
+
+  cas:logs:
+    desc: Follow local bazel-remote CAS logs
+    cmds:
+      - docker compose logs -f bazel-remote
+
+  cas:reset:
+    desc: Stop the local CAS and remove the disposable dev cache directory
+    cmds:
+      - docker compose down
+      - rm -rf .dev/bazel-remote-cache
+      - mkdir -p .dev/bazel-remote-cache
+
+  test:integration:cas:
+    desc: Verify the local bazel-remote CAS test prerequisite
+    cmds:
+      - cargo test --test cas_prerequisites

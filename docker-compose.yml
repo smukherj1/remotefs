@@ -1,0 +1,16 @@
+services:
+  bazel-remote:
+    image: ${BAZEL_REMOTE_IMAGE:-buchgr/bazel-remote-cache@sha256:dedff81150b3f217ae36cb95b57d579029ab21d9ae9e336b5bb3a81cd533b11b}
+    user: "${REMOTEFS_DOCKER_UID:-1000}:${REMOTEFS_DOCKER_GID:-1000}"
+    # Supported flags https://github.com/buchgr/bazel-remote#command-line-flags
+    command:
+      - --dir=/data
+      - --max_size=100
+      - --port=8080
+      - --grpc_port=9092
+    ports:
+      - "127.0.0.1:9090:8080"
+      - "127.0.0.1:9092:9092"
+    volumes:
+      - ./.dev/bazel-remote-cache:/data
+    restart: unless-stopped
