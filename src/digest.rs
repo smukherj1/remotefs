@@ -2,6 +2,8 @@ use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 
+use crate::reapi::remote_execution;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {
     hash: String,
@@ -18,6 +20,10 @@ pub enum DigestError {
     InvalidHash,
     #[error("Invalid size value: {0}")]
     InvalidSize(String),
+    #[error("Digest size mismatch: expected {expected} bytes, got {actual} bytes")]
+    SizeMismatch { expected: i64, actual: i64 },
+    #[error("Digest hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
 }
 
 impl Digest {
@@ -52,6 +58,48 @@ impl Digest {
             hash,
             size_bytes: bytes.len() as i64,
         }
+    }
+
+    pub fn verify_bytes(&self, bytes: &[u8]) -> Result<(), DigestError> {
+        let actual = Self::for_bytes(bytes);
+        if actual.size_bytes != self.size_bytes {
+            return Err(DigestError::SizeMismatch {
+                expected: self.size_bytes,
+                actual: actual.size_bytes,
+            });
+        }
+        if actual.hash != self.hash {
+            return Err(DigestError::HashMismatch {
+                expected: self.hash.clone(),
+                actual: actual.hash,
+            });
+        }
+        Ok(())
+    }
+
+    pub fn to_reapi(&self) -> remote_execution::Digest {
+        remote_execution::Digest {
+            hash: self.hash.clone(),
+            size_bytes: self.size_bytes,
+        }
+    }
+
+    pub fn from_reapi(digest: &remote_execution::Digest) -> Result<Self, DigestError> {
+        Self::new(digest.hash.clone(), digest.size_bytes)
+    }
+}
+
+impl TryFrom<remote_execution::Digest> for Digest {
+    type Error = DigestError;
+
+    fn try_from(value: remote_execution::Digest) -> Result<Self, Self::Error> {
+        Self::new(value.hash, value.size_bytes)
+    }
+}
+
+impl From<&Digest> for remote_execution::Digest {
+    fn from(value: &Digest) -> Self {
+        value.to_reapi()
     }
 }
 

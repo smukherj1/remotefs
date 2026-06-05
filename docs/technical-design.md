@@ -76,16 +76,20 @@ CAS client calls use conservative retry and timeout defaults for CI network resi
 - Retries are limited to transient transport or server failures: unavailable, deadline exceeded, resource exhausted, aborted, and internal errors that indicate a transport reset.
 - Semantic and authorization failures are not retried: not found after mount validation, invalid argument, permission denied, unauthenticated, digest mismatch, and failed precondition.
 - Exponential backoff with jitter starts at 100 ms, then 250 ms, 500 ms, and 1 second, with at most 5 attempts by default.
+- CAS configuration validates retry limits at construction time. The configured attempt count may not be zero and may not exceed the package maximum used by the backoff schedule.
 - ByteStream retries restart from byte 0 in the MVP. Partial stream resume is deferred.
 - Final errors include the operation name, digest or resource name when relevant, attempt count, CAS URL, and `instance_name`.
+- CAS operation identity is represented internally by a typed enum or equivalent closed set, not ad hoc string matching. That operation type owns timeout selection, display names, and retry metadata.
 
 Small blob and directory uploads use `BatchUpdateBlobs` packing to reduce RPC overhead:
 
 - The default batch/ByteStream split is 4 MiB.
-- The default serialized batch request budget is 3.5 MiB and is configurable for compatibility testing.
-- Small blob and directory-node entries are packed into a request until the next entry would exceed the serialized budget, then a new request starts.
-- A near-threshold entry that cannot fit in the serialized batch budget by itself is uploaded through ByteStream.
+- The default batch request payload budget is 4 MiB minus a small reserved overhead allowance and is configurable for compatibility testing.
+- Small blob and directory-node entries are packed by a running payload-size total. When the next entry would exceed the request budget, the current request is sent and a new request starts.
+- A near-threshold entry that cannot fit in the batch budget by itself is uploaded through ByteStream.
 - Entry order within a `BatchUpdateBlobs` request is not semantically significant and is not part of RemoteFS determinism guarantees. Determinism is required for tree encoding, root digests, and user-visible summaries.
+
+The CAS client exposes only RemoteFS-level operations to callers: existence checks, blob upload, and verified blob download. ByteStream resource-name construction, response verification, batch packing, retry classification, and transport-specific helper functions remain private implementation details unless another module has a concrete need for them. Public methods are documented with expected arguments, return values, and error behavior.
 
 ## Process Model
 

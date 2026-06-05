@@ -155,6 +155,8 @@ Definition of done:
 
 ### Step 2.1: Digest and CAS Client
 
+Status: implemented, with review cleanup required before building later filesystem code on this surface.
+
 Deliverables:
 
 - Implement `Digest` as a first-class internal type with:
@@ -168,12 +170,12 @@ Deliverables:
   - ByteStream upload for larger blobs.
   - `batch_read_blobs` for small downloads.
   - ByteStream read for larger downloads.
-- Default the batch/ByteStream split at 4 MiB, with a conservative serialized-message-size check so protobuf and gRPC framing overhead cannot push a batch request over the practical limit.
+- Default the batch/ByteStream split at 4 MiB, with a conservative request-overhead allowance so protobuf and gRPC framing overhead cannot push a batch request over the practical limit.
 - Make the threshold configurable for compatibility testing against different CAS deployments.
 - Pack `BatchUpdateBlobs` requests for small blobs and directory nodes:
-  - Default serialized batch request budget is 3.5 MiB.
-  - Add entries until the next entry would exceed the serialized budget, then start a new request.
-  - Send a near-threshold entry through ByteStream if it cannot fit in the serialized batch budget by itself.
+  - Default request payload budget is 4 MiB minus a small reserved overhead allowance.
+  - Add entries using a running payload-size total until the next entry would exceed the budget, then start a new request.
+  - Send a near-threshold entry through ByteStream if it cannot fit in the batch budget by itself.
   - Do not require deterministic entry order inside a batch request; it does not affect CAS state, blob digests, tree digests, or final summaries.
 - Add digest verification for downloaded blobs before cache admission.
 - Use standard uncompressed ByteStream resource names:
@@ -191,6 +193,14 @@ Deliverables:
   - Use exponential backoff with jitter: 100 ms, 250 ms, 500 ms, 1 second, and at most 5 attempts by default.
   - ByteStream retries restart from byte 0 in the MVP.
   - Final errors include operation name, digest or resource name when relevant, attempt count, CAS URL, and `instance_name`.
+- Keep the CAS client public API narrow:
+  - Public methods are documented with arguments, return values, and error behavior.
+  - ByteStream resource-name builders, download verification, batch packing, and transport helpers remain private unless another module has a concrete need for them.
+  - Large public methods delegate to private helpers for batch read, ByteStream read, batched upload, and ByteStream upload so the control flow remains readable.
+- Represent CAS operation names with a typed enum or equivalent closed set instead of matching hardcoded strings for timeout and retry behavior.
+- Validate retry configuration when constructing or connecting the CAS client:
+  - `max_attempts` must be at least 1.
+  - `max_attempts` must not exceed the package maximum used by the backoff schedule.
 
 Task targets:
 
@@ -206,9 +216,11 @@ Tests:
 - Unit: downloaded blob verifier rejects hash or size mismatch.
 - Unit: ByteStream resource names include the non-empty `instance_name` for read and write.
 - Unit: `instance_name` validation rejects empty values and reserved path segments.
-- Unit: batch packing respects serialized request budget and moves oversized near-threshold entries to ByteStream.
+- Unit: batch packing respects the request payload budget and moves oversized near-threshold entries to ByteStream.
 - Unit: retry classifier retries transient errors and does not retry semantic or authorization errors.
 - Unit: timeout configuration applies the expected per-operation defaults.
+- Unit: retry attempt validation rejects zero and values above the supported maximum.
+- Unit: CAS operation timeout selection is covered without stringly typed operation names.
 - Integration: against `task cas:up`, upload, existence-check, download, and verify blobs.
 - Integration: idempotent re-upload of the same digest succeeds.
 
@@ -216,6 +228,7 @@ Definition of done:
 
 - CAS calls are hidden behind a small trait so core filesystem tests can use an in-memory fake CAS.
 - CAS configuration requires a non-empty REAPI `instance_name` and sends it consistently on CAS and ByteStream calls.
+- Review comments in `src/cas.rs` are resolved and removed, either by implementing the requested change or by replacing the comment with a durable explanation of the chosen design.
 
 ### Step 2.2: Canonical Tree Encoding
 
