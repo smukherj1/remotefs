@@ -1,9 +1,16 @@
+use std::collections::BTreeSet;
+use std::fs;
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::fs::{PermissionsExt, symlink};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use remotefs::cas::{Blob, CasClient, CasConfig};
 use remotefs::digest::Digest;
+use remotefs::tree::decode_directory;
+use remotefs::upload::{scan_local_tree, upload_inputs_for_tree, upload_missing};
+use tempfile::tempdir;
 
 const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";
 
@@ -59,4 +66,143 @@ async fn local_bazel_remote_upload_check_download_and_reupload() {
     assert_eq!(downloaded.as_ref(), blob.data.as_slice());
 
     client.upload_blobs(vec![blob]).await.unwrap();
+}
+
+#[tokio::test]
+async fn tree_fixture_round_trips_through_local_cas() {
+    verify_prerequisites();
+
+    let source = tempdir().unwrap();
+    copy_tree(Path::new("tests/fixtures/tree-roundtrip"), source.path()).unwrap();
+
+    let tree = scan_local_tree(source.path()).unwrap();
+    assert!(!tree.file_blobs.is_empty());
+    assert!(!tree.directories.is_empty());
+    let config = CasConfig::new(format!("grpc://{LOCAL_CAS_ADDR}"), "remotefs/tests").unwrap();
+    let mut client = CasClient::connect(config).await.unwrap();
+    upload_missing(&mut client, upload_inputs_for_tree(&tree))
+        .await
+        .unwrap();
+
+    let reconstructed = tempdir().unwrap();
+    reconstruct_directory(&mut client, &tree.root_digest, reconstructed.path()).await;
+    compare_trees(source.path(), reconstructed.path());
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        if entry.file_name() == ".gitkeep" {
+            continue;
+        }
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            symlink(fs::read_link(&source_path)?, destination_path)?;
+        } else if metadata.is_dir() {
+            copy_tree(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path)?;
+            fs::set_permissions(
+                &destination_path,
+                fs::Permissions::from_mode(metadata.permissions().mode() & 0o777),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+async fn reconstruct_directory(client: &mut CasClient, digest: &Digest, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    let bytes = client.download_blob(digest).await.unwrap();
+    let directory = decode_directory(digest.clone(), bytes).unwrap();
+
+    for file in directory.files {
+        let digest = Digest::from_reapi(file.digest.as_ref().unwrap()).unwrap();
+        let data = client.download_blob(&digest).await.unwrap();
+        let path = destination.join(file.name);
+        fs::write(&path, data).unwrap();
+        if let Some(mode) = file
+            .node_properties
+            .as_ref()
+            .and_then(|properties| properties.unix_mode)
+        {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode & 0o777)).unwrap();
+        }
+    }
+
+    for child in directory.directories {
+        let digest = Digest::from_reapi(child.digest.as_ref().unwrap()).unwrap();
+        let path = destination.join(child.name);
+        Box::pin(reconstruct_directory(client, &digest, &path)).await;
+    }
+
+    for link in directory.symlinks {
+        symlink(link.target, destination.join(link.name)).unwrap();
+    }
+}
+
+fn compare_trees(left: &Path, right: &Path) {
+    let left_paths = relative_paths(left);
+    let right_paths = relative_paths(right);
+    assert_eq!(left_paths, right_paths);
+
+    for relative in left_paths {
+        let left_path = left.join(&relative);
+        let right_path = right.join(&relative);
+        let left_metadata = fs::symlink_metadata(&left_path).unwrap();
+        let right_metadata = fs::symlink_metadata(&right_path).unwrap();
+        assert_eq!(
+            left_metadata.file_type().is_symlink(),
+            right_metadata.file_type().is_symlink(),
+            "{relative:?}"
+        );
+        assert_eq!(
+            left_metadata.is_dir(),
+            right_metadata.is_dir(),
+            "{relative:?}"
+        );
+        assert_eq!(
+            left_metadata.is_file(),
+            right_metadata.is_file(),
+            "{relative:?}"
+        );
+
+        if left_metadata.file_type().is_symlink() {
+            assert_eq!(
+                fs::read_link(left_path).unwrap(),
+                fs::read_link(right_path).unwrap()
+            );
+        } else if left_metadata.is_file() {
+            assert_eq!(fs::read(left_path).unwrap(), fs::read(right_path).unwrap());
+            assert_eq!(
+                left_metadata.permissions().mode() & 0o111,
+                right_metadata.permissions().mode() & 0o111,
+                "{relative:?}"
+            );
+        }
+    }
+}
+
+fn relative_paths(root: &Path) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    collect_relative_paths(root, root, &mut paths);
+    paths
+}
+
+fn collect_relative_paths(root: &Path, current: &Path, paths: &mut BTreeSet<PathBuf>) {
+    let mut entries = fs::read_dir(current)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        paths.insert(path.strip_prefix(root).unwrap().to_path_buf());
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            collect_relative_paths(root, &path, paths);
+        }
+    }
 }

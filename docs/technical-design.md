@@ -48,9 +48,9 @@ The MVP profile excludes:
 - Sparse-file preservation.
 - UID/GID ownership preservation.
 
-Entries must use REAPI canonical ordering. Upload and snapshot must share the same encoder so bootstrap uploads and mounted workspace snapshots produce compatible trees.
+Entries must use REAPI canonical ordering. Upload and snapshot must share the same upload-free encoder so bootstrap uploads and mounted workspace snapshots produce compatible trees.
 
-Upload and snapshot also share a narrow tree-writer abstraction for canonical directory encoding, deterministic digest calculation, CAS existence checks, batch/ByteStream upload selection, counters, and metadata warnings. Input traversal remains separate: `rfs upload` walks a local directory, while daemon snapshot walks the merged overlay graph after the snapshot barrier.
+The encoder owns canonical directory encoding, deterministic digest calculation, decode validation, and metadata warnings. CAS existence checks, upload orchestration, counters, and batch/ByteStream policy are handled outside the encoder by upload code over the `BlobStore` abstraction. Input traversal remains separate: `rfs upload` walks a local directory, while daemon snapshot walks the merged overlay graph after the snapshot barrier.
 
 ## CAS Target
 
@@ -345,7 +345,7 @@ Mounted workspace snapshotting goes through the live `rfsd` process.
 2. Daemon enters a short snapshot barrier.
 3. If writable handles or in-flight mutations are active, snapshot fails.
 4. Daemon walks the overlay graph and dirty ancestors.
-5. Unchanged remote-backed blobs and subtrees reuse existing digests.
+5. Unchanged remote-backed blobs and subtrees reuse existing digests without rechecking CAS.
 6. Dirty/new files are streamed, hashed, checked with `FindMissingBlobs`, and uploaded if missing.
 7. New or changed `Directory` nodes are encoded canonically and uploaded if missing.
 8. Daemon returns the new root digest.
@@ -372,6 +372,7 @@ Upload uses a bounded deterministic pipeline:
 4. Missing small blobs are uploaded with `BatchUpdateBlobs`; larger blobs use ByteStream with a separate default concurrency cap of 4.
 5. Channels and in-flight byte accounting bound memory use. The default buffered in-flight payload budget is 64 MiB.
 6. Large ByteStream uploads reread from disk instead of buffering whole files in memory.
+7. Encoded directory nodes are uploaded through the same generic upload orchestration used for CAS existence checks and counters.
 
 Worker completion order must not affect output. Directory encoding, the root digest, and JSON summaries are stable through canonical path and entry ordering.
 

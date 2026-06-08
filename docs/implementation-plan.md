@@ -38,7 +38,7 @@ The intended implementation order is:
 
 ## Phase 0: Boilerplate and Workflow
 
-### Step 0.1: Crate Layout
+### Step 0.1: Crate Layout (Complete)
 
 Deliverables:
 
@@ -79,7 +79,7 @@ Definition of done:
 - `task fmt`, `task lint`, `task build`, and `task test:unit` pass.
 - Both binaries print real CLI help instead of placeholder messages.
 
-### Step 0.2: Proto Setup
+### Step 0.2: Proto Setup (Complete)
 
 Deliverables:
 
@@ -125,7 +125,7 @@ Definition of done:
 
 ## Phase 1: Development CAS Server
 
-### Step 1.1: Bazel-Remote Docker Workflow
+### Step 1.1: Bazel-Remote Docker Workflow (Complete)
 
 Deliverables:
 
@@ -153,7 +153,7 @@ Definition of done:
 
 ## Phase 2: CAS Client and Snapshot Primitives
 
-### Step 2.1: Digest and CAS Client
+### Step 2.1: Digest and CAS Client (Complete)
 
 Status: implemented, with review cleanup required before building later filesystem code on this surface.
 
@@ -235,6 +235,7 @@ Definition of done:
 Deliverables:
 
 - Implement the constrained REAPI `Directory` encoder/decoder.
+- Keep the encoder upload-free: it returns canonical raw bytes, the computed digest, and decoded proto state useful to callers/tests.
 - Enforce canonical entry ordering for files, directories, and symlinks.
 - Preserve supported metadata:
   - File type.
@@ -260,6 +261,9 @@ Deliverables:
   - Derive `FileNode.is_executable` from `(mode & 0o111) != 0` for regular files.
 - Reject or warn on unsupported file types according to CLI mode.
 - Preserve symlinks exactly, including absolute and escaping targets; emit warning counts for risky targets.
+- Decode raw directory bytes into validated REAPI `Directory` proto objects. Do not add a separate decoded internal representation or builder reconstruction API until a production caller needs it.
+- Add only the minimal local walker and generic uploader glue needed to integration-test a real fixture against CAS. The generic uploader lives in `src/upload.rs`, accepts file blobs and encoded directory nodes, performs `FindMissingBlobs`, uploads missing objects through `BlobStore`, and reports basic counters.
+- Keep production upload scheduling, worker pools, backpressure, and CLI summaries for Step 3.2.
 
 Task targets:
 
@@ -282,11 +286,11 @@ Tests:
 - Unit: non-UTF-8 names or symlink targets return structured unsupported-metadata errors.
 - Unit: empty directories encode to stable `Directory` digests.
 - Unit: unsupported node types return structured errors.
-- Integration: upload encoded tree nodes to CAS and fetch/decode them by digest.
+- Integration: walk a checked-in fixture, hash files, encode directories, upload file blobs and directory nodes through the generic uploader to CAS, fetch/decode by digest, and verify reconstruction.
 
 Definition of done:
 
-- `rfs upload` and mounted snapshot code share this encoder and can build on a common tree-writer abstraction.
+- `rfs upload` and mounted snapshot code can share this encoder and the generic uploader surface while keeping traversal and workspace-state logic separate.
 
 ## Phase 3: Bootstrap CLI
 
@@ -344,7 +348,7 @@ Deliverables:
 - Include every entry under the supplied directory; no include/exclude or `.gitignore` semantics in the MVP.
 - Fail on unsupported filesystem nodes by default.
 - Detect hard links, warn/count them, and store each path as an ordinary file.
-- Feed local filesystem entries into the shared tree-writer abstraction; keep local traversal separate from mounted overlay traversal.
+- Feed local filesystem entries into the shared tree encoder; keep local traversal separate from mounted overlay traversal.
 - Hash and upload file blobs through a bounded deterministic pipeline:
   - Use one filesystem walker to record metadata and path structure.
   - Stream file hashing through a bounded worker pool. Default workers are `min(available_parallelism, 8)`, with a minimum of 2.
@@ -353,8 +357,8 @@ Deliverables:
   - Upload larger blobs with ByteStream using a separate default concurrency cap of 4.
   - Limit buffered in-flight payloads to 64 MiB by default with bounded channels and byte accounting.
   - Reread large ByteStream uploads from disk instead of holding whole files in memory.
-- Encode and upload directories bottom-up.
-- Use `FindMissingBlobs` before uploading.
+- Encode directories bottom-up and upload encoded directory nodes through the generic uploader.
+- Use `FindMissingBlobs` before uploading new local file blobs and newly encoded directory nodes.
 - Print the root digest.
 - Emit counts for files, dirs, symlinks, uploaded blobs, reused blobs, bytes uploaded, warnings.
 
@@ -691,11 +695,11 @@ Deliverables:
 
 - Implement full-workspace snapshot from merged overlay state.
 - Open a short SQLite read transaction after the snapshot barrier passes to read a consistent overlay graph.
-- Feed merged overlay entries into the shared tree-writer abstraction; keep overlay traversal separate from local filesystem upload traversal.
+- Feed merged overlay entries into the shared tree encoder; keep overlay traversal separate from local filesystem upload traversal.
 - Reuse unchanged remote blob and subtree digests.
 - Hash dirty/new files at snapshot time.
 - Encode dirty/new directory nodes canonically.
-- Use `FindMissingBlobs` before uploading blobs and directory nodes.
+- Use `FindMissingBlobs` before uploading dirty/new file blobs and newly encoded directory nodes. Trust and reuse unchanged remote-backed blob and subtree digests without rechecking CAS.
 - Return the new root digest.
 
 Task targets:
