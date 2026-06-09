@@ -12,6 +12,7 @@ use tonic::{Code, Request, Status};
 use uuid::Uuid;
 
 use crate::digest::{Digest, DigestError};
+use crate::error_context::ResultContext as _;
 use crate::reapi::bytestream::{ReadRequest, WriteRequest, byte_stream_client::ByteStreamClient};
 use crate::reapi::remote_execution::{
     BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
@@ -80,8 +81,10 @@ impl CasConfig {
             bytestream_idle_timeout: Duration::from_secs(BYTESTREAM_IDLE_TIMEOUT_SECONDS),
             max_attempts: DEFAULT_ATTEMPTS,
         };
-        validate_instance_name(&config.instance_name)?;
-        validate_retry_attempts(config.max_attempts)?;
+        validate_instance_name(&config.instance_name)
+            .context("validate CAS instance name while constructing CasConfig")?;
+        validate_retry_attempts(config.max_attempts)
+            .context("validate retry attempts while constructing CasConfig")?;
         Ok(config)
     }
 }
@@ -167,6 +170,21 @@ pub enum CasError {
         #[source]
         source: DigestError,
     },
+    #[error("{operation}: {source}")]
+    Context {
+        operation: String,
+        #[source]
+        source: Box<CasError>,
+    },
+}
+
+impl crate::error_context::ResultContextError for CasError {
+    fn with_context(self, operation: String) -> Self {
+        CasError::Context {
+            operation,
+            source: Box::new(self),
+        }
+    }
 }
 
 /// Represents a blob of bytes along with its digest.
@@ -235,9 +253,20 @@ impl CasClient {
     /// range. Returns a client ready to issue CAS and ByteStream RPCs or a
     /// transport/configuration error if setup fails.
     pub async fn connect(config: CasConfig) -> Result<Self, CasError> {
-        validate_instance_name(&config.instance_name)?;
-        validate_retry_attempts(config.max_attempts)?;
-        let endpoint = endpoint_from_grpc_url(&config.cas_url)?;
+        validate_instance_name(&config.instance_name).with_context(|| {
+            format!(
+                "validate CAS instance name before connecting to {}",
+                config.cas_url
+            )
+        })?;
+        validate_retry_attempts(config.max_attempts).with_context(|| {
+            format!(
+                "validate retry attempts before connecting to {}",
+                config.cas_url
+            )
+        })?;
+        let endpoint = endpoint_from_grpc_url(&config.cas_url)
+            .with_context(|| format!("parse grpc CAS endpoint from {}", config.cas_url))?;
         let channel = Endpoint::from_shared(endpoint.clone())
             .map_err(|source| CasError::Transport {
                 operation: CasOperation::Connect,
@@ -285,7 +314,14 @@ impl CasClient {
                 let request = request.clone();
                 async move { cas.find_missing_blobs(Request::new(request)).await }
             })
-            .await?
+            .await;
+        let response = response
+            .with_context(|| {
+                format!(
+                    "check which {} blob digest(s) are missing from CAS",
+                    digests.len()
+                )
+            })?
             .into_inner();
 
         response
@@ -309,12 +345,20 @@ impl CasClient {
             .iter()
             .map(|blob| blob.digest.clone())
             .collect::<Vec<_>>();
-        let missing = self.find_missing_blobs(&digests).await?;
+        let missing = self.find_missing_blobs(&digests).await.with_context(|| {
+            format!(
+                "check missing blobs before upload for {} blob(s)",
+                digests.len()
+            )
+        })?;
         let missing_blobs = blobs
             .into_iter()
             .filter(|blob| missing.contains(&blob.digest))
             .collect::<Vec<_>>();
-        self.batch_update_blobs(missing_blobs).await
+        let missing_count = missing_blobs.len();
+        self.batch_update_blobs(missing_blobs)
+            .await
+            .with_context(|| format!("upload {missing_count} missing blob(s) through CAS"))
     }
 
     /// Downloads a blob from the CAS and verifies its digest.
@@ -324,9 +368,13 @@ impl CasClient {
     /// verified against `digest`, and mismatches return `CasError::Verification`.
     pub async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
         if digest.size_bytes() as usize <= self.config.download_blob_stream_threshold_bytes {
-            self.batch_read_blob(digest).await
+            self.batch_read_blob(digest)
+                .await
+                .with_context(|| format!("download blob {digest} through BatchReadBlobs"))
         } else {
-            self.bytestream_read(digest).await
+            self.bytestream_read(digest)
+                .await
+                .with_context(|| format!("download blob {digest} through ByteStream.Read"))
         }
     }
 
@@ -342,7 +390,9 @@ impl CasClient {
                 let request = request.clone();
                 async move { cas.batch_read_blobs(Request::new(request)).await }
             })
-            .await?
+            .await;
+        let response = response
+            .with_context(|| format!("read blob {digest} with BatchReadBlobs"))?
             .into_inner();
         let response = response
             .responses
@@ -360,20 +410,30 @@ impl CasClient {
                 message: status.message.clone(),
             });
         }
-        verify_download(digest, &response.data)?;
+        verify_download(digest, &response.data)
+            .with_context(|| format!("verify BatchReadBlobs response for {digest}"))?;
         Ok(Bytes::from(response.data.clone()))
     }
 
     async fn batch_update_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
         let packed = pack_batch_update_blobs(blobs, self.config.batch_update_budget_bytes);
 
-        self.upload_packed_batches(packed.batches).await?;
-        self.upload_bytestream_blobs(packed.bytestream).await
+        let batch_count = packed.batches.len();
+        let bytestream_count = packed.bytestream.len();
+        self.upload_packed_batches(packed.batches)
+            .await
+            .with_context(|| format!("upload {batch_count} packed BatchUpdateBlobs request(s)"))?;
+        self.upload_bytestream_blobs(packed.bytestream)
+            .await
+            .with_context(|| format!("upload {bytestream_count} blob(s) through ByteStream.Write"))
     }
 
     async fn upload_packed_batches(&mut self, batches: Vec<Vec<Blob>>) -> Result<(), CasError> {
-        for batch in batches {
-            self.upload_batch(batch).await?;
+        for (index, batch) in batches.into_iter().enumerate() {
+            let blob_count = batch.len();
+            self.upload_batch(batch).await.with_context(|| {
+                format!("upload BatchUpdateBlobs batch {index} containing {blob_count} blob(s)")
+            })?;
         }
         Ok(())
     }
@@ -396,7 +456,14 @@ impl CasClient {
                 let request = request.clone();
                 async move { cas.batch_update_blobs(Request::new(request)).await }
             })
-            .await?
+            .await;
+        let response = response
+            .with_context(|| {
+                format!(
+                    "send BatchUpdateBlobs request containing {} blob(s)",
+                    batch.len()
+                )
+            })?
             .into_inner();
 
         for blob in &batch {
@@ -423,7 +490,9 @@ impl CasClient {
 
     async fn upload_bytestream_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
         for blob in blobs {
-            self.bytestream_write(&blob).await?;
+            self.bytestream_write(&blob)
+                .await
+                .with_context(|| format!("upload blob {} with ByteStream.Write", blob.digest))?;
         }
         Ok(())
     }
@@ -434,42 +503,60 @@ impl CasClient {
         let data = blob.data.clone();
         let digest = blob.digest.clone();
 
-        self.retry_rpc(CasOperation::ByteStreamWrite, || {
-            let mut bytestream = self.bytestream.clone();
-            let resource_name = resource_name.clone();
-            let data = data.clone();
-            let digest = digest.clone();
-            async move {
-                let (tx, rx) = tokio::sync::mpsc::channel(2);
-                tx.send(WriteRequest {
-                    resource_name,
-                    write_offset: 0,
-                    finish_write: true,
-                    data,
-                })
-                .await
-                .map_err(|_| Status::internal("failed to queue ByteStream write request"))?;
-                drop(tx);
-                let response = bytestream
+        let write = self
+            .retry_rpc(CasOperation::ByteStreamWrite, || {
+                let mut bytestream = self.bytestream.clone();
+                let resource_name = resource_name.clone();
+                let data = data.clone();
+                let digest = digest.clone();
+                async move {
+                    let (tx, rx) = tokio::sync::mpsc::channel(2);
+                    let request_resource_name = resource_name.clone();
+                    tx.send(WriteRequest {
+                        resource_name: request_resource_name,
+                        write_offset: 0,
+                        finish_write: true,
+                        data,
+                    })
+                    .await
+                    .map_err(|_| Status::internal("failed to queue ByteStream write request"))?;
+                    drop(tx);
+                    let response = bytestream
                     .write(Request::new(ReceiverStream::new(rx)))
-                    .await?;
-                if response.get_ref().committed_size != digest.size_bytes() {
-                    return Err(Status::data_loss(format!(
-                        "committed {} bytes for {}",
-                        response.get_ref().committed_size,
-                        digest
-                    )));
+                    .await
+                    .map_err(|status| {
+                        Status::new(
+                            status.code(),
+                            format!(
+                                "send ByteStream write request for resource {resource_name}: {}",
+                                status.message()
+                            ),
+                        )
+                    })?;
+                    if response.get_ref().committed_size != digest.size_bytes() {
+                        return Err(Status::data_loss(format!(
+                            "committed {} bytes for {}",
+                            response.get_ref().committed_size,
+                            digest
+                        )));
+                    }
+                    Ok(response)
                 }
-                Ok(response)
-            }
-        })
-        .await
-        .map(|_| ())
+            })
+            .await;
+        write
+            .with_context(|| {
+                format!(
+                    "write blob {} to ByteStream resource {resource_name}",
+                    blob.digest
+                )
+            })
+            .map(|_| ())
     }
 
     async fn bytestream_read(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
         let resource_name = bytestream_read_resource_name(&self.config.instance_name, digest);
-        let mut response = self
+        let response = self
             .retry_rpc(CasOperation::ByteStreamRead, || {
                 let mut bytestream = self.bytestream.clone();
                 let resource_name = resource_name.clone();
@@ -483,7 +570,11 @@ impl CasClient {
                         .await
                 }
             })
-            .await?
+            .await;
+        let mut response = response
+            .with_context(|| {
+                format!("start ByteStream.Read for {digest} resource {resource_name}")
+            })?
             .into_inner();
 
         let mut data = Vec::new();
@@ -507,12 +598,20 @@ impl CasClient {
                         attempts: 1,
                         cas_url: self.config.cas_url.clone(),
                         instance_name: self.config.instance_name.clone(),
-                        status: Box::new(status),
+                        status: Box::new(Status::new(
+                            status.code(),
+                            format!(
+                                "read next ByteStream chunk for {digest} resource {resource_name}: {}",
+                                status.message()
+                            ),
+                        )),
                     })?
                     .data,
             );
         }
-        verify_download(digest, &data)?;
+        verify_download(digest, &data).with_context(|| {
+            format!("verify ByteStream.Read response for {digest} resource {resource_name}")
+        })?;
         Ok(Bytes::from(data))
     }
 
@@ -729,6 +828,14 @@ mod tests {
         .unwrap()
     }
 
+    fn rendered_chain(error: CasError) -> String {
+        anyhow::Error::new(error)
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn instance_name_rejects_empty_and_reserved_segments() {
         assert!(validate_instance_name("").is_err());
@@ -854,5 +961,25 @@ mod tests {
             assert!(!is_retryable_status(&Status::new(code, "semantic")));
         }
         assert!(!is_retryable_status(&Status::internal("digest mismatch")));
+    }
+
+    #[test]
+    fn cas_context_chain_preserves_rpc_operation_url_and_instance() {
+        let error = Err::<(), CasError>(CasError::Rpc {
+            operation: CasOperation::BatchReadBlobs,
+            attempts: 3,
+            cas_url: "grpc://127.0.0.1:9092".to_string(),
+            instance_name: "remotefs/tests".to_string(),
+            status: Box::new(Status::unavailable("connection reset by peer")),
+        })
+        .with_context(|| format!("download blob {} through BatchReadBlobs", valid_digest(12)))
+        .unwrap_err();
+
+        let rendered = rendered_chain(error);
+        assert!(rendered.contains("download blob sha256:"));
+        assert!(rendered.contains("BatchReadBlobs"));
+        assert!(rendered.contains("failed after 3 attempt(s)"));
+        assert!(rendered.contains("grpc://127.0.0.1:9092"));
+        assert!(rendered.contains("remotefs/tests"));
     }
 }

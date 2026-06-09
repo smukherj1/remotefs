@@ -26,6 +26,16 @@ These guidelines capture style and quality expectations remotefs code.
 
 - Avoid unnecessary data cloning. Clone request data only where ownership, async retries, or tonic request construction requires it.
 
+## Error Context
+
+- Add context whenever an error is propagated, especially at `?` sites. The context should state what operation was in progress, not just that something failed.
+- Prefer lazy context for dynamic messages so paths, digests, entry names, URLs, and counts are formatted only on error.
+- Use `anyhow::Context` only in functions that return `anyhow::Result`.
+- Use RemoteFS typed context helpers or traits in functions that return typed errors such as `TreeError`, `CasError`, `UploadError`, `DigestError`, or `ConfigError`.
+- Keep `map_err` when it constructs a structured error variant that already includes the operation and relevant identifiers.
+- Context messages should include stable debugging identifiers where available: paths, digests, CAS operation names, instance names, resource names, directory entry names, environment variable names, and proto paths.
+- Do not add vague context such as `failed`, `error`, or `operation failed`; the source error already communicates failure.
+
 ## Comments
 
 - Use comments to explain non-obvious design choices, edge cases, protocol quirks, invariants, and tradeoffs.

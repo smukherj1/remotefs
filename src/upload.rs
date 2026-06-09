@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::cas::{Blob, BlobStore, CasError};
 use crate::digest::Digest;
+use crate::error_context::ResultContext as _;
 use crate::tree::{
     DirectoryBuilder, DirectoryEntry, EncodedDirectory, EncodedDirectoryTree, FileEntry, NodeKind,
     NodeMetadata, SymlinkEntry, TreeError, TreeWarnings,
@@ -40,6 +41,21 @@ pub enum UploadError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{operation}: {source}")]
+    Context {
+        operation: String,
+        #[source]
+        source: Box<UploadError>,
+    },
+}
+
+impl crate::error_context::ResultContextError for UploadError {
+    fn with_context(self, operation: String) -> Self {
+        UploadError::Context {
+            operation,
+            source: Box::new(self),
+        }
+    }
 }
 
 /// Scans a local directory into a canonical encoded tree.
@@ -50,7 +66,8 @@ pub enum UploadError {
 pub fn scan_local_tree(root: impl AsRef<Path>) -> Result<EncodedDirectoryTree, TreeError> {
     let root = root.as_ref();
     let mut state = ScanState::default();
-    let root_directory = scan_directory(root, &mut state)?;
+    let root_directory = scan_directory(root, &mut state)
+        .with_context(|| format!("scan root directory {}", root.display()))?;
     state.warnings.merge(&root_directory.warnings);
     let root_digest = root_directory.digest.clone();
     state.directories.push(root_directory);
@@ -73,7 +90,16 @@ pub async fn upload_missing<S: BlobStore + Send>(
     inputs: Vec<UploadInput>,
 ) -> Result<UploadCounts, UploadError> {
     let digests = inputs.iter().map(|i| i.into()).cloned().collect::<Vec<_>>();
-    let missing = store.find_missing_blobs(&digests).await?;
+    let missing = store
+        .find_missing_blobs(&digests)
+        .await
+        .map_err(UploadError::from)
+        .with_context(|| {
+            format!(
+                "check which {} upload input digest(s) are missing from CAS",
+                digests.len()
+            )
+        })?;
     let mut counts = UploadCounts::default();
     let mut blobs = Vec::new();
 
@@ -103,7 +129,17 @@ pub async fn upload_missing<S: BlobStore + Send>(
         }
     }
 
-    store.upload_blobs(blobs).await?;
+    let upload_count = blobs.len();
+    store
+        .upload_blobs(blobs)
+        .await
+        .map_err(UploadError::from)
+        .with_context(|| {
+            format!(
+                "upload {upload_count} missing blob(s) to CAS: {} file blob(s), {} directory node(s)",
+                counts.file_blobs, counts.directory_nodes
+            )
+        })?;
     Ok(counts)
 }
 
@@ -156,7 +192,9 @@ fn scan_directory(path: &Path, state: &mut ScanState) -> Result<EncodedDirectory
 
     for entry in entries {
         let child_path = entry.path();
-        let name = component_name(&child_path)?;
+        let name = component_name(&child_path).with_context(|| {
+            format!("extract child component name for {}", child_path.display())
+        })?;
         let metadata =
             fs::symlink_metadata(&child_path).map_err(|source| TreeError::Filesystem {
                 path: child_path.clone(),
@@ -171,21 +209,35 @@ fn scan_directory(path: &Path, state: &mut ScanState) -> Result<EncodedDirectory
             })?;
             let digest = Digest::for_bytes(&data);
             state.file_blobs.push((digest.clone(), child_path.clone()));
-            builder.add_file(FileEntry {
-                name,
-                digest,
-                metadata: metadata_for(NodeKind::File, &metadata),
-            })?;
+            let entry_name = name.clone();
+            builder
+                .add_file(FileEntry {
+                    name,
+                    digest,
+                    metadata: metadata_for(NodeKind::File, &metadata),
+                })
+                .with_context(|| {
+                    format!("add file entry {entry_name} from {}", child_path.display())
+                })?;
         } else if file_type.is_dir() {
-            let encoded = scan_directory(&child_path, state)?;
+            let encoded = scan_directory(&child_path, state)
+                .with_context(|| format!("scan child directory {}", child_path.display()))?;
             state.warnings.merge(&encoded.warnings);
             let digest = encoded.digest.clone();
             state.directories.push(encoded);
-            builder.add_directory(DirectoryEntry {
-                name,
-                digest,
-                metadata: metadata_for(NodeKind::Directory, &metadata),
-            })?;
+            let entry_name = name.clone();
+            builder
+                .add_directory(DirectoryEntry {
+                    name,
+                    digest,
+                    metadata: metadata_for(NodeKind::Directory, &metadata),
+                })
+                .with_context(|| {
+                    format!(
+                        "add directory entry {entry_name} from {}",
+                        child_path.display()
+                    )
+                })?;
         } else if file_type.is_symlink() {
             let target = fs::read_link(&child_path).map_err(|source| TreeError::Filesystem {
                 path: child_path.clone(),
@@ -195,13 +247,24 @@ fn scan_directory(path: &Path, state: &mut ScanState) -> Result<EncodedDirectory
                 .to_str()
                 .ok_or_else(|| TreeError::NonUtf8SymlinkTarget {
                     path: child_path.clone(),
-                })?
-                .to_string();
-            builder.add_symlink(SymlinkEntry {
-                name,
-                target,
-                metadata: metadata_for(NodeKind::Symlink, &metadata),
-            })?;
+                })
+                .map(ToOwned::to_owned)
+                .with_context(|| {
+                    format!("validate symlink target UTF-8 for {}", child_path.display())
+                })?;
+            let entry_name = name.clone();
+            builder
+                .add_symlink(SymlinkEntry {
+                    name,
+                    target,
+                    metadata: metadata_for(NodeKind::Symlink, &metadata),
+                })
+                .with_context(|| {
+                    format!(
+                        "add symlink entry {entry_name} from {}",
+                        child_path.display()
+                    )
+                })?;
         } else {
             return Err(TreeError::UnsupportedNodeType {
                 path: child_path,
@@ -210,7 +273,9 @@ fn scan_directory(path: &Path, state: &mut ScanState) -> Result<EncodedDirectory
         }
     }
 
-    builder.encode()
+    builder
+        .encode()
+        .with_context(|| format!("encode directory {}", path.display()))
 }
 
 fn component_name(path: &Path) -> Result<String, TreeError> {
@@ -247,9 +312,9 @@ fn node_type_name(file_type: fs::FileType) -> &'static str {
     }
 }
 
-impl<'a> Into<&'a Digest> for &'a UploadInput {
-    fn into(self) -> &'a Digest {
-        match self {
+impl<'a> From<&'a UploadInput> for &'a Digest {
+    fn from(input: &'a UploadInput) -> Self {
+        match input {
             UploadInput::Directory { digest, .. } | UploadInput::File { digest, .. } => digest,
         }
     }
@@ -258,7 +323,17 @@ impl<'a> Into<&'a Digest> for &'a UploadInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     use tempfile::tempdir;
+
+    fn rendered_tree_chain(error: TreeError) -> String {
+        anyhow::Error::new(error)
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn scanner_preserves_file_directory_and_symlink_entries() {
@@ -279,5 +354,18 @@ mod tests {
         assert_eq!(root.directory.symlinks[0].target, "../target");
         assert_eq!(tree.file_blobs.len(), 1);
         assert_eq!(tree.warnings.escaping_symlinks, 1);
+    }
+
+    #[test]
+    fn scanner_error_includes_root_scan_and_child_context() {
+        let temp = tempdir().unwrap();
+        std::os::unix::fs::symlink(OsStr::from_bytes(b"\xff"), temp.path().join("bad-link"))
+            .unwrap();
+
+        let error = scan_local_tree(temp.path()).unwrap_err();
+        let rendered = rendered_tree_chain(error);
+        assert!(rendered.contains(&format!("scan root directory {}", temp.path().display())));
+        assert!(rendered.contains("validate symlink target UTF-8"));
+        assert!(rendered.contains("Symlink target is not UTF-8"));
     }
 }

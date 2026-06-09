@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use remotefs::cas::{Blob, CasClient, CasConfig};
 use remotefs::digest::Digest;
 use remotefs::tree::decode_directory;
@@ -89,26 +90,49 @@ async fn tree_fixture_round_trips_through_local_cas() {
     compare_trees(source.path(), reconstructed.path());
 }
 
-fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
+fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("create fixture destination {}", destination.display()))?;
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("read fixture source directory {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in {}", source.display()))?;
         if entry.file_name() == ".gitkeep" {
             continue;
         }
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)?;
+        let metadata = fs::symlink_metadata(&source_path)
+            .with_context(|| format!("read metadata for fixture {}", source_path.display()))?;
         if metadata.file_type().is_symlink() {
-            symlink(fs::read_link(&source_path)?, destination_path)?;
+            let target = fs::read_link(&source_path)
+                .with_context(|| format!("read symlink target {}", source_path.display()))?;
+            symlink(target, &destination_path).with_context(|| {
+                format!("create fixture symlink {}", destination_path.display())
+            })?;
         } else if metadata.is_dir() {
-            copy_tree(&source_path, &destination_path)?;
+            copy_tree(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copy fixture directory {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
         } else {
-            fs::copy(&source_path, &destination_path)?;
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "copy fixture file {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
             fs::set_permissions(
                 &destination_path,
                 fs::Permissions::from_mode(metadata.permissions().mode() & 0o777),
-            )?;
+            )
+            .with_context(|| {
+                format!("set fixture permissions on {}", destination_path.display())
+            })?;
         }
     }
     Ok(())

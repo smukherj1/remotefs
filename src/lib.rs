@@ -2,6 +2,7 @@ pub mod cas;
 pub mod config;
 pub mod control;
 pub mod digest;
+pub mod error_context;
 pub mod fs;
 pub mod reapi;
 pub mod state;

@@ -4,8 +4,10 @@ use thiserror::Error;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum ConfigError {
-    #[error("Could not determine user home directory")]
-    HomeDirNotFound,
+    #[error(
+        "Unable to determine directory to use as home, neither RFS_HOME nor the HOME env variable was set"
+    )]
+    RfsHomeNotResolved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +22,7 @@ impl Config {
         let rfs_home = match env::var_os("RFS_HOME") {
             Some(val) => PathBuf::from(val),
             None => {
-                let home = env::var_os("HOME").ok_or(ConfigError::HomeDirNotFound)?;
+                let home = env::var_os("HOME").ok_or(ConfigError::RfsHomeNotResolved)?;
                 Path::new(&home).join(".rfs")
             }
         };
@@ -47,6 +49,12 @@ impl Config {
 mod tests {
     use super::*;
     use std::env;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     fn clear_env() {
         unsafe {
@@ -58,6 +66,7 @@ mod tests {
 
     #[test]
     fn test_default_paths() {
+        let _guard = env_lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
@@ -77,6 +86,7 @@ mod tests {
 
     #[test]
     fn test_rfs_home_override() {
+        let _guard = env_lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
@@ -97,6 +107,7 @@ mod tests {
 
     #[test]
     fn test_all_overrides() {
+        let _guard = env_lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
@@ -113,12 +124,13 @@ mod tests {
 
     #[test]
     fn test_no_home_var() {
+        let _guard = env_lock();
         clear_env();
         unsafe {
             env::remove_var("HOME");
         }
 
         let config = Config::new();
-        assert_eq!(config, Err(ConfigError::HomeDirNotFound));
+        assert_eq!(config, Err(ConfigError::RfsHomeNotResolved));
     }
 }

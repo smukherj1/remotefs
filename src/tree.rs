@@ -7,6 +7,7 @@ use prost_types::Timestamp;
 use thiserror::Error;
 
 use crate::digest::{Digest, DigestError};
+use crate::error_context::ResultContext as _;
 use crate::reapi::remote_execution::{
     Directory, DirectoryNode, FileNode, NodeProperties, SymlinkNode,
 };
@@ -67,7 +68,8 @@ impl NodeMetadata {
         });
 
         if let Some(timestamp) = &self.mtime {
-            validate_timestamp(path, timestamp)?;
+            validate_timestamp(path.clone(), timestamp)
+                .with_context(|| format!("validate mtime for {}", path.display()))?;
         }
 
         Ok((
@@ -228,6 +230,21 @@ pub enum TreeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{operation}: {source}")]
+    Context {
+        operation: String,
+        #[source]
+        source: Box<TreeError>,
+    },
+}
+
+impl crate::error_context::ResultContextError for TreeError {
+    fn with_context(self, operation: String) -> Self {
+        TreeError::Context {
+            operation,
+            source: Box::new(self),
+        }
+    }
 }
 
 /// Builder for one canonical REAPI `Directory`.
@@ -265,7 +282,8 @@ impl DirectoryBuilder {
     /// Entry names must be valid single path components. Duplicate names across
     /// all node kinds are rejected when `encode` is called.
     pub fn add_file(&mut self, entry: FileEntry) -> Result<(), TreeError> {
-        validate_name(&entry.name)?;
+        validate_name(&entry.name)
+            .with_context(|| format!("validate file entry name {}", entry.name))?;
         self.files.push(entry);
         Ok(())
     }
@@ -275,7 +293,8 @@ impl DirectoryBuilder {
     /// Entry names must be valid single path components. Duplicate names across
     /// all node kinds are rejected when `encode` is called.
     pub fn add_directory(&mut self, entry: DirectoryEntry) -> Result<(), TreeError> {
-        validate_name(&entry.name)?;
+        validate_name(&entry.name)
+            .with_context(|| format!("validate directory entry name {}", entry.name))?;
         self.directories.push(entry);
         Ok(())
     }
@@ -285,7 +304,8 @@ impl DirectoryBuilder {
     /// Entry names must be valid single path components. The target is stored
     /// exactly as supplied, including absolute paths and `..` components.
     pub fn add_symlink(&mut self, entry: SymlinkEntry) -> Result<(), TreeError> {
-        validate_name(&entry.name)?;
+        validate_name(&entry.name)
+            .with_context(|| format!("validate symlink entry name {}", entry.name))?;
         self.symlinks.push(entry);
         Ok(())
     }
@@ -297,26 +317,41 @@ impl DirectoryBuilder {
     /// hashed exactly as uploaded to CAS.
     pub fn encode(mut self) -> Result<EncodedDirectory, TreeError> {
         sort_entries(&mut self);
-        reject_duplicate_names(&self)?;
+        reject_duplicate_names(&self)
+            .context("reject duplicate names before encoding directory")?;
 
         let mut warnings = TreeWarnings::default();
         let node_properties =
-            normalize_optional_metadata(self.metadata, PathBuf::from("."), &mut warnings)?;
+            normalize_optional_metadata(self.metadata, PathBuf::from("."), &mut warnings)
+                .context("normalize root directory metadata")?;
         let files = self
             .files
             .into_iter()
-            .map(|entry| file_node(entry, &mut warnings))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|entry| {
+                let name = entry.name.clone();
+                file_node(entry, &mut warnings).with_context(|| format!("encode file node {name}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .context("encode all file nodes for directory")?;
         let directories = self
             .directories
             .into_iter()
-            .map(directory_node)
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|entry| {
+                let name = entry.name.clone();
+                directory_node(entry).with_context(|| format!("encode directory node {name}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .context("encode all directory nodes for directory")?;
         let symlinks = self
             .symlinks
             .into_iter()
-            .map(|entry| symlink_node(entry, &mut warnings))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|entry| {
+                let name = entry.name.clone();
+                symlink_node(entry, &mut warnings)
+                    .with_context(|| format!("encode symlink node {name}"))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .context("encode all symlink nodes for directory")?;
         let directory = Directory {
             files,
             directories,
@@ -355,7 +390,8 @@ pub fn decode_directory(expected: Digest, bytes: Bytes) -> Result<Directory, Tre
         digest: expected.clone(),
         source,
     })?;
-    validate_directory(&directory)?;
+    validate_directory(&directory)
+        .with_context(|| format!("validate decoded REAPI Directory {expected}"))?;
     Ok(directory)
 }
 
@@ -414,14 +450,17 @@ fn normalize_optional_metadata(
     let Some(metadata) = metadata else {
         return Ok(None);
     };
-    let (metadata, metadata_warnings) = metadata.normalize(path)?;
+    let (metadata, metadata_warnings) = metadata
+        .normalize(path.clone())
+        .with_context(|| format!("normalize node metadata for {}", path.display()))?;
     warnings.merge(&metadata_warnings);
     Ok(metadata.into_node_properties())
 }
 
 fn file_node(entry: FileEntry, warnings: &mut TreeWarnings) -> Result<FileNode, TreeError> {
     let path = PathBuf::from(&entry.name);
-    let node_properties = normalize_optional_metadata(Some(entry.metadata), path, warnings)?;
+    let node_properties = normalize_optional_metadata(Some(entry.metadata), path, warnings)
+        .with_context(|| format!("normalize file node metadata for {}", entry.name))?;
     let mode = node_properties
         .as_ref()
         .and_then(|properties| properties.unix_mode)
@@ -458,7 +497,8 @@ fn symlink_node(
             target: entry.target.clone(),
         });
     }
-    let node_properties = normalize_optional_metadata(Some(entry.metadata), path, warnings)?;
+    let node_properties = normalize_optional_metadata(Some(entry.metadata), path, warnings)
+        .with_context(|| format!("normalize symlink node metadata for {}", entry.name))?;
     Ok(SymlinkNode {
         name: entry.name,
         target: entry.target,
@@ -498,9 +538,12 @@ fn validate_timestamp(path: PathBuf, timestamp: &Timestamp) -> Result<(), TreeEr
 }
 
 fn validate_directory(directory: &Directory) -> Result<(), TreeError> {
-    validate_sorted_names(directory.files.iter().map(|node| node.name.as_str()))?;
-    validate_sorted_names(directory.directories.iter().map(|node| node.name.as_str()))?;
-    validate_sorted_names(directory.symlinks.iter().map(|node| node.name.as_str()))?;
+    validate_sorted_names(directory.files.iter().map(|node| node.name.as_str()))
+        .context("validate sorted file node names")?;
+    validate_sorted_names(directory.directories.iter().map(|node| node.name.as_str()))
+        .context("validate sorted directory node names")?;
+    validate_sorted_names(directory.symlinks.iter().map(|node| node.name.as_str()))
+        .context("validate sorted symlink node names")?;
 
     let mut names: HashSet<&str> = HashSet::new();
     for name in directory
@@ -510,7 +553,7 @@ fn validate_directory(directory: &Directory) -> Result<(), TreeError> {
         .chain(directory.directories.iter().map(|node| node.name.as_str()))
         .chain(directory.symlinks.iter().map(|node| node.name.as_str()))
     {
-        validate_name(name)?;
+        validate_name(name).with_context(|| format!("validate decoded node name {name}"))?;
         if !names.insert(name) {
             return Err(TreeError::DuplicateName {
                 name: name.to_string(),
@@ -518,7 +561,8 @@ fn validate_directory(directory: &Directory) -> Result<(), TreeError> {
         }
     }
 
-    validate_node_properties(".", directory.node_properties.as_ref())?;
+    validate_node_properties(".", directory.node_properties.as_ref())
+        .context("validate root directory node properties")?;
     for node in &directory.files {
         let digest = node
             .digest
@@ -530,7 +574,8 @@ fn validate_directory(directory: &Directory) -> Result<(), TreeError> {
             name: node.name.clone(),
             source,
         })?;
-        validate_node_properties(&node.name, node.node_properties.as_ref())?;
+        validate_node_properties(&node.name, node.node_properties.as_ref())
+            .with_context(|| format!("validate file node properties for {}", node.name))?;
     }
     for node in &directory.directories {
         let digest = node
@@ -545,7 +590,8 @@ fn validate_directory(directory: &Directory) -> Result<(), TreeError> {
         })?;
     }
     for node in &directory.symlinks {
-        validate_node_properties(&node.name, node.node_properties.as_ref())?;
+        validate_node_properties(&node.name, node.node_properties.as_ref())
+            .with_context(|| format!("validate symlink node properties for {}", node.name))?;
     }
 
     Ok(())
@@ -571,7 +617,8 @@ fn validate_node_properties(
     if let Some(properties) = properties
         && let Some(timestamp) = &properties.mtime
     {
-        validate_timestamp(PathBuf::from(name), timestamp)?;
+        validate_timestamp(PathBuf::from(name), timestamp)
+            .with_context(|| format!("validate node properties timestamp for {name}"))?;
     }
     Ok(())
 }
@@ -609,6 +656,14 @@ mod tests {
         }
     }
 
+    fn rendered_chain(error: TreeError) -> String {
+        anyhow::Error::new(error)
+            .chain()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn canonical_ordering_is_stable() {
         let mut left = DirectoryBuilder::new();
@@ -638,20 +693,20 @@ mod tests {
         builder.add_file(file("same", 0o644)).unwrap();
         builder.add_directory(dir("same")).unwrap();
 
-        assert!(matches!(
-            builder.encode(),
-            Err(TreeError::DuplicateName { name }) if name == "same"
-        ));
+        let error = builder.encode().unwrap_err();
+        let rendered = rendered_chain(error);
+        assert!(rendered.contains("reject duplicate names before encoding directory"));
+        assert!(rendered.contains("Duplicate tree entry name `same`"));
     }
 
     #[test]
     fn invalid_component_names_are_rejected() {
         for name in ["", ".", "..", "a/b"] {
             let mut builder = DirectoryBuilder::new();
-            assert!(matches!(
-                builder.add_file(file(name, 0o644)),
-                Err(TreeError::InvalidName { .. })
-            ));
+            let error = builder.add_file(file(name, 0o644)).unwrap_err();
+            let rendered = rendered_chain(error);
+            assert!(rendered.contains("validate file entry name"));
+            assert!(rendered.contains("Invalid entry name"));
         }
     }
 
@@ -735,10 +790,11 @@ mod tests {
             })
             .unwrap();
 
-        assert!(matches!(
-            builder.encode(),
-            Err(TreeError::UnsupportedTimestamp { .. })
-        ));
+        let error = builder.encode().unwrap_err();
+        let rendered = rendered_chain(error);
+        assert!(rendered.contains("encode file node future"));
+        assert!(rendered.contains("normalize file node metadata for future"));
+        assert!(rendered.contains("Unsupported timestamp at future"));
     }
 
     #[test]
@@ -783,10 +839,11 @@ mod tests {
         let bytes = Bytes::from(directory.encode_to_vec());
         let digest = Digest::for_bytes(bytes.as_ref());
 
-        assert!(matches!(
-            decode_directory(digest, bytes),
-            Err(TreeError::DuplicateName { .. })
-        ));
+        let error = decode_directory(digest.clone(), bytes).unwrap_err();
+        let rendered = rendered_chain(error);
+        assert!(rendered.contains(&format!("validate decoded REAPI Directory {digest}")));
+        assert!(rendered.contains("validate sorted file node names"));
+        assert!(rendered.contains("Duplicate tree entry name `a`"));
     }
 
     #[test]
@@ -808,9 +865,9 @@ mod tests {
         let bytes = Bytes::from(directory.encode_to_vec());
         let digest = Digest::for_bytes(bytes.as_ref());
 
-        assert!(matches!(
-            decode_directory(digest, bytes),
-            Err(TreeError::InvalidDigest { .. })
-        ));
+        let error = decode_directory(digest.clone(), bytes).unwrap_err();
+        let rendered = rendered_chain(error);
+        assert!(rendered.contains(&format!("validate decoded REAPI Directory {digest}")));
+        assert!(rendered.contains("Invalid digest in directory entry `bad`"));
     }
 }

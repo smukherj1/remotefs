@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+use anyhow::{Context, Result};
+
+fn main() -> Result<()> {
     let third_party = PathBuf::from("third_party/remote-apis");
     let control = PathBuf::from("proto");
 
@@ -17,7 +19,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(true)
         .build_client(true)
         .disable_comments(".")
-        .compile_with_config(prost_config, &protos, &[third_party, control])?;
+        .compile_with_config(prost_config, &protos, &[third_party, control])
+        .with_context(|| format!("compile RemoteFS protobuf definitions: {protos:?}"))?;
 
     for proto in protos {
         println!("cargo:rerun-if-changed={proto}");
