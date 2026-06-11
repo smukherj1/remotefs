@@ -18,7 +18,24 @@ pub struct Config {
 }
 
 impl Config {
+    /// Resolves local RemoteFS state paths from environment variables.
+    ///
+    /// `RFS_HOME` controls the default state root. `RFS_CACHE_DIR` and
+    /// `RFS_SESSION_DIR` override their individual directories when present.
+    /// Returns `ConfigError::RfsHomeNotResolved` if neither `RFS_HOME` nor
+    /// `HOME` is available.
     pub fn new() -> Result<Self, ConfigError> {
+        Self::from_overrides(None, None)
+    }
+
+    /// Resolves local RemoteFS state paths with explicit CLI overrides.
+    ///
+    /// `cache_dir` and `session_dir` take precedence over `RFS_CACHE_DIR` and
+    /// `RFS_SESSION_DIR`. Other path defaults are the same as `Config::new`.
+    pub fn from_overrides(
+        cache_dir: Option<PathBuf>,
+        session_dir: Option<PathBuf>,
+    ) -> Result<Self, ConfigError> {
         let rfs_home = match env::var_os("RFS_HOME") {
             Some(val) => PathBuf::from(val),
             None => {
@@ -27,15 +44,15 @@ impl Config {
             }
         };
 
-        let rfs_cache_dir = match env::var_os("RFS_CACHE_DIR") {
+        let rfs_cache_dir = cache_dir.unwrap_or_else(|| match env::var_os("RFS_CACHE_DIR") {
             Some(val) => PathBuf::from(val),
             None => rfs_home.join("cache"),
-        };
+        });
 
-        let rfs_session_dir = match env::var_os("RFS_SESSION_DIR") {
+        let rfs_session_dir = session_dir.unwrap_or_else(|| match env::var_os("RFS_SESSION_DIR") {
             Some(val) => PathBuf::from(val),
             None => rfs_home.join("active"),
-        };
+        });
 
         Ok(Config {
             rfs_home,
@@ -49,12 +66,6 @@ impl Config {
 mod tests {
     use super::*;
     use std::env;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
 
     fn clear_env() {
         unsafe {
@@ -66,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_default_paths() {
-        let _guard = env_lock();
+        let _guard = crate::test_env::lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
@@ -86,7 +97,7 @@ mod tests {
 
     #[test]
     fn test_rfs_home_override() {
-        let _guard = env_lock();
+        let _guard = crate::test_env::lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
@@ -107,7 +118,7 @@ mod tests {
 
     #[test]
     fn test_all_overrides() {
-        let _guard = env_lock();
+        let _guard = crate::test_env::lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
@@ -124,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_no_home_var() {
-        let _guard = env_lock();
+        let _guard = crate::test_env::lock();
         clear_env();
         unsafe {
             env::remove_var("HOME");

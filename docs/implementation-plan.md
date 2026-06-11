@@ -230,7 +230,7 @@ Definition of done:
 - CAS configuration requires a non-empty REAPI `instance_name` and sends it consistently on CAS and ByteStream calls.
 - Review comments in `src/cas.rs` are resolved and removed, either by implementing the requested change or by replacing the comment with a durable explanation of the chosen design.
 
-### Step 2.2: Canonical Tree Encoding
+### Step 2.2: Canonical Tree Encoding (Complete)
 
 Deliverables:
 
@@ -294,7 +294,7 @@ Definition of done:
 
 ## Phase 3: Bootstrap CLI
 
-### Step 3.1: CLI Skeleton and Config
+### Step 3.1: CLI Skeleton and Config (Complete)
 
 Deliverables:
 
