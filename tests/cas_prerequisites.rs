@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use remotefs::cas::{Blob, CasClient, CasConfig};
 use remotefs::digest::Digest;
 use remotefs::tree::decode_directory;
-use remotefs::upload::{scan_local_tree, upload_inputs_for_tree, upload_missing};
+use remotefs::upload::{UploadOptions, upload_local_directory};
 use tempfile::tempdir;
 
 const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";
@@ -43,7 +43,7 @@ fn local_bazel_remote_grpc_endpoint_is_reachable() {
 async fn local_bazel_remote_upload_check_download_and_reupload() {
     verify_prerequisites();
 
-    let blob = Blob::new(b"remotefs integration blob\n".to_vec());
+    let blob = Blob::from_bytes("remotefs integration blob\n");
     let config = CasConfig::new(format!("grpc://{LOCAL_CAS_ADDR}"), "remotefs/tests").unwrap();
     let mut client = CasClient::connect(config).await.unwrap();
 
@@ -52,7 +52,10 @@ async fn local_bazel_remote_upload_check_download_and_reupload() {
         .await
         .unwrap();
     if missing_before.contains(&blob.digest) {
-        client.upload_blobs(vec![blob.clone()]).await.unwrap();
+        client
+            .upload_blob_sources(vec![blob.clone()])
+            .await
+            .unwrap();
     }
 
     assert_eq!(
@@ -64,9 +67,9 @@ async fn local_bazel_remote_upload_check_download_and_reupload() {
     );
 
     let downloaded = client.download_blob(&blob.digest).await.unwrap();
-    assert_eq!(downloaded.as_ref(), blob.data.as_slice());
+    assert_eq!(downloaded.as_ref(), b"remotefs integration blob\n");
 
-    client.upload_blobs(vec![blob]).await.unwrap();
+    client.upload_blob_sources(vec![blob]).await.unwrap();
 }
 
 #[tokio::test]
@@ -76,17 +79,16 @@ async fn tree_fixture_round_trips_through_local_cas() {
     let source = tempdir().unwrap();
     copy_tree(Path::new("tests/fixtures/tree-roundtrip"), source.path()).unwrap();
 
-    let tree = scan_local_tree(source.path()).unwrap();
-    assert!(!tree.file_blobs.is_empty());
-    assert!(!tree.directories.is_empty());
     let config = CasConfig::new(format!("grpc://{LOCAL_CAS_ADDR}"), "remotefs/tests").unwrap();
     let mut client = CasClient::connect(config).await.unwrap();
-    upload_missing(&mut client, upload_inputs_for_tree(&tree))
+    let summary = upload_local_directory(&mut client, source.path(), UploadOptions::default())
         .await
         .unwrap();
+    assert!(summary.files > 0);
+    assert!(summary.directories > 0);
 
     let reconstructed = tempdir().unwrap();
-    reconstruct_directory(&mut client, &tree.root_digest, reconstructed.path()).await;
+    reconstruct_directory(&mut client, &summary.root_digest, reconstructed.path()).await;
     compare_trees(source.path(), reconstructed.path());
 }
 

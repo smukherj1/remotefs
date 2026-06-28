@@ -1,7 +1,8 @@
 use clap::Parser;
-use remotefs::cli::{Cli, render_error, run};
+use remotefs::cli::{Cli, render_error_for_command, run};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -11,9 +12,10 @@ fn main() {
         }
     };
     let json = cli.json_output();
+    let command = cli.command_name();
 
-    if let Err(error) = run(cli) {
-        eprintln!("{}", render_error(&error, json));
+    if let Err(error) = run(cli).await {
+        eprintln!("{}", render_error_for_command(&error, json, command));
         std::process::exit(1);
     }
 }

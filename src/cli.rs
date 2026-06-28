@@ -6,9 +6,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::cas::CasConfig;
+use crate::cas::{CasClient, CasConfig};
 use crate::config::{Config, ConfigError};
 use crate::digest::{Digest, DigestError};
+use crate::upload::{UploadOptions, UploadSummary, upload_local_directory};
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -65,6 +66,11 @@ impl Cli {
     pub fn json_output(&self) -> bool {
         self.json
     }
+
+    /// Returns the selected subcommand name for diagnostics.
+    pub fn command_name(&self) -> &'static str {
+        self.command.name()
+    }
 }
 
 /// Supported `rfs` subcommands for the MVP command surface.
@@ -99,6 +105,19 @@ enum Commands {
     },
     #[command(about = "Clean up stale active session state and locks")]
     Cleanup,
+}
+
+impl Commands {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Upload { .. } => "upload",
+            Self::Mount { .. } => "mount",
+            Self::Snapshot { .. } => "snapshot",
+            Self::Unmount { .. } => "unmount",
+            Self::Status { .. } => "status",
+            Self::Cleanup => "cleanup",
+        }
+    }
 }
 
 /// Output format for CLI diagnostics and future logging.
@@ -143,6 +162,11 @@ pub enum CliError {
     ActiveSessionLock { lock_path: PathBuf, pid: u32 },
     #[error("{command} is not implemented yet")]
     NotImplemented { command: &'static str },
+    #[error("{message}")]
+    CommandFailed {
+        category: &'static str,
+        message: String,
+    },
 }
 
 impl CliError {
@@ -154,6 +178,7 @@ impl CliError {
             Self::MountpointMismatch { .. } => "mountpoint_mismatch",
             Self::ActiveSessionLock { .. } => "active_session_lock",
             Self::NotImplemented { .. } => "not_implemented",
+            Self::CommandFailed { category, .. } => category,
         }
     }
 }
@@ -202,15 +227,17 @@ fn resolve_cli_config(cli: &Cli) -> Result<CliConfig, CliError> {
     })
 }
 
-/// Executes the currently implemented step-3.1 command skeleton.
+/// Executes the current command.
 ///
 /// Commands that depend on later phases return `CliError::NotImplemented`
 /// after validating the arguments that already have stable rules.
-pub fn run(cli: Cli) -> Result<(), CliError> {
+pub async fn run(cli: Cli) -> Result<(), CliError> {
     match &cli.command {
-        Commands::Upload { .. } => {
-            resolve_cli_config(&cli)?;
-            Err(CliError::NotImplemented { command: "upload" })
+        Commands::Upload { local_dir } => {
+            let config = resolve_cli_config(&cli)?;
+            let output = run_upload(config, local_dir.clone()).await?;
+            print_command_output(output);
+            Ok(())
         }
         Commands::Mount { root_digest, .. } => {
             parse_root_digest(root_digest)?;
@@ -238,6 +265,116 @@ pub fn run(cli: Cli) -> Result<(), CliError> {
             Err(CliError::NotImplemented { command: "cleanup" })
         }
     }
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    json: bool,
+    summary: UploadSummary,
+}
+
+#[derive(Serialize)]
+struct JsonEnvelope<'a> {
+    schema_version: u32,
+    command: &'static str,
+    ok: bool,
+    warnings: &'a crate::upload::UploadWarnings,
+    error: Option<JsonError>,
+    data: Option<UploadData<'a>>,
+}
+
+#[derive(Serialize)]
+struct UploadData<'a> {
+    root_digest: &'a Digest,
+    files: usize,
+    directories: usize,
+    symlinks: usize,
+    uploaded_blobs: usize,
+    reused_blobs: usize,
+    bytes_uploaded: u64,
+}
+
+#[derive(Serialize)]
+struct JsonError {
+    code: String,
+    message: String,
+    details: serde_json::Value,
+}
+
+async fn run_upload(config: CliConfig, local_dir: PathBuf) -> Result<CommandOutput, CliError> {
+    let metadata = fs::symlink_metadata(&local_dir).map_err(|source| CliError::CommandFailed {
+        category: "filesystem",
+        message: format!(
+            "read metadata for upload root {}: {source}",
+            local_dir.display()
+        ),
+    })?;
+    if !metadata.is_dir() {
+        return Err(CliError::InvalidConfig {
+            message: format!("upload root `{}` is not a directory", local_dir.display()),
+        });
+    }
+
+    let cas_config =
+        CasConfig::new(config.cas_url.clone(), config.instance_name.clone()).map_err(|source| {
+            CliError::InvalidConfig {
+                message: source.to_string(),
+            }
+        })?;
+    let mut client =
+        CasClient::connect(cas_config)
+            .await
+            .map_err(|source| CliError::CommandFailed {
+                category: "cas",
+                message: source.to_string(),
+            })?;
+    let summary = upload_local_directory(&mut client, local_dir, UploadOptions::default())
+        .await
+        .map_err(|source| CliError::CommandFailed {
+            category: "upload",
+            message: source.to_string(),
+        })?;
+    Ok(CommandOutput {
+        json: config.json,
+        summary,
+    })
+}
+
+fn print_command_output(output: CommandOutput) {
+    if output.json {
+        println!("{}", render_upload_success(&output.summary));
+    } else {
+        println!("{}", output.summary.root_digest);
+        eprintln!(
+            "uploaded_blobs={} reused_blobs={} bytes_uploaded={} files={} directories={} symlinks={}",
+            output.summary.uploaded_blobs,
+            output.summary.reused_blobs,
+            output.summary.bytes_uploaded,
+            output.summary.files,
+            output.summary.directories,
+            output.summary.symlinks
+        );
+    }
+}
+
+fn render_upload_success(summary: &UploadSummary) -> String {
+    serde_json::to_string(&JsonEnvelope {
+        schema_version: 1,
+        command: "upload",
+        ok: true,
+        warnings: &summary.warnings,
+        error: None,
+        data: Some(UploadData {
+            root_digest: &summary.root_digest,
+            files: summary.files,
+            directories: summary.directories,
+            symlinks: summary.symlinks,
+            uploaded_blobs: summary.uploaded_blobs,
+            reused_blobs: summary.reused_blobs,
+            bytes_uploaded: summary.bytes_uploaded,
+        }),
+    })
+    .expect("upload success envelope is serializable")
 }
 
 /// Parses and validates an MVP root digest string.
@@ -268,12 +405,23 @@ fn validate_optional_mountpoint(
 
 /// Renders a CLI error as a one-line human message or JSON diagnostic.
 pub fn render_error(error: &CliError, json: bool) -> String {
+    render_error_for_command(error, json, "unknown")
+}
+
+/// Renders a CLI error with a command-aware JSON envelope.
+pub fn render_error_for_command(error: &CliError, json: bool, command: &'static str) -> String {
     if json {
         serde_json::json!({
+            "schema_version": 1,
+            "command": command,
+            "ok": false,
+            "warnings": null,
             "error": {
-                "category": error.category(),
+                "code": error.category(),
                 "message": error.to_string(),
-            }
+                "details": {}
+            },
+            "data": null
         })
         .to_string()
     } else {

@@ -69,3 +69,13 @@ tasks:
     desc: Verify the local bazel-remote CAS test prerequisite
     cmds:
       - cargo test --test cas_prerequisites
+
+  test:integration:upload:
+    desc: Verify upload integration behavior against the local bazel-remote CAS
+    cmds:
+      - cargo test --test upload_integration
+
+  fixture:upload:
+    desc: Upload the checked-in tree fixture to the local bazel-remote CAS
+    cmds:
+      - cargo run --bin rfs -- --cas-url grpc://127.0.0.1:9092 --instance-name remotefs/fixtures upload tests/fixtures/tree-roundtrip

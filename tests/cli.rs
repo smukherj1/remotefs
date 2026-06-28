@@ -56,7 +56,7 @@ fn test_rfs_json_error_diagnostic() {
         .assert()
         .failure()
         .code(1)
-        .stderr(predicate::str::contains("\"category\":\"invalid_digest\""));
+        .stderr(predicate::str::contains("\"code\":\"invalid_digest\""));
 }
 
 #[test]
