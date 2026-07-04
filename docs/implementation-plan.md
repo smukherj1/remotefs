@@ -309,9 +309,8 @@ Deliverables:
 - Implement common flags:
   - `--cas-url`
   - `--instance-name`
-  - `--json`
   - `--log-level`
-  - `--log-format text|json`
+  - `--output-format text|json`
   - `--cache-dir`
   - `--session-dir`
 - Use simple process exit codes: `0` for success and `1` for any error. Put detailed error categories in human and JSON diagnostics instead of numeric exit codes.
@@ -734,7 +733,7 @@ Deliverables:
 - Add a short snapshot barrier.
 - Fail snapshot if writable handles or in-flight mutations are active.
 - Return human and JSON output with root digest and counters.
-- Use the stable JSON envelope for `rfs snapshot --json`: `schema_version`, `command`, `ok`, `warnings`, `error`, and `data`.
+- Use the stable JSON envelope for `rfs snapshot --output-format json`: `schema_version`, `command`, `ok`, `warnings`, `error`, and `data`.
 
 Task targets:
 
@@ -775,7 +774,7 @@ Deliverables:
   - Snapshot duration.
   - Remote errors.
   - Digest verification failures.
-- Implement `rfs status` and `rfs status --json`.
+- Implement `rfs status` and `rfs status --output-format json`.
 - Status output covers live active session, previous/stale session, and clean no-session states.
 - Implement stable JSON command summaries for `status`, `upload`, and `snapshot`:
   - Include `schema_version: 1`, `command`, `ok`, `warnings`, `error`, and command-specific `data`.
@@ -783,11 +782,11 @@ Deliverables:
   - Treat field names and types as stable within a schema version.
   - Allow later versions to add optional fields without bumping the schema.
   - Require a `schema_version` bump before removing fields or changing field types.
-  - Print one JSON object on `--json` failure for machine consumers; keep logs separate.
+  - Print one JSON object on `--output-format json` failure for machine consumers; keep logs separate.
 - Route CLI logs to stderr only. Command results and JSON summaries go to stdout.
 - Write daemon logs to `RFS_HOME/active/logs/rfsd.log`.
-- Use compact human-readable text logs by default and JSON Lines logs when `--log-format json` is selected.
-- Apply `--log-level` and `--log-format` to both `rfs` and any spawned `rfsd`.
+- Use compact human-readable text output and logs by default and JSON summaries plus JSON Lines logs when `--output-format json` is selected.
+- Apply `--log-level` and `--output-format` to both `rfs` and any spawned `rfsd`.
 - Store effective daemon log level and format in session metadata for `rfs status`.
 - Preserve the session log file with `RFS_HOME/active` until `rfs cleanup`; no log rotation in the MVP.
 - Include timestamp, level, target/module, session id, operation, path/digest where relevant, and message in daemon log events.
@@ -807,7 +806,7 @@ Tests:
 - Unit: `status`, `upload`, and `snapshot` JSON outputs match golden envelope snapshots.
 - Unit: JSON failure output uses the same envelope with `ok: false`.
 - Unit: CLI logs use stderr and command summaries use stdout.
-- Unit: log format flag selects text or JSON Lines formatting.
+- Unit: output format flag selects text or JSON Lines formatting.
 - Integration: daemon status includes mount root, cache paths, session paths, and counters.
 - Integration: spawned daemon writes `RFS_HOME/active/logs/rfsd.log` and status reports log level/format.
 - Integration: status reports previous/stale session metadata after clean unmount leaves inspectable state.

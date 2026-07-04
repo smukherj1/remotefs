@@ -385,16 +385,16 @@ MVP should support:
 - CLI logs go to stderr only. Command results and JSON summaries go to stdout.
 - `rfsd` logs go to `RFS_HOME/active/logs/rfsd.log` and remain inspectable with the active or previous session until `rfs cleanup`.
 - Human-readable compact text logs by default.
-- JSON Lines logs via `--log-format json`; text logs via `--log-format text`.
-- `--log-level` and `--log-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.
+- JSON Lines logs and JSON command summaries via `--output-format json`; text logs and human command summaries via `--output-format text`.
+- `--log-level` and `--output-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.
 - Effective daemon log level and format are written into session metadata so `rfs status` can report them.
 - No log rotation in the MVP.
 - `rfs status`.
-- `rfs status --json`.
-- `--json` command summaries for `status`, `upload`, and `snapshot`.
+- `rfs status --output-format json`.
+- `--output-format json` command summaries for `status`, `upload`, and `snapshot`.
 - JSON command summaries use a stable envelope with `schema_version`, `command`, `ok`, `warnings`, `error`, and command-specific `data`.
 - JSON field names and types are stable within a schema version. Later versions may add optional fields, but removing or changing existing fields requires bumping `schema_version`.
-- On `--json` failure, commands print one JSON object for machine consumers; logs remain separate.
+- On `--output-format json` failure, commands print one JSON object for machine consumers; logs remain separate.
 - Per-session counters for:
   - Directory nodes fetched.
   - Blobs fetched.

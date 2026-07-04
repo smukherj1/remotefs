@@ -58,7 +58,8 @@ fn rfs_upload_fixture_prints_digest_and_json_summary() {
     let mut json = Command::cargo_bin("rfs").unwrap();
     let output = json
         .args([
-            "--json",
+            "--output-format",
+            "json",
             "--cas-url",
             &format!("grpc://{LOCAL_CAS_ADDR}"),
             "--instance-name",

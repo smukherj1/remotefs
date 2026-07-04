@@ -30,9 +30,6 @@ pub struct Cli {
     #[arg(long, global = true, help = "Remote Execution API instance name")]
     instance_name: Option<String>,
 
-    #[arg(long, global = true, help = "Output machine-readable JSON summaries")]
-    json: bool,
-
     #[arg(
         long,
         global = true,
@@ -47,9 +44,9 @@ pub struct Cli {
         global = true,
         default_value = "text",
         value_enum,
-        help = "Log format (text, json)"
+        help = "Output format for command summaries and logs (text, json)"
     )]
-    log_format: LogFormat,
+    output_format: OutputFormat,
 
     #[arg(long, global = true, help = "Path to custom cache directory")]
     cache_dir: Option<PathBuf>,
@@ -64,7 +61,7 @@ pub struct Cli {
 impl Cli {
     /// Returns whether CLI diagnostics should be rendered as JSON.
     pub fn json_output(&self) -> bool {
-        self.json
+        self.output_format == OutputFormat::Json
     }
 
     /// Returns the selected subcommand name for diagnostics.
@@ -120,10 +117,10 @@ impl Commands {
     }
 }
 
-/// Output format for CLI diagnostics and future logging.
+/// Output format for cli logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
-enum LogFormat {
+enum OutputFormat {
     Text,
     Json,
 }
@@ -134,9 +131,8 @@ struct CliConfig {
     state: Config,
     cas_url: String,
     instance_name: String,
-    json: bool,
+    output_format: OutputFormat,
     log_level: LogLevel,
-    log_format: LogFormat,
 }
 
 /// Supported log level values accepted by `rfs`.
@@ -221,9 +217,8 @@ fn resolve_cli_config(cli: &Cli) -> Result<CliConfig, CliError> {
         state,
         cas_url,
         instance_name,
-        json: cli.json,
+        output_format: cli.output_format,
         log_level: cli.log_level,
-        log_format: cli.log_format,
     })
 }
 
@@ -318,7 +313,10 @@ async fn run_upload(config: CliConfig, local_dir: PathBuf) -> Result<CommandOutp
     let cas_config =
         CasConfig::new(config.cas_url.clone(), config.instance_name.clone()).map_err(|source| {
             CliError::InvalidConfig {
-                message: source.to_string(),
+                message: format!(
+                    "unable to create configuration to connect to backend CAS: {}",
+                    source
+                ),
             }
         })?;
     let mut client =
@@ -326,7 +324,7 @@ async fn run_upload(config: CliConfig, local_dir: PathBuf) -> Result<CommandOutp
             .await
             .map_err(|source| CliError::CommandFailed {
                 category: "cas",
-                message: source.to_string(),
+                message: format!("unable to connect to CAS server: {}", source),
             })?;
     let summary = upload_local_directory(&mut client, local_dir, UploadOptions::default())
         .await
@@ -335,7 +333,7 @@ async fn run_upload(config: CliConfig, local_dir: PathBuf) -> Result<CommandOutp
             message: source.to_string(),
         })?;
     Ok(CommandOutput {
-        json: config.json,
+        json: config.output_format == OutputFormat::Json,
         summary,
     })
 }

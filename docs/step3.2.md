@@ -264,7 +264,7 @@ Tests:
   - Call `upload::upload_local_directory`.
   - Print the root digest on stdout for human output.
   - Print warnings and counters to stderr or as a compact summary after the digest only if the current CLI style permits it. Logs must remain on stderr.
-  - For `--json`, print one JSON object on stdout.
+  - For `--output-format json`, print one JSON object on stdout.
 - Keep all upload-specific command execution behind a helper such as:
 
 ```rust
@@ -288,7 +288,7 @@ For human output, make stdout easy to script:
 sha256:<hash>/<size>
 ```
 
-For `--json`, use the stable envelope expected by the technical design:
+For `--output-format json`, use the stable envelope expected by the technical design:
 
 ```json
 {
@@ -315,7 +315,7 @@ For `--json`, use the stable envelope expected by the technical design:
 }
 ```
 
-On failure with `--json`, print the same envelope shape with `ok: false`, `data: null`, and `error: { code, message, details }`.
+On failure with `--output-format json`, print the same envelope shape with `ok: false`, `data: null`, and `error: { code, message, details }`.
 
 ### Slice 8: Task Targets and Fixtures
 
