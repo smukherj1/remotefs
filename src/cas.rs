@@ -15,7 +15,9 @@ use uuid::Uuid;
 
 use crate::digest::{Digest, DigestError};
 use crate::error_context::ResultContext as _;
-use crate::reapi::bytestream::{ReadRequest, WriteRequest, byte_stream_client::ByteStreamClient};
+use crate::reapi::bytestream::{
+    ReadRequest, WriteRequest, WriteResponse, byte_stream_client::ByteStreamClient,
+};
 use crate::reapi::remote_execution::{
     BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
     batch_update_blobs_request, compressor,
@@ -38,6 +40,41 @@ const RETRY_BACKOFFS: [Duration; MAX_RETRY_ATTEMPTS - 1] = [
     Duration::from_millis(500),
     Duration::from_secs(1),
 ];
+
+struct BatchUpdateState {
+    blobs: Vec<Blob>,
+    bytes: usize,
+    index: usize,
+}
+
+impl BatchUpdateState {
+    fn new() -> Self {
+        Self {
+            blobs: Vec::new(),
+            bytes: 0,
+            index: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blobs.is_empty()
+    }
+
+    fn would_exceed_budget(&self, blob_size: usize, budget: usize) -> bool {
+        !self.is_empty() && self.bytes + blob_size > budget
+    }
+
+    fn push(&mut self, blob: Blob, blob_size: usize) {
+        self.bytes += blob_size;
+        self.blobs.push(blob);
+    }
+
+    fn take(&mut self) -> Vec<Blob> {
+        self.bytes = 0;
+        self.index += 1;
+        std::mem::take(&mut self.blobs)
+    }
+}
 
 /// Defines a configuration to connect to a CAS server.
 #[derive(Debug, Clone)]
@@ -371,8 +408,8 @@ impl CasClient {
     /// Uploads caller-selected blobs to the CAS.
     ///
     /// The caller owns existence checks. Small byte-backed and path-backed
-    /// sources are packed into `BatchUpdateBlobs`; larger sources are uploaded
-    /// through ByteStream, with path-backed sources streamed from disk.
+    /// blobs are packed into `BatchUpdateBlobs`; larger blobs are uploaded
+    /// through ByteStream, with path-backed blobs streamed from disk.
     pub async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
         let uploaded_blobs = blobs.len();
         let bytes_uploaded = blobs.iter().try_fold(0u64, |total, blob| {
@@ -383,9 +420,9 @@ impl CasClient {
                 message: "uploaded byte counter overflowed u64".to_string(),
             })
         })?;
-        self.upload_blobs_helper(blobs)
+        self.upload_blobs_to_cas(blobs)
             .await
-            .with_context(|| format!("upload {uploaded_blobs} caller-selected blob source(s)"))?;
+            .with_context(|| format!("upload {uploaded_blobs} caller-selected blob(s)"))?;
         Ok(UploadStats {
             uploaded_blobs,
             bytes_uploaded,
@@ -446,71 +483,45 @@ impl CasClient {
         Ok(Bytes::from(response.data.clone()))
     }
 
-    // Uploads the given blobs to the CAS. Uses bytestream to upload large blobs
-    // and batches upload of smaller blobs that fit within batch size limits.
-    async fn upload_blobs_helper(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
-        let mut current_batch = Vec::new();
-        let mut current_batch_bytes = 0usize;
-        let mut batch_index = 0usize;
-
+    // Uploads caller-selected blobs after existence checks have already
+    // happened in the upload pipeline. BatchUpdateBlobs is used only for blobs
+    // that fit the configured request budget; larger blobs use ByteStream.
+    async fn upload_blobs_to_cas(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
+        let mut batch = BatchUpdateState::new();
         for blob in blobs {
             let blob_size = digest_size_usize(&blob.digest)?;
             if blob_size > self.config.batch_update_budget_bytes {
-                self.bytestream_write_blob(blob)
-                    .await
-                    .context("upload oversized blob source through ByteStream.Write")?;
+                self.flush_batch_update(&mut batch).await?;
+                self.upload_oversized_blob(blob).await?;
                 continue;
             }
 
-            let blob = match blob.contents {
-                BlobContents::Bytes(data) => Blob {
-                    digest: blob.digest,
-                    contents: BlobContents::Bytes(data),
-                },
-                BlobContents::FilePath(path) => {
-                    let data = tokio::fs::read(&path).await.map_err(|io| CasError::Io {
-                        operation: CasOperation::BatchUpdateBlobs,
-                        path: path.clone(),
-                        source: io,
-                    })?;
-                    if data.len() != blob_size {
-                        return Err(CasError::BlobStatus {
-                            operation: CasOperation::BatchUpdateBlobs,
-                            digest: blob.digest,
-                            message: format!(
-                                "path-backed blob size changed before upload: expected {blob_size} bytes, read {} bytes",
-                                data.len()
-                            ),
-                        });
-                    }
-                    Blob {
-                        digest: blob.digest,
-                        contents: BlobContents::Bytes(Bytes::from(data)),
-                    }
-                }
-            };
-            if !current_batch.is_empty()
-                && current_batch_bytes + blob_size > self.config.batch_update_budget_bytes
-            {
-                self.upload_batch_to_cas(std::mem::take(&mut current_batch))
-                    .await
-                    .with_context(|| {
-                        format!("upload source BatchUpdateBlobs batch {batch_index}")
-                    })?;
-                current_batch_bytes = 0;
-                batch_index += 1;
+            let blob = prepare_batch_update_blob(blob, blob_size).await?;
+            if batch.would_exceed_budget(blob_size, self.config.batch_update_budget_bytes) {
+                self.flush_batch_update(&mut batch).await?;
             }
-            current_batch_bytes += blob_size;
-            current_batch.push(blob);
+            batch.push(blob, blob_size);
         }
 
-        if !current_batch.is_empty() {
-            self.upload_batch_to_cas(current_batch)
-                .await
-                .with_context(|| format!("upload source BatchUpdateBlobs batch {batch_index}"))?;
+        self.flush_batch_update(&mut batch).await
+    }
+
+    async fn flush_batch_update(&mut self, batch: &mut BatchUpdateState) -> Result<(), CasError> {
+        if batch.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        let batch_index = batch.index;
+        self.upload_batch_to_cas(batch.take())
+            .await
+            .with_context(|| format!("upload BatchUpdateBlobs batch {batch_index}"))
+    }
+
+    async fn upload_oversized_blob(&mut self, blob: Blob) -> Result<(), CasError> {
+        let digest = blob.digest.clone();
+        self.bytestream_write_blob(blob)
+            .await
+            .with_context(|| format!("upload oversized blob {digest} through ByteStream.Write"))
     }
 
     // Uploads the given batch of blobs to the CAS. Assumes the batch of blobs fits within the applicable
@@ -570,7 +581,9 @@ impl CasClient {
         Ok(())
     }
 
-    // Uploads the given blob using Bytestream write.
+    // Uploads the given blob using ByteStream.Write. Path-backed blobs are
+    // streamed from disk on each retry so large files are not copied into
+    // memory; byte-backed sources are already resident and are sent directly.
     async fn bytestream_write_blob(&mut self, blob: Blob) -> Result<(), CasError> {
         let data = match blob.contents {
             BlobContents::Bytes(data) => data,
@@ -586,42 +599,12 @@ impl CasClient {
 
         let write = self
             .retry_rpc(CasOperation::ByteStreamWrite, || {
-                let mut bytestream = self.bytestream.clone();
+                let bytestream = self.bytestream.clone();
                 let resource_name = resource_name.clone();
                 let data = data.clone();
                 let digest = digest.clone();
                 async move {
-                    let (tx, rx) = tokio::sync::mpsc::channel(2);
-                    let request_resource_name = resource_name.clone();
-                    tx.send(WriteRequest {
-                        resource_name: request_resource_name,
-                        write_offset: 0,
-                        finish_write: true,
-                        data: data.to_vec(),
-                    })
-                    .await
-                    .map_err(|_| Status::internal("failed to queue ByteStream write request"))?;
-                    drop(tx);
-                    let response = bytestream
-                    .write(Request::new(ReceiverStream::new(rx)))
-                    .await
-                    .map_err(|status| {
-                        Status::new(
-                            status.code(),
-                            format!(
-                                "send ByteStream write request for resource {resource_name}: {}",
-                                status.message()
-                            ),
-                        )
-                    })?;
-                    if response.get_ref().committed_size != digest.size_bytes() {
-                        return Err(Status::data_loss(format!(
-                            "committed {} bytes for {}",
-                            response.get_ref().committed_size,
-                            digest
-                        )));
-                    }
-                    Ok(response)
+                    send_bytestream_bytes_write(bytestream, resource_name, digest, data).await
                 }
             })
             .await;
@@ -644,67 +627,11 @@ impl CasClient {
 
         let write = self
             .retry_rpc(CasOperation::ByteStreamWrite, || {
-                let mut bytestream = self.bytestream.clone();
+                let bytestream = self.bytestream.clone();
                 let resource_name = resource_name.clone();
                 let digest = digest.clone();
                 let path = path.clone();
-                async move {
-                    let (tx, rx) = tokio::sync::mpsc::channel(2);
-                    let request_resource_name = resource_name.clone();
-                    let producer = tokio::spawn(async move {
-                        let mut file = tokio::fs::File::open(&path).await.map_err(|source| {
-                            Status::internal(format!("open {}: {source}", path.display()))
-                        })?;
-                        let mut offset = 0i64;
-                        loop {
-                            let mut buffer = vec![0u8; BYTESTREAM_UPLOAD_CHUNK_BYTES];
-                            let read = file.read(&mut buffer).await.map_err(|source| {
-                                Status::internal(format!("read {}: {source}", path.display()))
-                            })?;
-                            buffer.truncate(read);
-                            let finish_write = read == 0;
-                            tx.send(WriteRequest {
-                                resource_name: request_resource_name.clone(),
-                                write_offset: offset,
-                                finish_write,
-                                data: buffer,
-                            })
-                            .await
-                            .map_err(|_| {
-                                Status::internal("failed to queue ByteStream file write request")
-                            })?;
-                            if finish_write {
-                                break;
-                            }
-                            offset += read as i64;
-                        }
-                        Ok::<(), Status>(())
-                    });
-                    let response = bytestream
-                        .write(Request::new(ReceiverStream::new(rx)))
-                        .await;
-                    let producer_result = producer.await.map_err(|source| {
-                        Status::internal(format!("ByteStream file producer task failed: {source}"))
-                    })?;
-                    producer_result?;
-                    let response = response.map_err(|status| {
-                            Status::new(
-                                status.code(),
-                                format!(
-                                    "send ByteStream file write request for resource {resource_name}: {}",
-                                    status.message()
-                                ),
-                            )
-                        })?;
-                    if response.get_ref().committed_size != digest.size_bytes() {
-                        return Err(Status::data_loss(format!(
-                            "committed {} bytes for {}",
-                            response.get_ref().committed_size,
-                            digest
-                        )));
-                    }
-                    Ok(response)
-                }
+                async move { send_bytestream_file_write(bytestream, resource_name, digest, path).await }
             })
             .await;
         write
@@ -828,6 +755,171 @@ impl CasClient {
             }
         }
     }
+}
+
+async fn prepare_batch_update_blob(blob: Blob, expected_size: usize) -> Result<Blob, CasError> {
+    match blob.contents {
+        BlobContents::Bytes(data) => {
+            if data.len() != expected_size {
+                return Err(CasError::BlobStatus {
+                    operation: CasOperation::BatchUpdateBlobs,
+                    digest: blob.digest,
+                    message: format!(
+                        "byte-backed blob size does not match digest: expected {expected_size} bytes, got {} bytes",
+                        data.len()
+                    ),
+                });
+            }
+
+            Ok(Blob {
+                digest: blob.digest,
+                contents: BlobContents::Bytes(data),
+            })
+        }
+        BlobContents::FilePath(path) => {
+            // Small path-backed blobs are read into memory so they can share the
+            // BatchUpdateBlobs path with directory nodes. The size check catches
+            // local file races between hashing and upload before sending bytes
+            // under a stale digest.
+            let data = tokio::fs::read(&path).await.map_err(|io| CasError::Io {
+                operation: CasOperation::BatchUpdateBlobs,
+                path: path.clone(),
+                source: io,
+            })?;
+            if data.len() != expected_size {
+                return Err(CasError::BlobStatus {
+                    operation: CasOperation::BatchUpdateBlobs,
+                    digest: blob.digest,
+                    message: format!(
+                        "path-backed blob size changed before upload: expected {expected_size} bytes, read {} bytes",
+                        data.len()
+                    ),
+                });
+            }
+
+            Ok(Blob {
+                digest: blob.digest,
+                contents: BlobContents::Bytes(Bytes::from(data)),
+            })
+        }
+    }
+}
+
+async fn send_bytestream_bytes_write(
+    mut bytestream: ByteStreamClient<Channel>,
+    resource_name: String,
+    digest: Digest,
+    data: Bytes,
+) -> Result<tonic::Response<WriteResponse>, Status> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    tx.send(WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: true,
+        data: data.to_vec(),
+    })
+    .await
+    .map_err(|_| Status::internal("failed to queue ByteStream write request"))?;
+    drop(tx);
+
+    let response = bytestream
+        .write(Request::new(ReceiverStream::new(rx)))
+        .await
+        .map_err(|status| bytestream_write_status(&resource_name, status))?;
+    verify_bytestream_committed_size(&response, &digest)?;
+    Ok(response)
+}
+
+async fn send_bytestream_file_write(
+    mut bytestream: ByteStreamClient<Channel>,
+    resource_name: String,
+    digest: Digest,
+    path: PathBuf,
+) -> Result<tonic::Response<WriteResponse>, Status> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let producer_resource_name = resource_name.clone();
+    let producer_path = path.clone();
+
+    // ByteStream.Write consumes an async stream while the file is read. The
+    // producer task keeps those two sides progressing concurrently, and every
+    // retry recreates the task so the file is reopened from offset zero.
+    let producer = tokio::spawn(async move {
+        send_bytestream_file_requests(tx, producer_resource_name, producer_path).await
+    });
+
+    let response = bytestream
+        .write(Request::new(ReceiverStream::new(rx)))
+        .await;
+    let producer_result = producer.await.map_err(|source| {
+        Status::internal(format!("ByteStream file producer task failed: {source}"))
+    })?;
+    producer_result?;
+
+    let response = response.map_err(|status| bytestream_write_status(&resource_name, status))?;
+    verify_bytestream_committed_size(&response, &digest)?;
+    Ok(response)
+}
+
+async fn send_bytestream_file_requests(
+    tx: tokio::sync::mpsc::Sender<WriteRequest>,
+    resource_name: String,
+    path: PathBuf,
+) -> Result<(), Status> {
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|source| Status::internal(format!("open {}: {source}", path.display())))?;
+    let mut offset = 0i64;
+
+    loop {
+        let mut buffer = vec![0u8; BYTESTREAM_UPLOAD_CHUNK_BYTES];
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|source| Status::internal(format!("read {}: {source}", path.display())))?;
+        buffer.truncate(read);
+
+        // REAPI marks stream completion with a final request carrying
+        // finish_write=true. For exact chunk boundaries that means an empty
+        // final message at the committed offset.
+        let finish_write = read == 0;
+        tx.send(WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: offset,
+            finish_write,
+            data: buffer,
+        })
+        .await
+        .map_err(|_| Status::internal("failed to queue ByteStream file write request"))?;
+
+        if finish_write {
+            return Ok(());
+        }
+        offset += read as i64;
+    }
+}
+
+fn bytestream_write_status(resource_name: &str, status: Status) -> Status {
+    Status::new(
+        status.code(),
+        format!(
+            "send ByteStream write request for resource {resource_name}: {}",
+            status.message()
+        ),
+    )
+}
+
+fn verify_bytestream_committed_size(
+    response: &tonic::Response<WriteResponse>,
+    digest: &Digest,
+) -> Result<(), Status> {
+    if response.get_ref().committed_size != digest.size_bytes() {
+        return Err(Status::data_loss(format!(
+            "committed {} bytes for {}",
+            response.get_ref().committed_size,
+            digest
+        )));
+    }
+    Ok(())
 }
 
 fn endpoint_from_grpc_url(cas_url: &str) -> Result<String, CasError> {
