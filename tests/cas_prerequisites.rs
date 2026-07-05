@@ -52,10 +52,7 @@ async fn local_bazel_remote_upload_check_download_and_reupload() {
         .await
         .unwrap();
     if missing_before.contains(&blob.digest) {
-        client
-            .upload_blob_sources(vec![blob.clone()])
-            .await
-            .unwrap();
+        client.upload_blobs(vec![blob.clone()]).await.unwrap();
     }
 
     assert_eq!(
@@ -69,7 +66,7 @@ async fn local_bazel_remote_upload_check_download_and_reupload() {
     let downloaded = client.download_blob(&blob.digest).await.unwrap();
     assert_eq!(downloaded.as_ref(), b"remotefs integration blob\n");
 
-    client.upload_blob_sources(vec![blob]).await.unwrap();
+    client.upload_blobs(vec![blob]).await.unwrap();
 }
 
 #[tokio::test]

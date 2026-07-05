@@ -342,7 +342,7 @@ async fn upload_encoded_tree<S: BlobStore + Send>(
         .filter_map(|digest| sources_by_digest.get(digest).cloned())
         .collect::<Vec<_>>();
     let stats = store
-        .upload_blob_sources(missing_sources)
+        .upload_blobs(missing_sources)
         .await
         .map_err(UploadError::from)
         .with_context(|| format!("upload {} missing CAS object(s)", missing.len()))?;
@@ -706,7 +706,7 @@ mod tests {
                 .collect())
         }
 
-        async fn upload_blob_sources(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
+        async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
             let stats = UploadStats {
                 uploaded_blobs: blobs.len(),
                 bytes_uploaded: blobs

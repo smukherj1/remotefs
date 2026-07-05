@@ -38,8 +38,10 @@ These guidelines capture style and quality expectations remotefs code.
 
 ## Comments
 
-- Use comments to explain non-obvious design choices, edge cases, protocol quirks, invariants, and tradeoffs.
+- _MUST_ comment non-obvious design choices, edge cases, protocol quirks, invariants, and tradeoffs.
 - Do not leave review notes, temporary TODOs, or style reminders in production code. Convert them into code changes, tests, or durable design comments.
+- Public APIs (methods and structures) _MUST_ have comments explaining the inputs, results, preconditions, side-effects and behaviors as applicable.
+- Private APIs _SHOULD_ have comments (similar to public APIs) unless they're trivial wrappers.
 
 ## Tests
 
