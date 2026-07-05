@@ -41,10 +41,12 @@ const RETRY_BACKOFFS: [Duration; MAX_RETRY_ATTEMPTS - 1] = [
     Duration::from_secs(1),
 ];
 
+// Tracks the in-progress BatchUpdateBlobs request without exposing batching
+// policy outside the CAS client.
 struct BatchUpdateState {
     blobs: Vec<Blob>,
     bytes: usize,
-    index: usize,
+    next_index: usize,
 }
 
 impl BatchUpdateState {
@@ -52,7 +54,7 @@ impl BatchUpdateState {
         Self {
             blobs: Vec::new(),
             bytes: 0,
-            index: 0,
+            next_index: 0,
         }
     }
 
@@ -71,7 +73,7 @@ impl BatchUpdateState {
 
     fn take(&mut self) -> Vec<Blob> {
         self.bytes = 0;
-        self.index += 1;
+        self.next_index += 1;
         std::mem::take(&mut self.blobs)
     }
 }
@@ -496,7 +498,7 @@ impl CasClient {
                 continue;
             }
 
-            let blob = prepare_batch_update_blob(blob, blob_size).await?;
+            let blob = load_blob_as_bytes(blob, blob_size).await?;
             if batch.would_exceed_budget(blob_size, self.config.batch_update_budget_bytes) {
                 self.flush_batch_update(&mut batch).await?;
             }
@@ -511,7 +513,7 @@ impl CasClient {
             return Ok(());
         }
 
-        let batch_index = batch.index;
+        let batch_index = batch.next_index;
         self.upload_batch_to_cas(batch.take())
             .await
             .with_context(|| format!("upload BatchUpdateBlobs batch {batch_index}"))
@@ -757,7 +759,9 @@ impl CasClient {
     }
 }
 
-async fn prepare_batch_update_blob(blob: Blob, expected_size: usize) -> Result<Blob, CasError> {
+// Materializes a blob for BatchUpdateBlobs and verifies that its current size
+// still matches the digest chosen by the caller.
+async fn load_blob_as_bytes(blob: Blob, expected_size: usize) -> Result<Blob, CasError> {
     match blob.contents {
         BlobContents::Bytes(data) => {
             if data.len() != expected_size {
@@ -826,7 +830,9 @@ async fn send_bytestream_bytes_write(
         .write(Request::new(ReceiverStream::new(rx)))
         .await
         .map_err(|status| bytestream_write_status(&resource_name, status))?;
-    verify_bytestream_committed_size(&response, &digest)?;
+    if let Some(status) = bytestream_committed_size_error(&response, &digest) {
+        return Err(status);
+    }
     Ok(response)
 }
 
@@ -856,7 +862,9 @@ async fn send_bytestream_file_write(
     producer_result?;
 
     let response = response.map_err(|status| bytestream_write_status(&resource_name, status))?;
-    verify_bytestream_committed_size(&response, &digest)?;
+    if let Some(status) = bytestream_committed_size_error(&response, &digest) {
+        return Err(status);
+    }
     Ok(response)
 }
 
@@ -908,18 +916,18 @@ fn bytestream_write_status(resource_name: &str, status: Status) -> Status {
     )
 }
 
-fn verify_bytestream_committed_size(
+fn bytestream_committed_size_error(
     response: &tonic::Response<WriteResponse>,
     digest: &Digest,
-) -> Result<(), Status> {
+) -> Option<Status> {
     if response.get_ref().committed_size != digest.size_bytes() {
-        return Err(Status::data_loss(format!(
+        return Some(Status::data_loss(format!(
             "committed {} bytes for {}",
             response.get_ref().committed_size,
             digest
         )));
     }
-    Ok(())
+    None
 }
 
 fn endpoint_from_grpc_url(cas_url: &str) -> Result<String, CasError> {

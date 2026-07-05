@@ -27,8 +27,22 @@ const HASH_CHUNK_BYTES: usize = 1024 * 1024;
 /// Options controlling local-directory upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UploadOptions {
+    /// Maximum number of blocking worker tasks used to hash regular files.
+    ///
+    /// Must be greater than zero. Workers read files from disk without
+    /// following symlinks discovered by the scanner.
     pub hash_workers: usize,
+    /// Approximate maximum bytes buffered by the hashing stage at once.
+    ///
+    /// Must be at least `hash_workers`, because each worker needs a minimum
+    /// one-byte read buffer. The implementation divides this budget across
+    /// workers and caps each per-file read buffer at `HASH_CHUNK_BYTES`.
     pub in_flight_bytes: usize,
+    /// Whether scanning should reject sockets, devices, FIFOs, and unknown nodes.
+    ///
+    /// When true, the first unsupported node returns `UploadError::Tree`.
+    /// When false, unsupported nodes are skipped and no CAS object is emitted
+    /// for them.
     pub fail_on_unsupported_nodes: bool,
 }
 
@@ -45,23 +59,36 @@ impl Default for UploadOptions {
 /// Stable summary returned by `rfs upload`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UploadSummary {
+    /// Digest of the root REAPI `Directory` object uploaded or reused in CAS.
     pub root_digest: Digest,
+    /// Count of regular file entries scanned under the upload root.
     pub files: usize,
+    /// Count of directories scanned, including the upload root.
     pub directories: usize,
+    /// Count of symlink entries scanned without following their targets.
     pub symlinks: usize,
+    /// Count of unique CAS objects uploaded during this invocation.
     pub uploaded_blobs: usize,
+    /// Count of unique CAS objects already present according to `FindMissingBlobs`.
     pub reused_blobs: usize,
+    /// Total bytes uploaded for missing file blobs and directory objects.
     pub bytes_uploaded: u64,
+    /// Warning counters for supported lossy or surprising filesystem inputs.
     pub warnings: UploadWarnings,
 }
 
 /// Warning counters for supported but lossy or surprising upload inputs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct UploadWarnings {
+    /// Additional regular-file paths sharing a `(dev, ino)` pair with an earlier path.
     pub hard_links: usize,
+    /// File, directory, or symlink metadata entries where setuid was masked.
     pub masked_setuid: usize,
+    /// File, directory, or symlink metadata entries where setgid was masked.
     pub masked_setgid: usize,
+    /// Symlinks whose target is absolute.
     pub absolute_symlinks: usize,
+    /// Symlinks whose relative target escapes the encoded tree.
     pub escaping_symlinks: usize,
 }
 
@@ -75,6 +102,10 @@ impl UploadWarnings {
 }
 
 /// Scanned local filesystem tree before file content hashing.
+///
+/// Directories are stored deepest-first so bottom-up REAPI encoding can look
+/// up already encoded child directory digests. File and symlink counts reflect
+/// the scanned metadata only; file contents are read later by `hash_files`.
 #[derive(Debug)]
 pub(crate) struct LocalTree {
     pub root: PathBuf,
@@ -85,6 +116,9 @@ pub(crate) struct LocalTree {
 }
 
 /// Scanned local directory and its immediate entries.
+///
+/// Entries are sorted by raw filename bytes during scanning so later phases do
+/// not depend on filesystem iteration order.
 #[derive(Debug)]
 pub(crate) struct LocalDirectory {
     pub relative_path: PathBuf,
@@ -94,6 +128,9 @@ pub(crate) struct LocalDirectory {
 }
 
 /// Scanned local node.
+///
+/// Variants carry metadata needed to construct REAPI nodes without rereading
+/// directory entries during encoding.
 #[derive(Debug)]
 pub(crate) enum LocalNode {
     File(LocalFile),
@@ -102,6 +139,9 @@ pub(crate) enum LocalNode {
 }
 
 /// Scanned local regular file.
+///
+/// The scanner records metadata and paths only. `hash_files` is responsible
+/// for reading contents and producing the digest used by encoding and upload.
 #[derive(Debug, Clone)]
 pub(crate) struct LocalFile {
     pub name: String,
@@ -111,6 +151,9 @@ pub(crate) struct LocalFile {
 }
 
 /// File digest produced by the hashing stage.
+///
+/// Results are sorted by relative path before encoding so worker completion
+/// order cannot affect the directory tree or summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileDigest {
     pub relative_path: PathBuf,
@@ -119,6 +162,7 @@ pub(crate) struct FileDigest {
     pub size_bytes: u64,
 }
 
+/// Reference to a child directory whose encoded digest is resolved later.
 #[derive(Debug)]
 pub(crate) struct LocalDirectoryRef {
     pub name: String,
@@ -126,6 +170,7 @@ pub(crate) struct LocalDirectoryRef {
     pub metadata: fs::Metadata,
 }
 
+/// Scanned symlink entry and target text.
 #[derive(Debug)]
 pub(crate) struct LocalSymlink {
     pub name: String,
@@ -133,20 +178,26 @@ pub(crate) struct LocalSymlink {
     pub metadata: fs::Metadata,
 }
 
+/// Errors returned while scanning, hashing, encoding, or uploading local inputs.
 #[derive(Error, Debug)]
 pub enum UploadError {
+    /// Canonical tree encoding failed.
     #[error(transparent)]
     Tree(#[from] TreeError),
+    /// CAS existence checking or upload failed.
     #[error(transparent)]
     Cas(#[from] CasError),
+    /// Local filesystem access failed for the given path.
     #[error("Filesystem error at {path}: {source}")]
     Filesystem {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// Caller-provided options or pipeline invariants were invalid.
     #[error("Invalid upload option `{name}`: {reason}")]
     InvalidOption { name: &'static str, reason: String },
+    /// Additional operation context attached while preserving the source error.
     #[error("{operation}: {source}")]
     Context {
         operation: String,
@@ -354,6 +405,11 @@ async fn upload_encoded_tree<S: BlobStore + Send>(
     })
 }
 
+/// Scans filesystem metadata for the upload root without reading file contents.
+///
+/// This phase intentionally uses `symlink_metadata` and `read_link` so symlink
+/// targets are recorded as links rather than traversed. The returned directory
+/// list is arranged for bottom-up encoding.
 fn scan_local_directory_with_options(
     root: &Path,
     options: &UploadOptions,
@@ -393,6 +449,10 @@ fn scan_local_directory_with_options(
     })
 }
 
+/// Mutable state shared through recursive directory scanning.
+///
+/// Hard-link tracking uses Unix `(dev, ino)` identity. Each path remains in the
+/// tree, but duplicate identities increment a warning counter for the summary.
 #[derive(Default)]
 struct ScanState {
     directories: Vec<LocalDirectory>,
@@ -402,6 +462,10 @@ struct ScanState {
     hard_links: HashSet<(u64, u64)>,
 }
 
+/// Recursively scans one directory and records its immediate child nodes.
+///
+/// Child directories are fully scanned before the returned `LocalDirectory` is
+/// constructed so `ScanState::directories` can later be sorted deepest-first.
 fn scan_directory(
     path: &Path,
     relative_path: PathBuf,
@@ -500,6 +564,11 @@ fn scan_directory(
     })
 }
 
+/// Encodes one scanned directory using previously computed child digests.
+///
+/// File and child-directory digests are looked up by relative path. Missing
+/// entries indicate a broken pipeline invariant and are reported as upload
+/// option errors with the affected path.
 fn encode_directory(
     local: &LocalDirectory,
     file_digests: &HashMap<PathBuf, Digest>,
@@ -558,6 +627,11 @@ fn encode_directory(
     builder.encode().map_err(UploadError::from)
 }
 
+/// Streams one regular file into a SHA-256 digest using a reusable buffer.
+///
+/// The file size is compared with metadata captured during scanning so common
+/// races, such as a file being appended or truncated during upload, fail with a
+/// path-rich error instead of silently producing a mixed snapshot.
 fn hash_file(file: &LocalFile, chunk_bytes: usize) -> Result<FileDigest, UploadError> {
     let mut handle =
         fs::File::open(&file.absolute_path).map_err(|source| UploadError::Filesystem {
@@ -580,6 +654,17 @@ fn hash_file(file: &LocalFile, chunk_bytes: usize) -> Result<FileDigest, UploadE
         size_bytes += read as u64;
         hasher.update(&buffer[..read]);
     }
+    if size_bytes != file.metadata.len() {
+        return Err(UploadError::InvalidOption {
+            name: "file_size",
+            reason: format!(
+                "{} changed size during upload: scanned {} byte(s), read {} byte(s)",
+                file.absolute_path.display(),
+                file.metadata.len(),
+                size_bytes
+            ),
+        });
+    }
     let digest =
         Digest::new(hex::encode(hasher.finalize()), size_bytes as i64).map_err(|source| {
             UploadError::InvalidOption {
@@ -595,6 +680,7 @@ fn hash_file(file: &LocalFile, chunk_bytes: usize) -> Result<FileDigest, UploadE
     })
 }
 
+/// Converts a filesystem path basename into the UTF-8 name required by REAPI.
 fn component_name(path: &Path) -> Result<String, TreeError> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -604,6 +690,7 @@ fn component_name(path: &Path) -> Result<String, TreeError> {
         })
 }
 
+/// Captures Unix mode and mtime metadata for later canonical normalization.
 fn metadata_for(kind: NodeKind, metadata: &fs::Metadata) -> NodeMetadata {
     NodeMetadata::new(
         kind,
@@ -615,6 +702,7 @@ fn metadata_for(kind: NodeKind, metadata: &fs::Metadata) -> NodeMetadata {
     )
 }
 
+/// Returns a stable user-facing name for unsupported Unix file types.
 fn node_type_name(file_type: fs::FileType) -> &'static str {
     if file_type.is_block_device() {
         "block device"
@@ -629,6 +717,7 @@ fn node_type_name(file_type: fs::FileType) -> &'static str {
     }
 }
 
+/// Rejects impossible hashing options before they reach async worker setup.
 fn validate_options(options: &UploadOptions) -> Result<(), UploadError> {
     if options.hash_workers == 0 {
         return Err(UploadError::InvalidOption {
@@ -642,26 +731,40 @@ fn validate_options(options: &UploadOptions) -> Result<(), UploadError> {
             reason: "must be at least 1".to_string(),
         });
     }
+    if options.in_flight_bytes < options.hash_workers {
+        return Err(UploadError::InvalidOption {
+            name: "in_flight_bytes",
+            reason: format!(
+                "must be at least hash_workers ({}) so every worker has a read buffer",
+                options.hash_workers
+            ),
+        });
+    }
     Ok(())
 }
 
+/// Derives the per-worker read buffer from the global in-flight byte budget.
 fn hash_chunk_bytes(options: &UploadOptions) -> usize {
     HASH_CHUNK_BYTES.min((options.in_flight_bytes / options.hash_workers).max(1))
 }
 
+/// Chooses a conservative default worker count from host parallelism.
 fn default_hash_workers() -> usize {
     default_hash_workers_for(std::thread::available_parallelism().map_or(1, usize::from))
 }
 
+/// Clamps available CPU count into the supported default worker range.
 fn default_hash_workers_for(available: usize) -> usize {
     available.clamp(MIN_DEFAULT_HASH_WORKERS, MAX_DEFAULT_HASH_WORKERS)
 }
 
+/// Counts path components for deepest-first directory sorting.
 fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
 #[cfg(test)]
+/// Adapts upload scan errors to the legacy test helper's tree-error result.
 fn upload_tree_error(error: UploadError) -> TreeError {
     match error {
         UploadError::Tree(error) => error,
@@ -739,6 +842,18 @@ mod tests {
     }
 
     #[test]
+    fn options_require_enough_in_flight_bytes_for_workers() {
+        let error = validate_options(&UploadOptions {
+            hash_workers: 4,
+            in_flight_bytes: 3,
+            fail_on_unsupported_nodes: true,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be at least hash_workers"));
+    }
+
+    #[test]
     fn scanner_records_file_directory_symlink_and_hard_link() {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("file.txt"), b"hello").unwrap();
@@ -792,6 +907,20 @@ mod tests {
         assert_eq!(digests.len(), 1);
         assert_eq!(digests[0].size_bytes, 5);
         assert_eq!(digests[0].digest, Digest::for_bytes(b"hello"));
+    }
+
+    #[test]
+    fn hashing_rejects_file_size_change_after_scan() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("file.txt");
+        fs::write(&path, b"hello").unwrap();
+        let tree = scan_local_directory(temp.path()).unwrap();
+        fs::write(&path, b"hello world").unwrap();
+
+        let error = hash_file(&tree.files[0], HASH_CHUNK_BYTES).unwrap_err();
+
+        assert!(error.to_string().contains("changed size during upload"));
+        assert!(error.to_string().contains("file.txt"));
     }
 
     #[tokio::test]
