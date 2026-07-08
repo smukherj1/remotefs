@@ -124,17 +124,14 @@ pub(crate) struct LocalDirectory {
     pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
     pub metadata: fs::Metadata,
-    pub entries: Vec<LocalNode>,
+    pub entries: Vec<LocalDirectoryChild>,
 }
 
-/// Scanned local node.
-///
-/// Variants carry metadata needed to construct REAPI nodes without rereading
-/// directory entries during encoding.
+/// Scanned child entry of a LocalDirectory.
 #[derive(Debug)]
-pub(crate) enum LocalNode {
+pub(crate) enum LocalDirectoryChild {
     File(LocalFile),
-    Directory(LocalDirectoryRef),
+    Directory(LocalSubDirectory),
     Symlink(LocalSymlink),
 }
 
@@ -162,9 +159,9 @@ pub(crate) struct FileDigest {
     pub size_bytes: u64,
 }
 
-/// Reference to a child directory whose encoded digest is resolved later.
+/// Reference to a child directory in a LocalDirectory.
 #[derive(Debug)]
-pub(crate) struct LocalDirectoryRef {
+pub(crate) struct LocalSubDirectory {
     pub name: String,
     pub relative_path: PathBuf,
     pub metadata: fs::Metadata,
@@ -517,18 +514,18 @@ fn scan_directory(
                 state.warnings.hard_links += 1;
             }
             state.files.push(file.clone());
-            local_entries.push(LocalNode::File(file));
+            local_entries.push(LocalDirectoryChild::File(file));
         } else if file_type.is_dir() {
             let directory =
                 scan_directory(&child_path, child_relative_path.clone(), state, options)
                     .with_context(|| format!("scan child directory {}", child_path.display()))?;
-            let directory_ref = LocalDirectoryRef {
+            let directory_ref = LocalSubDirectory {
                 name,
                 relative_path: child_relative_path,
                 metadata: child_metadata,
             };
             state.directories.push(directory);
-            local_entries.push(LocalNode::Directory(directory_ref));
+            local_entries.push(LocalDirectoryChild::Directory(directory_ref));
         } else if file_type.is_symlink() {
             let target = fs::read_link(&child_path).map_err(|source| UploadError::Filesystem {
                 path: child_path.clone(),
@@ -542,7 +539,7 @@ fn scan_directory(
                 .map(ToOwned::to_owned)
                 .map_err(UploadError::from)?;
             state.symlinks += 1;
-            local_entries.push(LocalNode::Symlink(LocalSymlink {
+            local_entries.push(LocalDirectoryChild::Symlink(LocalSymlink {
                 name,
                 target,
                 metadata: child_metadata,
@@ -578,7 +575,7 @@ fn encode_directory(
         DirectoryBuilder::with_metadata(metadata_for(NodeKind::Directory, &local.metadata));
     for entry in &local.entries {
         match entry {
-            LocalNode::File(file) => {
+            LocalDirectoryChild::File(file) => {
                 let digest = file_digests
                     .get(&file.relative_path)
                     .cloned()
@@ -594,7 +591,7 @@ fn encode_directory(
                     })
                     .map_err(UploadError::from)?;
             }
-            LocalNode::Directory(directory) => {
+            LocalDirectoryChild::Directory(directory) => {
                 let digest = directory_digests
                     .get(&directory.relative_path)
                     .cloned()
@@ -613,7 +610,7 @@ fn encode_directory(
                     })
                     .map_err(UploadError::from)?;
             }
-            LocalNode::Symlink(symlink) => {
+            LocalDirectoryChild::Symlink(symlink) => {
                 builder
                     .add_symlink(SymlinkEntry {
                         name: symlink.name.clone(),
