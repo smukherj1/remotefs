@@ -11,6 +11,7 @@ fn test_rfs_help() {
         .stdout(predicate::str::contains(
             "content-addressed remote filesystem",
         ))
+        .stdout(predicate::str::contains("--output-format"))
         .stdout(predicate::str::contains("Upload a local directory"))
         .stdout(predicate::str::contains("Mount a RemoteFS snapshot"));
 }
@@ -24,6 +25,7 @@ fn test_rfsd_help() {
         .stdout(predicate::str::contains(
             "background daemon that owns the FUSE mount",
         ))
+        .stdout(predicate::str::contains("--output-format"))
         .stdout(predicate::str::contains(
             "Root digest of the snapshot to mount",
         ));
@@ -52,11 +54,17 @@ fn test_rfs_mount_invalid_digest() {
 #[test]
 fn test_rfs_json_error_diagnostic() {
     let mut cmd = Command::cargo_bin("rfs").unwrap();
-    cmd.args(["--json", "mount", "not-a-digest", "/tmp/rfs-mnt"])
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("\"category\":\"invalid_digest\""));
+    cmd.args([
+        "--output-format",
+        "json",
+        "mount",
+        "not-a-digest",
+        "/tmp/rfs-mnt",
+    ])
+    .assert()
+    .failure()
+    .code(1)
+    .stderr(predicate::str::contains("\"code\":\"invalid_digest\""));
 }
 
 #[test]

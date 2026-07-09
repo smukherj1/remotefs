@@ -1,10 +1,12 @@
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
@@ -13,7 +15,9 @@ use uuid::Uuid;
 
 use crate::digest::{Digest, DigestError};
 use crate::error_context::ResultContext as _;
-use crate::reapi::bytestream::{ReadRequest, WriteRequest, byte_stream_client::ByteStreamClient};
+use crate::reapi::bytestream::{
+    ReadRequest, WriteRequest, WriteResponse, byte_stream_client::ByteStreamClient,
+};
 use crate::reapi::remote_execution::{
     BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
     batch_update_blobs_request, compressor,
@@ -28,6 +32,7 @@ const BATCH_UPDATE_TIMEOUT_SECONDS: u64 = 30;
 const BYTESTREAM_IDLE_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_ATTEMPTS: usize = 5;
 const MAX_RETRY_ATTEMPTS: usize = 5;
+const BYTESTREAM_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const RETRY_BACKOFFS: [Duration; MAX_RETRY_ATTEMPTS - 1] = [
     DEFAULT_RETRY_INITIAL_BACKOFF,
@@ -35,6 +40,43 @@ const RETRY_BACKOFFS: [Duration; MAX_RETRY_ATTEMPTS - 1] = [
     Duration::from_millis(500),
     Duration::from_secs(1),
 ];
+
+// Tracks the in-progress BatchUpdateBlobs request without exposing batching
+// policy outside the CAS client.
+struct BatchUpdateState {
+    blobs: Vec<Blob>,
+    bytes: usize,
+    next_index: usize,
+}
+
+impl BatchUpdateState {
+    fn new() -> Self {
+        Self {
+            blobs: Vec::new(),
+            bytes: 0,
+            next_index: 0,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blobs.is_empty()
+    }
+
+    fn would_exceed_budget(&self, blob_size: usize, budget: usize) -> bool {
+        !self.is_empty() && self.bytes + blob_size > budget
+    }
+
+    fn push(&mut self, blob: Blob, blob_size: usize) {
+        self.bytes += blob_size;
+        self.blobs.push(blob);
+    }
+
+    fn take(&mut self) -> Vec<Blob> {
+        self.bytes = 0;
+        self.next_index += 1;
+        std::mem::take(&mut self.blobs)
+    }
+}
 
 /// Defines a configuration to connect to a CAS server.
 #[derive(Debug, Clone)]
@@ -170,6 +212,19 @@ pub enum CasError {
         #[source]
         source: DigestError,
     },
+    #[error("CAS filesystem error during {operation} at {path}: {source}")]
+    Io {
+        operation: CasOperation,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Error converting between RE API and native object: {operation}: {source}")]
+    ReApiConversion {
+        operation: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("{operation}: {source}")]
     Context {
         operation: String,
@@ -187,21 +242,47 @@ impl crate::error_context::ResultContextError for CasError {
     }
 }
 
-/// Represents a blob of bytes along with its digest.
+/// A blob that can be stored on CAS.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Blob {
     pub digest: Digest,
-    pub data: Vec<u8>,
+    pub contents: BlobContents,
+}
+
+/// Backing data for a Blob.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobContents {
+    // The blob contents are available directly.
+    Bytes(Bytes),
+    // The blob contents are available at this
+    // file path. Typically used for large blobs.
+    FilePath(PathBuf),
 }
 
 impl Blob {
-    /// Creates a blob from raw bytes and computes its SHA-256 digest.
-    pub fn new(data: Vec<u8>) -> Self {
+    /// Creates an in-memory blob from raw bytes and computes its SHA-256 digest.
+    pub fn from_bytes(data: impl Into<Bytes>) -> Self {
+        let data = data.into();
         Self {
-            digest: Digest::for_bytes(&data),
-            data,
+            digest: Digest::for_bytes(data.as_ref()),
+            contents: BlobContents::Bytes(data),
         }
     }
+
+    /// Creates a path-backed blob with a caller-provided digest.
+    pub fn from_file_path(digest: Digest, path: impl Into<PathBuf>) -> Self {
+        Self {
+            digest,
+            contents: BlobContents::FilePath(path.into()),
+        }
+    }
+}
+
+/// Statistics for blobs uploaded by a `BlobStore`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UploadStats {
+    pub uploaded_blobs: usize,
+    pub bytes_uploaded: u64,
 }
 
 /// Minimal blob storage surface used by filesystem and upload code.
@@ -218,11 +299,8 @@ pub trait BlobStore {
     /// existence check.
     async fn find_missing_blobs(&mut self, digests: &[Digest]) -> Result<Vec<Digest>, CasError>;
 
-    /// Uploads blobs that are not already present in storage.
-    ///
-    /// Each blob's embedded digest is used as its content identity. The method
-    /// may fail on transport errors or if the remote service rejects an upload.
-    async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError>;
+    /// Uploads the given blobs to the BlobStore.
+    async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError>;
 
     /// Downloads and verifies the blob identified by `digest`.
     ///
@@ -237,12 +315,6 @@ pub struct CasClient {
     config: CasConfig,
     cas: ContentAddressableStorageClient<Channel>,
     bytestream: ByteStreamClient<Channel>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PackedBatch {
-    pub batches: Vec<Vec<Blob>>,
-    pub bytestream: Vec<Blob>,
 }
 
 impl CasClient {
@@ -335,30 +407,28 @@ impl CasClient {
             })
     }
 
-    /// Uploads blobs that are missing from the CAS.
+    /// Uploads caller-selected blobs to the CAS.
     ///
-    /// The client first performs an existence check and then uploads only the
-    /// missing blobs. Small blobs are packed into `BatchUpdateBlobs`; blobs that
-    /// exceed the configured batch budget are uploaded through ByteStream.
-    pub async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
-        let digests = blobs
-            .iter()
-            .map(|blob| blob.digest.clone())
-            .collect::<Vec<_>>();
-        let missing = self.find_missing_blobs(&digests).await.with_context(|| {
-            format!(
-                "check missing blobs before upload for {} blob(s)",
-                digests.len()
-            )
+    /// The caller owns existence checks. Small byte-backed and path-backed
+    /// blobs are packed into `BatchUpdateBlobs`; larger blobs are uploaded
+    /// through ByteStream, with path-backed blobs streamed from disk.
+    pub async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
+        let uploaded_blobs = blobs.len();
+        let bytes_uploaded = blobs.iter().try_fold(0u64, |total, blob| {
+            let size = digest_size_u64(&blob.digest)?;
+            total.checked_add(size).ok_or_else(|| CasError::BlobStatus {
+                operation: CasOperation::BatchUpdateBlobs,
+                digest: blob.digest.clone(),
+                message: "uploaded byte counter overflowed u64".to_string(),
+            })
         })?;
-        let missing_blobs = blobs
-            .into_iter()
-            .filter(|blob| missing.contains(&blob.digest))
-            .collect::<Vec<_>>();
-        let missing_count = missing_blobs.len();
-        self.batch_update_blobs(missing_blobs)
+        self.upload_blobs_to_cas(blobs)
             .await
-            .with_context(|| format!("upload {missing_count} missing blob(s) through CAS"))
+            .with_context(|| format!("upload {uploaded_blobs} caller-selected blob(s)"))?;
+        Ok(UploadStats {
+            uploaded_blobs,
+            bytes_uploaded,
+        })
     }
 
     /// Downloads a blob from the CAS and verifies its digest.
@@ -367,7 +437,7 @@ impl CasClient {
     /// `BatchReadBlobs`; larger blobs use ByteStream. The returned bytes are
     /// verified against `digest`, and mismatches return `CasError::Verification`.
     pub async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
-        if digest.size_bytes() as usize <= self.config.download_blob_stream_threshold_bytes {
+        if digest_size_usize(digest)? <= self.config.download_blob_stream_threshold_bytes {
             self.batch_read_blob(digest)
                 .await
                 .with_context(|| format!("download blob {digest} through BatchReadBlobs"))
@@ -415,37 +485,62 @@ impl CasClient {
         Ok(Bytes::from(response.data.clone()))
     }
 
-    async fn batch_update_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
-        let packed = pack_batch_update_blobs(blobs, self.config.batch_update_budget_bytes);
+    // Uploads caller-selected blobs after existence checks have already
+    // happened in the upload pipeline. BatchUpdateBlobs is used only for blobs
+    // that fit the configured request budget; larger blobs use ByteStream.
+    async fn upload_blobs_to_cas(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
+        let mut batch = BatchUpdateState::new();
+        for blob in blobs {
+            let blob_size = digest_size_usize(&blob.digest)?;
+            if blob_size > self.config.batch_update_budget_bytes {
+                self.flush_batch_update(&mut batch).await?;
+                self.upload_oversized_blob(blob).await?;
+                continue;
+            }
 
-        let batch_count = packed.batches.len();
-        let bytestream_count = packed.bytestream.len();
-        self.upload_packed_batches(packed.batches)
-            .await
-            .with_context(|| format!("upload {batch_count} packed BatchUpdateBlobs request(s)"))?;
-        self.upload_bytestream_blobs(packed.bytestream)
-            .await
-            .with_context(|| format!("upload {bytestream_count} blob(s) through ByteStream.Write"))
-    }
-
-    async fn upload_packed_batches(&mut self, batches: Vec<Vec<Blob>>) -> Result<(), CasError> {
-        for (index, batch) in batches.into_iter().enumerate() {
-            let blob_count = batch.len();
-            self.upload_batch(batch).await.with_context(|| {
-                format!("upload BatchUpdateBlobs batch {index} containing {blob_count} blob(s)")
-            })?;
+            let blob = load_blob_as_bytes(blob, blob_size).await?;
+            if batch.would_exceed_budget(blob_size, self.config.batch_update_budget_bytes) {
+                self.flush_batch_update(&mut batch).await?;
+            }
+            batch.push(blob, blob_size);
         }
-        Ok(())
+
+        self.flush_batch_update(&mut batch).await
     }
 
-    async fn upload_batch(&mut self, batch: Vec<Blob>) -> Result<(), CasError> {
+    async fn flush_batch_update(&mut self, batch: &mut BatchUpdateState) -> Result<(), CasError> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let batch_index = batch.next_index;
+        self.upload_batch_to_cas(batch.take())
+            .await
+            .with_context(|| format!("upload BatchUpdateBlobs batch {batch_index}"))
+    }
+
+    async fn upload_oversized_blob(&mut self, blob: Blob) -> Result<(), CasError> {
+        let digest = blob.digest.clone();
+        self.bytestream_write_blob(blob)
+            .await
+            .with_context(|| format!("upload oversized blob {digest} through ByteStream.Write"))
+    }
+
+    // Uploads the given batch of blobs to the CAS. Assumes the batch of blobs fits within the applicable
+    // limits configured for the rfs as well as that supported by the CAS server.
+    async fn upload_batch_to_cas(&mut self, batch: Vec<Blob>) -> Result<(), CasError> {
         let request = BatchUpdateBlobsRequest {
             instance_name: self.config.instance_name.clone(),
             requests: batch
                 .iter()
                 .map(|blob| batch_update_blobs_request::Request {
                     digest: Some(blob.digest.to_reapi()),
-                    data: blob.data.clone(),
+                    data: match &blob.contents {
+                        BlobContents::Bytes(data) => data.to_vec(),
+                        BlobContents::FilePath(_) => {
+                            unreachable!("BatchUpdateBlobs batches contain byte-backed blobs")
+                        }
+                    },
                     compressor: compressor::Value::Identity as i32,
                 })
                 .collect(),
@@ -488,59 +583,30 @@ impl CasClient {
         Ok(())
     }
 
-    async fn upload_bytestream_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
-        for blob in blobs {
-            self.bytestream_write(&blob)
-                .await
-                .with_context(|| format!("upload blob {} with ByteStream.Write", blob.digest))?;
-        }
-        Ok(())
-    }
-
-    async fn bytestream_write(&mut self, blob: &Blob) -> Result<(), CasError> {
+    // Uploads the given blob using ByteStream.Write. Path-backed blobs are
+    // streamed from disk on each retry so large files are not copied into
+    // memory; byte-backed sources are already resident and are sent directly.
+    async fn bytestream_write_blob(&mut self, blob: Blob) -> Result<(), CasError> {
+        let data = match blob.contents {
+            BlobContents::Bytes(data) => data,
+            BlobContents::FilePath(path) => {
+                // Stream the blob from the file path.
+                return self.bytestream_write_file(blob.digest, path).await;
+            }
+        };
+        // Stream the inlined blob.
         let resource_name =
             bytestream_write_resource_name(&self.config.instance_name, &blob.digest);
-        let data = blob.data.clone();
         let digest = blob.digest.clone();
 
         let write = self
             .retry_rpc(CasOperation::ByteStreamWrite, || {
-                let mut bytestream = self.bytestream.clone();
+                let bytestream = self.bytestream.clone();
                 let resource_name = resource_name.clone();
                 let data = data.clone();
                 let digest = digest.clone();
                 async move {
-                    let (tx, rx) = tokio::sync::mpsc::channel(2);
-                    let request_resource_name = resource_name.clone();
-                    tx.send(WriteRequest {
-                        resource_name: request_resource_name,
-                        write_offset: 0,
-                        finish_write: true,
-                        data,
-                    })
-                    .await
-                    .map_err(|_| Status::internal("failed to queue ByteStream write request"))?;
-                    drop(tx);
-                    let response = bytestream
-                    .write(Request::new(ReceiverStream::new(rx)))
-                    .await
-                    .map_err(|status| {
-                        Status::new(
-                            status.code(),
-                            format!(
-                                "send ByteStream write request for resource {resource_name}: {}",
-                                status.message()
-                            ),
-                        )
-                    })?;
-                    if response.get_ref().committed_size != digest.size_bytes() {
-                        return Err(Status::data_loss(format!(
-                            "committed {} bytes for {}",
-                            response.get_ref().committed_size,
-                            digest
-                        )));
-                    }
-                    Ok(response)
+                    send_bytestream_bytes_write(bytestream, resource_name, digest, data).await
                 }
             })
             .await;
@@ -549,6 +615,32 @@ impl CasClient {
                 format!(
                     "write blob {} to ByteStream resource {resource_name}",
                     blob.digest
+                )
+            })
+            .map(|_| ())
+    }
+
+    async fn bytestream_write_file(
+        &mut self,
+        digest: Digest,
+        path: PathBuf,
+    ) -> Result<(), CasError> {
+        let resource_name = bytestream_write_resource_name(&self.config.instance_name, &digest);
+
+        let write = self
+            .retry_rpc(CasOperation::ByteStreamWrite, || {
+                let bytestream = self.bytestream.clone();
+                let resource_name = resource_name.clone();
+                let digest = digest.clone();
+                let path = path.clone();
+                async move { send_bytestream_file_write(bytestream, resource_name, digest, path).await }
+            })
+            .await;
+        write
+            .with_context(|| {
+                format!(
+                    "write file {} to ByteStream resource {resource_name}",
+                    path.display()
                 )
             })
             .map(|_| ())
@@ -667,6 +759,177 @@ impl CasClient {
     }
 }
 
+// Materializes a blob for BatchUpdateBlobs and verifies that its current size
+// still matches the digest chosen by the caller.
+async fn load_blob_as_bytes(blob: Blob, expected_size: usize) -> Result<Blob, CasError> {
+    match blob.contents {
+        BlobContents::Bytes(data) => {
+            if data.len() != expected_size {
+                return Err(CasError::BlobStatus {
+                    operation: CasOperation::BatchUpdateBlobs,
+                    digest: blob.digest,
+                    message: format!(
+                        "byte-backed blob size does not match digest: expected {expected_size} bytes, got {} bytes",
+                        data.len()
+                    ),
+                });
+            }
+
+            Ok(Blob {
+                digest: blob.digest,
+                contents: BlobContents::Bytes(data),
+            })
+        }
+        BlobContents::FilePath(path) => {
+            // Small path-backed blobs are read into memory so they can share the
+            // BatchUpdateBlobs path with directory nodes. The size check catches
+            // local file races between hashing and upload before sending bytes
+            // under a stale digest.
+            let data = tokio::fs::read(&path).await.map_err(|io| CasError::Io {
+                operation: CasOperation::BatchUpdateBlobs,
+                path: path.clone(),
+                source: io,
+            })?;
+            if data.len() != expected_size {
+                return Err(CasError::BlobStatus {
+                    operation: CasOperation::BatchUpdateBlobs,
+                    digest: blob.digest,
+                    message: format!(
+                        "path-backed blob size changed before upload: expected {expected_size} bytes, read {} bytes",
+                        data.len()
+                    ),
+                });
+            }
+
+            Ok(Blob {
+                digest: blob.digest,
+                contents: BlobContents::Bytes(Bytes::from(data)),
+            })
+        }
+    }
+}
+
+async fn send_bytestream_bytes_write(
+    mut bytestream: ByteStreamClient<Channel>,
+    resource_name: String,
+    digest: Digest,
+    data: Bytes,
+) -> Result<tonic::Response<WriteResponse>, Status> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    tx.send(WriteRequest {
+        resource_name: resource_name.clone(),
+        write_offset: 0,
+        finish_write: true,
+        data: data.to_vec(),
+    })
+    .await
+    .map_err(|_| Status::internal("failed to queue ByteStream write request"))?;
+    drop(tx);
+
+    let response = bytestream
+        .write(Request::new(ReceiverStream::new(rx)))
+        .await
+        .map_err(|status| bytestream_write_status(&resource_name, status))?;
+    if let Some(status) = bytestream_committed_size_error(&response, &digest) {
+        return Err(status);
+    }
+    Ok(response)
+}
+
+async fn send_bytestream_file_write(
+    mut bytestream: ByteStreamClient<Channel>,
+    resource_name: String,
+    digest: Digest,
+    path: PathBuf,
+) -> Result<tonic::Response<WriteResponse>, Status> {
+    let (tx, rx) = tokio::sync::mpsc::channel(2);
+    let producer_resource_name = resource_name.clone();
+    let producer_path = path.clone();
+
+    // ByteStream.Write consumes an async stream while the file is read. The
+    // producer task keeps those two sides progressing concurrently, and every
+    // retry recreates the task so the file is reopened from offset zero.
+    let producer = tokio::spawn(async move {
+        send_bytestream_file_requests(tx, producer_resource_name, producer_path).await
+    });
+
+    let response = bytestream
+        .write(Request::new(ReceiverStream::new(rx)))
+        .await;
+    let producer_result = producer.await.map_err(|source| {
+        Status::internal(format!("ByteStream file producer task failed: {source}"))
+    })?;
+    producer_result?;
+
+    let response = response.map_err(|status| bytestream_write_status(&resource_name, status))?;
+    if let Some(status) = bytestream_committed_size_error(&response, &digest) {
+        return Err(status);
+    }
+    Ok(response)
+}
+
+async fn send_bytestream_file_requests(
+    tx: tokio::sync::mpsc::Sender<WriteRequest>,
+    resource_name: String,
+    path: PathBuf,
+) -> Result<(), Status> {
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|source| Status::internal(format!("open {}: {source}", path.display())))?;
+    let mut offset = 0i64;
+
+    loop {
+        let mut buffer = vec![0u8; BYTESTREAM_UPLOAD_CHUNK_BYTES];
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|source| Status::internal(format!("read {}: {source}", path.display())))?;
+        buffer.truncate(read);
+
+        // REAPI marks stream completion with a final request carrying
+        // finish_write=true. For exact chunk boundaries that means an empty
+        // final message at the committed offset.
+        let finish_write = read == 0;
+        tx.send(WriteRequest {
+            resource_name: resource_name.clone(),
+            write_offset: offset,
+            finish_write,
+            data: buffer,
+        })
+        .await
+        .map_err(|_| Status::internal("failed to queue ByteStream file write request"))?;
+
+        if finish_write {
+            return Ok(());
+        }
+        offset += read as i64;
+    }
+}
+
+fn bytestream_write_status(resource_name: &str, status: Status) -> Status {
+    Status::new(
+        status.code(),
+        format!(
+            "send ByteStream write request for resource {resource_name}: {}",
+            status.message()
+        ),
+    )
+}
+
+fn bytestream_committed_size_error(
+    response: &tonic::Response<WriteResponse>,
+    digest: &Digest,
+) -> Option<Status> {
+    if response.get_ref().committed_size != digest.size_bytes() {
+        return Some(Status::data_loss(format!(
+            "committed {} bytes for {}",
+            response.get_ref().committed_size,
+            digest
+        )));
+    }
+    None
+}
+
 fn endpoint_from_grpc_url(cas_url: &str) -> Result<String, CasError> {
     cas_url
         .strip_prefix("grpc://")
@@ -734,6 +997,26 @@ fn bytestream_write_resource_name(instance_name: &str, digest: &Digest) -> Strin
     )
 }
 
+fn digest_size_u64(digest: &Digest) -> Result<u64, CasError> {
+    digest
+        .size_bytes()
+        .try_into()
+        .map_err(|source| CasError::ReApiConversion {
+            operation: format!("convert digest size for {digest} into u64"),
+            source: Box::new(source),
+        })
+}
+
+fn digest_size_usize(digest: &Digest) -> Result<usize, CasError> {
+    digest
+        .size_bytes()
+        .try_into()
+        .map_err(|source| CasError::ReApiConversion {
+            operation: format!("convert digest size for {digest} into usize"),
+            source: Box::new(source),
+        })
+}
+
 fn verify_download(digest: &Digest, bytes: &[u8]) -> Result<(), CasError> {
     digest
         .verify_bytes(bytes)
@@ -741,37 +1024,6 @@ fn verify_download(digest: &Digest, bytes: &[u8]) -> Result<(), CasError> {
             digest: digest.clone(),
             source,
         })
-}
-
-fn pack_batch_update_blobs(blobs: Vec<Blob>, budget_bytes: usize) -> PackedBatch {
-    let mut batches: Vec<Vec<Blob>> = Vec::new();
-    let mut current: Vec<Blob> = Vec::new();
-    let mut current_bytes = 0usize;
-    let mut bytestream = Vec::new();
-
-    for blob in blobs {
-        let blob_size = blob.data.len();
-        if blob_size > budget_bytes {
-            bytestream.push(blob);
-            continue;
-        }
-
-        if !current.is_empty() && current_bytes + blob_size > budget_bytes {
-            batches.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes += blob_size;
-        current.push(blob);
-    }
-
-    if !current.is_empty() {
-        batches.push(current);
-    }
-
-    PackedBatch {
-        batches,
-        bytestream,
-    }
 }
 
 fn is_retryable_status(status: &Status) -> bool {
@@ -807,7 +1059,7 @@ impl BlobStore for CasClient {
         CasClient::find_missing_blobs(self, digests).await
     }
 
-    async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
+    async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
         CasClient::upload_blobs(self, blobs).await
     }
 
@@ -920,23 +1172,6 @@ mod tests {
             verify_download(&digest, b"jello"),
             Err(CasError::Verification { .. })
         ));
-    }
-
-    #[test]
-    fn batch_packing_respects_budget_and_moves_oversized_entries() {
-        let small_a = Blob::new(vec![b'a'; 8]);
-        let small_b = Blob::new(vec![b'b'; 8]);
-        let too_large = Blob::new(vec![b'c'; 64]);
-
-        let packed = pack_batch_update_blobs(
-            vec![small_a.clone(), small_b.clone(), too_large.clone()],
-            12,
-        );
-
-        assert_eq!(packed.batches.len(), 2);
-        assert_eq!(packed.batches[0], vec![small_a]);
-        assert_eq!(packed.batches[1], vec![small_b]);
-        assert_eq!(packed.bytestream, vec![too_large]);
     }
 
     #[test]

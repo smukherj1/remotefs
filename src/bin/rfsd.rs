@@ -31,8 +31,12 @@ struct Cli {
     )]
     log_level: String,
 
-    #[arg(long, default_value = "text", help = "Log format (text, json)")]
-    log_format: String,
+    #[arg(
+        long,
+        default_value = "text",
+        help = "Output format for daemon logs (text, json)"
+    )]
+    output_format: String,
 
     #[arg(long, help = "Path to custom cache directory")]
     cache_dir: Option<PathBuf>,

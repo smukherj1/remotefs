@@ -1,3 +1,4 @@
+use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
@@ -8,6 +9,15 @@ use crate::reapi::remote_execution;
 pub struct Digest {
     hash: String,
     size_bytes: i64,
+}
+
+impl Serialize for Digest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
 }
 
 #[derive(Error, Debug, PartialEq, Eq)]
