@@ -13,6 +13,12 @@ These guidelines capture style and quality expectations remotefs code.
 - Keep public methods small enough that the main control flow is obvious.
 - Split large branches into private helpers when each branch performs a distinct workflow, such as batch download versus ByteStream download.
 - Minimize the level of control flow (loops or if else nesting) within a function.
+  - Nesting more than once is a MAJOR red flag. Should be avoided.
+  - Avoid large bodies for if/else because it makes the overall function hard to follow. Prefer early returns at the top of a function to
+    deal with error conditions. Otherwise, refactor into helpers.
+  - Within a function, DO NOT check a condition if it's already guaranteed to never happen based on an above condition.
+  - Within a package/crate, prefer to not check a condition if it's already been checked unless it prevents a fatal error that would
+    trigger an immediate exit like out of bounds array access.
 - Prefer one helper per operation boundary when it improves readability: build request, send RPC, validate response, transform result.
 - Avoid unrelated refactors while implementing a plan step. If cleanup is necessary, keep it in the same ownership boundary as the change.
 
@@ -39,6 +45,9 @@ These guidelines capture style and quality expectations remotefs code.
 ## Comments
 
 - _MUST_ comment non-obvious design choices, edge cases, protocol quirks, invariants, and tradeoffs.
+- Strongly prefer briefly comment every struct, field and function with their purpose. For functions document
+  the arguments and results and any assumptions / preconditions.
+- Within the function body, explain the purpose of each condition branch with comments (unless extremely obvious from the condition itself).
 - Do not leave review notes, temporary TODOs, or style reminders in production code. Convert them into code changes, tests, or durable design comments.
 - Public APIs (methods and structures) _MUST_ have comments explaining the inputs, results, preconditions, side-effects and behaviors as applicable.
 - Private APIs _SHOULD_ have comments (similar to public APIs) unless they're trivial wrappers.
