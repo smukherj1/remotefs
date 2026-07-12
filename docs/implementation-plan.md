@@ -34,7 +34,7 @@ The intended implementation order is:
 - SQLite state uses `rusqlite` in daemon-owned blocking sections.
 - Generated Rust proto code is produced during build from checked-in pinned proto sources under `third_party/remote-apis/`.
 - Process exit codes are simple: `0` for success and `1` for any error.
-- Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence.
+- Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence. `rfs cleanup` remains an explicit full local reset that also removes the cache; it is not an eviction policy.
 
 ## Phase 0: Boilerplate and Workflow
 
@@ -70,7 +70,7 @@ task test:unit
 Tests:
 
 - Unit: digest parser skeleton tests.
-- Unit: config path resolution tests for `RFS_HOME`, `RFS_CACHE_DIR`, and `RFS_SESSION_DIR`.
+- Unit: config path resolution tests for `RFS_HOME` and its fixed `cache/` and `active/` children.
 - Integration/e2e test setup: verify local test prerequisites where needed, including Docker for CAS tests and `/dev/fuse` plus mount permissions for FUSE tests. Missing prerequisites fail clearly from the test target that needs them.
 - Smoke: `task build` produces both `rfs` and `rfsd`.
 
@@ -311,8 +311,6 @@ Deliverables:
   - `--instance-name`
   - `--log-level`
   - `--output-format text|json`
-  - `--cache-dir`
-  - `--session-dir`
 - Use simple process exit codes: `0` for success and `1` for any error. Put detailed error categories in human and JSON diagnostics instead of numeric exit codes.
 - Validate `--cas-url` with an explicit scheme; accept `grpc://` in the MVP and reserve `grpcs://`.
 
@@ -321,7 +319,7 @@ Task targets:
 ```sh
 task build
 task test:unit
-task test:cli
+task test
 ```
 
 Tests:
@@ -332,14 +330,14 @@ Tests:
 - Unit: CAS URL and REAPI `instance_name` are included in every CAS and ByteStream request.
 - Unit: command parsing for every expected command.
 - Unit: optional mountpoint arguments validate against active-session metadata when supplied.
-- CLI: `rfs cleanup` refuses to remove active state while a live session lock exists.
+- CLI: `rfs cleanup` refuses to reset local state while another process holds the active-session lock.
 - CLI: `rfs --help`, subcommand help, and invalid digest errors via `assert_cmd`.
 
 Definition of done:
 
 - Every MVP command exists, even if some commands return a clear "not implemented yet" error.
 
-### Step 3.2: `rfs upload`
+### Step 3.2: `rfs upload` (Complete)
 
 Deliverables:
 
@@ -348,18 +346,16 @@ Deliverables:
 - Fail on unsupported filesystem nodes by default.
 - Detect hard links, warn/count them, and store each path as an ordinary file.
 - Feed local filesystem entries into the shared tree encoder; keep local traversal separate from mounted overlay traversal.
-- Hash and upload file blobs through a bounded deterministic pipeline:
-  - Use one filesystem walker to record metadata and path structure.
-  - Stream file hashing through a bounded worker pool. Default workers are `min(available_parallelism, 8)`, with a minimum of 2.
-  - Run `FindMissingBlobs` after digests are known.
-  - Upload missing small blobs with `BatchUpdateBlobs`.
-  - Upload larger blobs with ByteStream using a separate default concurrency cap of 4.
-  - Limit buffered in-flight payloads to 64 MiB by default with bounded channels and byte accounting.
-  - Reread large ByteStream uploads from disk instead of holding whole files in memory.
+- Hash regular files in blocking tasks bounded to `min(available_parallelism, 8)` concurrent workers, with a minimum of 2. The configured 64 MiB default is currently divided into per-worker read buffers (capped at 1 MiB), rather than enforcing queue-wide in-flight byte accounting.
+- Reject files whose observed length changes between scan and hashing.
 - Encode directories bottom-up and upload encoded directory nodes through the generic uploader.
-- Use `FindMissingBlobs` before uploading new local file blobs and newly encoded directory nodes.
-- Print the root digest.
-- Emit counts for files, dirs, symlinks, uploaded blobs, reused blobs, bytes uploaded, warnings.
+- Deduplicate file and directory objects by digest, use one `FindMissingBlobs` call, and upload only missing objects through `BlobStore`. The CAS client decides whether each object is sent with `BatchUpdateBlobs` or ByteStream.
+- Print the root digest to stdout in text mode and a text counter line to stderr. In JSON mode, print a versioned envelope to stdout containing the root digest, counts, and warning counters.
+
+Not implemented in this step:
+
+- A bounded upload queue, queue-wide byte accounting, or a separate ByteStream concurrency cap.
+- CLI flags for upload worker count, buffer budget, or unsupported-node policy; the command uses `UploadOptions::default()`.
 
 Task targets:
 
@@ -371,15 +367,13 @@ task fixture:upload
 
 Tests:
 
-- Unit: filesystem walker handles regular files, dirs, symlinks, mtimes, executable bit, unsupported types.
-- Unit: unsupported nodes fail upload by default.
-- Unit: hard links are counted and represented as ordinary files.
-- Unit: tree encoder produces identical root digest for identical trees.
-- Unit: worker completion order does not affect root digest or JSON summary ordering.
-- Unit: upload backpressure enforces the configured in-flight byte budget.
-- Unit: symlink warnings/counts are stable.
-- Integration: upload a fixture directory to `bazel-remote`, fetch all reachable objects, and verify metadata.
-- E2E-lite: `task fixture:upload` uploads a checked-in fixture and prints a root digest.
+- Unit: default worker-count and option-budget validation.
+- Unit: scanner records regular files, directories, symlinks, and hard-link warnings without following symlinked directories.
+- Unit: non-UTF-8 symlink targets return a path-rich error.
+- Unit: hashing returns the expected digest/size and rejects a file whose size changed after scanning.
+- Unit: fake-store upload deduplicates objects and submits only missing objects.
+- Integration: upload the checked-in fixture to `bazel-remote`; verify text output and the JSON envelope/counts.
+- E2E-lite: `task fixture:upload` uploads the checked-in fixture and prints a root digest.
 
 Definition of done:
 
@@ -395,22 +389,23 @@ Deliverables:
   - Shared blob cache.
   - Shared directory cache.
   - Active session directory.
-  - Active session logs under `RFS_HOME/active/logs/`.
+  - Stable ownership lock at `RFS_HOME/active.lock`.
+  - Active session log at `RFS_HOME/active/rfsd.log`.
+  - Fixed overlay directories at `RFS_HOME/active/overlay/data/` and `overlay/tmp/`.
+- Make `RFS_HOME` the only local-state path configuration. Remove cache/session environment and CLI overrides; resolve a symlinked home once to a canonical absolute directory.
 - Use sharded cache paths by hash prefix, for example `cache/blobs/aa/<hash>-<size>` and `cache/dirs/aa/<hash>-<size>`.
 - Store raw serialized REAPI `Directory` bytes in the directory cache; keep decoded directory objects in memory only.
 - Create one active session under `RFS_HOME/active/`.
-- Add an active-session lock so at most one `rfsd` can own an `RFS_HOME` at a time.
+- Acquire and retain `RFS_HOME/active.lock` so at most one `rfsd` can own an `RFS_HOME` at a time. Keep the lock outside the removable `active/` tree.
 - Preserve `RFS_HOME/active/` after clean unmount for inspection.
-- Implement `rfs cleanup` to remove stale `RFS_HOME/active/` only when no live active-session lock exists.
-- `rfs cleanup` does not prune shared blob or directory caches; cache pruning is a future separate command.
-- Add SQLite schema migrations for:
-  - Session metadata.
-  - Inode table.
-  - Remote directory materialization table.
-  - Overlay entry table placeholders.
-  - Counters.
+- Automatically replace a valid cleanly closed `active/` on the next daemon startup while retaining the cache. Require explicit cleanup for unclean, partial, malformed, or unsupported session state.
+- Implement `rfs cleanup` as a guarded full reset: while holding `active.lock`, remove `active/` and `cache/`, then remove the lock last and leave `RFS_HOME` empty. Refuse unknown top-level content and possible live ownership.
+- Add a rollback-journal SQLite schema migration containing only session metadata and `initializing`, `active`, and `closed` lifecycle states. Defer inode, remote-directory, overlay-index, and counter tables until their first consumers.
+- Validate the root digest and require/canonicalize an existing mountpoint directory before creating session state.
+- Validate only fixed top-level and active-layout entries; never traverse cache shards or overlay data during startup. Create private files/directories and reject unsafe ownership, permissions, symlinks, and wrong entry types.
+- Wire the state owner into foreground `rfsd`; keep background daemon launch for the mount/FUSE step.
 - Add startup validation and lock handling so a second mount using the same `RFS_HOME` fails clearly while an active session is live.
-- Add startup validation so stale `RFS_HOME/active/` without a live lock fails the next mount with an `rfs cleanup` hint.
+- Add startup validation so unlocked unclean `RFS_HOME/active/` fails the next mount with an `rfs cleanup` hint.
 
 Task targets:
 
@@ -421,18 +416,19 @@ task test:integration:state
 
 Tests:
 
-- Unit: state path layout honors env overrides.
+- Unit: state path layout honors `RFS_HOME`, canonicalizes a symlinked home, and uses fixed child paths.
 - Unit: blob and directory cache path derivation is stable and includes hash prefix plus size.
 - Unit: migrations are idempotent.
-- Unit: inode allocation preserves root inode.
-- Integration: create, close, and reopen a session database.
+- Unit: metadata constraints and clean-session recognition reject malformed state.
+- Unit: mountpoint canonicalization requires an existing directory and resolves aliases/symlinks.
+- Integration: create and cleanly close a session database.
 - Integration: clean unmount leaves active session state available for inspection.
-- Integration: stale active state blocks the next mount until `rfs cleanup` runs.
-- Integration: `rfs cleanup` removes stale active state and refuses to run while a live lock exists.
+- Integration: the next daemon replaces valid closed state while retaining cache; stale active state blocks until cleanup.
+- Integration: `rfs cleanup` fully resets active state and cache, refuses a held lock or unknown top-level content, and does not follow removable-tree symlinks.
 
 Definition of done:
 
-- `rfsd` can initialize a durable session and print/log its state paths.
+- Foreground `rfsd` can initialize and retain a session, log to `active/rfsd.log`, close it inspectably, and automatically replace only valid closed state on its next start.
 
 ### Step 4.2: Control Socket Protocol
 
@@ -446,9 +442,9 @@ Deliverables:
   - `unmount`
   - protocol/version check
 - Make `rfs status` talk to `rfsd` through the generated gRPC client.
-- Add socket path discovery from `RFS_HOME/active/` metadata.
-- If no live session exists but previous `RFS_HOME/active/` state remains, make `rfs status` report previous/stale session metadata and cleanup guidance.
-- If no live or previous session state exists, make `rfs status` report a clean no-session state.
+- Use the fixed control-socket path `RFS_HOME/active/control.sock`.
+- If no live session exists but `RFS_HOME/active/` remains, make `rfs status` distinguish cleanly closed state from stale state and give cleanup guidance only for stale state.
+- If neither live nor retained session state exists, make `rfs status` report a clean no-session state.
 - Keep text-proto-friendly message shapes so debug clients can log readable request and response payloads.
 
 Task targets:
@@ -463,7 +459,7 @@ Tests:
 - Unit: control protobuf conversion rejects unknown or incompatible protocol versions cleanly.
 - Unit: gRPC status codes map to stable CLI daemon diagnostics.
 - CLI: `rfs status` reports clean no-session state when no active or previous state exists.
-- CLI: `rfs status` reports previous/stale state when `RFS_HOME/active/` remains without a live lock.
+- CLI: `rfs status` distinguishes cleanly closed and stale state when `RFS_HOME/active/` remains without a live lock.
 - Integration: start foreground `rfsd` in no-FUSE control mode and query `rfs status`.
 - Integration: attempting a second active session in the same `RFS_HOME` fails with the existing session metadata.
 - Integration: daemon shutdown through `rfs unmount` control path.
@@ -485,6 +481,7 @@ Deliverables:
   - Resolve lookup and readdir from remote tree metadata.
   - Read symlink targets.
   - Fetch file blobs on first read through the verified blob cache.
+- Add the first consumer-owned SQLite migrations for session-stable inodes and remote-directory materialization, including their allocation and identity invariants.
 - Keep this layer independent of `fuser`.
 
 Task targets:
@@ -556,7 +553,7 @@ Definition of done:
 
 Deliverables:
 
-- Extend SQLite schema for overlay entries:
+- Add the consumer-owned SQLite schema for overlay entries:
   - New files and directories.
   - Copied-up remote files.
   - Tombstones.
@@ -775,7 +772,7 @@ Deliverables:
   - Remote errors.
   - Digest verification failures.
 - Implement `rfs status` and `rfs status --output-format json`.
-- Status output covers live active session, previous/stale session, and clean no-session states.
+- Status output covers live, cleanly closed, stale, and clean no-session states.
 - Implement stable JSON command summaries for `status`, `upload`, and `snapshot`:
   - Include `schema_version: 1`, `command`, `ok`, `warnings`, `error`, and command-specific `data`.
   - Use `error: null` on success and `error: { code, message, details }` on failure.
@@ -784,11 +781,11 @@ Deliverables:
   - Require a `schema_version` bump before removing fields or changing field types.
   - Print one JSON object on `--output-format json` failure for machine consumers; keep logs separate.
 - Route CLI logs to stderr only. Command results and JSON summaries go to stdout.
-- Write daemon logs to `RFS_HOME/active/logs/rfsd.log`.
+- Write daemon logs to `RFS_HOME/active/rfsd.log`.
 - Use compact human-readable text output and logs by default and JSON summaries plus JSON Lines logs when `--output-format json` is selected.
 - Apply `--log-level` and `--output-format` to both `rfs` and any spawned `rfsd`.
-- Store effective daemon log level and format in session metadata for `rfs status`.
-- Preserve the session log file with `RFS_HOME/active` until `rfs cleanup`; no log rotation in the MVP.
+- Store effective daemon log level and format in SQLite session metadata for `rfs status`.
+- Preserve the session log file with `RFS_HOME/active` until the next mount replaces a clean session or `rfs cleanup` resets the home; no log rotation in the MVP.
 - Include timestamp, level, target/module, session id, operation, path/digest where relevant, and message in daemon log events.
 
 Task targets:
@@ -808,8 +805,8 @@ Tests:
 - Unit: CLI logs use stderr and command summaries use stdout.
 - Unit: output format flag selects text or JSON Lines formatting.
 - Integration: daemon status includes mount root, cache paths, session paths, and counters.
-- Integration: spawned daemon writes `RFS_HOME/active/logs/rfsd.log` and status reports log level/format.
-- Integration: status reports previous/stale session metadata after clean unmount leaves inspectable state.
+- Integration: spawned daemon writes `RFS_HOME/active/rfsd.log` and status reports log level/format.
+- Integration: status reports cleanly closed session metadata after clean unmount and distinguishes it from stale state.
 - E2E: read a file through mount and observe counter changes.
 
 Definition of done:
@@ -823,7 +820,7 @@ Deliverables:
 - Normalize errors across CLI, daemon, CAS, and FUSE paths.
 - Include path, digest, operation, and remote context where available.
 - Ensure no empty, partial, or unverified content is served after fetch failures.
-- Document that automatic cache eviction and cache pruning are deferred; `rfs cleanup` only removes stale session state.
+- Document that automatic cache eviction and selective cache pruning are deferred; `rfs cleanup` is a full reset and removes the entire cache along with session state.
 
 Task targets:
 

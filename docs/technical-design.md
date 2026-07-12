@@ -16,7 +16,7 @@ This document captures implementation and architecture decisions. Product scope 
   - `rfs`: user-facing CLI.
   - `rfsd`: long-running mount daemon.
 - Use SQLite for durable session and overlay state.
-- Allow at most one active mount session per `RFS_HOME`.
+- Allow at most one active mount session per `RFS_HOME`, coordinated by a stable `RFS_HOME/active.lock` outside the removable session tree.
 - Use one Unix control socket per active `RFS_HOME` session for CLI-to-daemon commands.
 - Use whole-file copy-on-write for remote-backed file mutations.
 - Use full-workspace snapshotting for the earliest writable MVP.
@@ -93,7 +93,7 @@ The CAS client exposes only RemoteFS-level operations to callers: existence chec
 
 ## Process Model
 
-`rfs` is the user-facing CLI. Expected MVP commands:
+`rfs` is the user-facing CLI. Its target MVP command surface is:
 
 ```sh
 rfs upload <local-dir>
@@ -104,7 +104,7 @@ rfs status [mountpoint]
 rfs cleanup
 ```
 
-`rfsd` owns:
+When implemented, `rfsd` will own:
 
 - The FUSE mount.
 - The mounted root digest.
@@ -114,17 +114,19 @@ rfs cleanup
 - The active session overlay data directory.
 - The Unix control socket.
 
-`rfs mount` starts `rfsd` in the background by default and returns only after the root directory is validated, the FUSE mount is active, and the control socket is reachable. Direct `rfsd` invocation runs in the foreground unless supervised externally.
+When implemented, `rfs mount` will start `rfsd` in the background by default and return only after the root directory is validated, the FUSE mount is active, and the control socket is reachable. Direct `rfsd` invocation will run in the foreground unless supervised externally.
 
-The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires an active-session lock under `RFS_HOME` before starting `rfsd`; if another live session owns that lock, the mount fails and reports the active session metadata. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts can still be run by using distinct `RFS_HOME` values.
+Current CLI behavior is deliberately narrower: `upload` is functional; `mount`, `snapshot`, `unmount`, `status`, and `cleanup` parse their stable arguments but return a clear not-implemented diagnostic (except that `cleanup` first refuses a possible live owner). `mount` validates its root digest before returning that diagnostic. `rfsd` currently only parses and prints its configuration; it does not create a session or mount FUSE.
 
-`rfs snapshot`, `rfs status`, and `rfs unmount` discover session state from `RFS_HOME`. Their mountpoint argument is optional in the MVP. If supplied, the CLI validates that it matches the active session mountpoint before sending the request.
+The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires `RFS_HOME/active.lock` before starting `rfsd`; if another process holds that advisory lock, the mount fails and reports its diagnostic lock metadata when readable. The lock is outside `RFS_HOME/active/` so cleanup or replacement never removes the inode that coordinates ownership. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts require distinct `RFS_HOME` values.
+
+`rfs snapshot`, `rfs status`, and `rfs unmount` discover session state from `RFS_HOME`. Their mountpoint argument is optional in the MVP. If supplied, the CLI requires it to exist as a directory, canonicalizes it to an absolute path with symlinks resolved, and validates that it matches the canonical active-session mountpoint before sending the request.
 
 `rfs status` reports only session state:
 
 - If a live active session exists, it talks to the daemon through the active session's Unix control socket and reports mountpoint, root digest, daemon pid/socket, cache/session paths, counters, dirty state, and snapshot blockers.
-- If no live session exists but previous `RFS_HOME/active/` state remains, it reports previous/stale session metadata and cleanup guidance.
-- If no live or previous session state exists, it reports a clean no-session state.
+- If no live session exists but `RFS_HOME/active/` remains, it reports cleanly closed or stale session metadata as appropriate. Stale state includes cleanup guidance.
+- If neither live nor retained session state exists, it reports a clean no-session state.
 
 RemoteFS does not include `rfs doctor` in the MVP. Configuration, CAS, path, FUSE, and root-digest validation happen in the commands that need them: `upload`, `mount`, `snapshot`, and `unmount`.
 
@@ -134,6 +136,7 @@ Default state root:
 
 ```text
 $HOME/.rfs/
+  active.lock
   cache/
     blobs/
       <2-hex-prefix>/
@@ -143,18 +146,14 @@ $HOME/.rfs/
         <sha256-hex>-<size>
   active/
     session.db
+    rfsd.log
     overlay/
+      data/
+      tmp/
     control.sock
-    metadata.json
-    logs/
-      rfsd.log
 ```
 
-Config overrides:
-
-- `RFS_HOME`
-- `RFS_CACHE_DIR`
-- `RFS_SESSION_DIR`
+`RFS_HOME` is the only local-state path setting. It defaults to `$HOME/.rfs`, may itself be a symlink, and is resolved once to a canonical absolute directory. Cache and session paths are fixed beneath it. Users who need another filesystem set or symlink `RFS_HOME` rather than overriding individual subdirectories.
 
 The shared cache is content-addressed and may be reused across sequential mount sessions on the same runner.
 
@@ -165,9 +164,11 @@ Active session state is isolated under `RFS_HOME/active/`:
 - SQLite overlay/session database.
 - Local files for copied-up and newly created file contents.
 - Control socket.
-- Session logs and metadata.
+- Session logs and SQLite-backed session metadata.
 
-Only one active session may exist for an `RFS_HOME` at a time. Clean unmount leaves `RFS_HOME/active/` in place for inspection, including the session database, logs, and overlay data. A later `rfs mount` fails if stale active state exists without a live lock and tells the operator to run `rfs cleanup`. `rfs status` can inspect and report that previous/stale state. `rfs cleanup` refuses to run while a live active-session lock exists, and removes stale `RFS_HOME/active/` when no session is active.
+Only one active session may exist for an `RFS_HOME` at a time. Clean unmount transactionally marks the session `closed`, then leaves `RFS_HOME/active/` in place for inspection. The next mount, while holding `active.lock`, automatically removes only a valid cleanly closed `active/` tree and preserves the shared cache. Unclean, partial, malformed, or unsupported session state blocks mounting and requires `rfs cleanup`.
+
+`rfs cleanup` is an explicit full local reset. It refuses while another process holds `active.lock` or when the home contains unknown direct children or expected entries of unsafe type. Otherwise it removes both `active/` and `cache/` without following symlinks, removes `active.lock` last, and leaves `RFS_HOME` empty. It does not scan individual cache or overlay data files before removal.
 
 Local cache eviction is deferred. The earliest MVP may provide manual pruning only. Remote CAS eviction is a deployment concern and must be disabled or capacity-provisioned during MVP evaluation.
 
@@ -364,30 +365,36 @@ Upload walks the local filesystem directly and uses the same canonical tree enco
 
 Upload does not follow symlinks by default.
 
-Upload uses a bounded deterministic pipeline:
+The implemented upload pipeline is:
 
-1. A single filesystem walker records metadata and path structure without following symlinks.
-2. A bounded hashing worker pool streams regular files from disk. The default worker count is `min(available_parallelism, 8)`, with a minimum of 2.
-3. `FindMissingBlobs` runs after digests are known so uploads can skip existing blobs.
-4. Missing small blobs are uploaded with `BatchUpdateBlobs`; larger blobs use ByteStream with a separate default concurrency cap of 4.
-5. Channels and in-flight byte accounting bound memory use. The default buffered in-flight payload budget is 64 MiB.
-6. Large ByteStream uploads reread from disk instead of buffering whole files in memory.
-7. Encoded directory nodes are uploaded through the same generic upload orchestration used for CAS existence checks and counters.
+1. A recursive scanner records all directory metadata and entries without following symlinks. It sorts entries by raw filename bytes, rejects non-UTF-8 entry names and symlink targets, and fails on unsupported nodes by default.
+2. The scanner records each regular-file path even when it shares a Unix `(dev, ino)` identity with an earlier path. Such additional paths increment the hard-link warning count; hard-link identity is not encoded.
+3. Regular files are hashed by blocking tasks with at most `min(available_parallelism, 8)` concurrent workers and a minimum of 2. Each task streams with a reusable buffer of at most 1 MiB; the 64 MiB default in-flight setting is divided across workers to size those buffers. This is a per-worker buffer bound, not yet a queue-wide byte-accounting or backpressure mechanism.
+4. The upload fails if a file's byte count changes between scan metadata and hashing. Completed digests are sorted by relative path before bottom-up directory encoding.
+5. Directories are encoded bottom-up with the shared canonical encoder. File blobs and serialized `Directory` objects are deduplicated by digest, checked once with `FindMissingBlobs`, then submitted through `BlobStore`.
+6. The CAS client owns the current batch-versus-ByteStream choice and batching policy. Upload does not yet impose a separate ByteStream concurrency cap or an upload worker pool.
 
-Worker completion order must not affect output. Directory encoding, the root digest, and JSON summaries are stable through canonical path and entry ordering.
+Canonical directory encoding and the root digest are independent of filesystem traversal and hashing completion order. The current object submission order is not a user-visible determinism guarantee.
+
+`rfs upload` writes the root digest alone to stdout in text mode and a compact counter line to stderr. In JSON mode it writes one versioned success envelope to stdout with `root_digest`, entry/object/byte counts, and warning counters. JSON failures are emitted as one versioned envelope on stderr. The upload-specific warning counters are hard links, masked setuid/setgid bits, absolute symlinks, and relative symlinks that escape the upload tree.
 
 ## Observability
 
 Structured logs and command summaries are the first observability layer.
 
-MVP should support:
+The completed upload slice supports:
+
+- A stable JSON success/failure envelope for `rfs upload` with `schema_version`, `command`, `ok`, `warnings`, `error`, and `data`.
+- Upload results on stdout and the text-mode upload counter line on stderr.
+
+The later MVP observability work should support:
 
 - CLI logs go to stderr only. Command results and JSON summaries go to stdout.
-- `rfsd` logs go to `RFS_HOME/active/logs/rfsd.log` and remain inspectable with the active or previous session until `rfs cleanup`.
+- `rfsd` logs go to `RFS_HOME/active/rfsd.log` and remain inspectable with the active or cleanly closed session until the next mount replaces that session or `rfs cleanup` resets the home.
 - Human-readable compact text logs by default.
 - JSON Lines logs and JSON command summaries via `--output-format json`; text logs and human command summaries via `--output-format text`.
 - `--log-level` and `--output-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.
-- Effective daemon log level and format are written into session metadata so `rfs status` can report them.
+- Effective daemon log level and format are written into SQLite session metadata so `rfs status` can report them.
 - No log rotation in the MVP.
 - `rfs status`.
 - `rfs status --output-format json`.
