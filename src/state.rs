@@ -55,19 +55,18 @@ impl StatePaths {
     /// direct children without traversing cache or overlay contents.
     pub fn from_config(config: &Config) -> Result<Self, StateError> {
         if !config.rfs_home.exists() {
-            create_dir_private(&config.rfs_home)?;
+            create_home_private(&config.rfs_home)?;
         }
         let home = fs::canonicalize(&config.rfs_home)
             .map_err(|source| fs_error(&config.rfs_home, source))?;
-        if !fs::metadata(&home)
-            .map_err(|source| fs_error(&home, source))?
-            .is_dir()
-        {
+        let metadata = fs::symlink_metadata(&home).map_err(|source| fs_error(&home, source))?;
+        if !metadata.file_type().is_dir() {
             return Err(StateError::UnsafePath {
                 path: home,
                 reason: "RFS_HOME is not a directory".into(),
             });
         }
+        validate_existing_permissions(&home, &metadata)?;
         let paths = Self { home };
         paths.validate_top_level()?;
         Ok(paths)
@@ -169,6 +168,14 @@ struct LockRecord {
     record_version: u32,
     session_id: String,
     pid: u32,
+}
+
+struct ClosedSessionMetadata {
+    session_id: String,
+    daemon_pid: u32,
+    state: String,
+    closed_at_seconds: Option<i64>,
+    closed_at_nanos: Option<i64>,
 }
 
 /// An exclusively held stable ownership lock.
@@ -323,27 +330,20 @@ fn create_layout(paths: &StatePaths) -> Result<(), StateError> {
 }
 
 fn validate_closed_session(paths: &StatePaths) -> Result<(), StateError> {
-    for path in [
-        paths.database(),
-        paths.log(),
-        paths.active().join("overlay"),
-        paths.overlay_data(),
-        paths.overlay_tmp(),
-    ] {
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|source| stale(paths, format!("{}: {source}", path.display())))?;
-        let expected_file = path == paths.database() || path == paths.log();
-        if (expected_file && !metadata.file_type().is_file())
-            || (!expected_file && !metadata.file_type().is_dir())
-        {
-            return Err(stale(
-                paths,
-                format!("{} has the wrong type", path.display()),
-            ));
-        }
-        validate_existing_permissions(&path, &metadata)
-            .map_err(|error| stale(paths, error.to_string()))?;
-    }
+    validate_directory_entries(
+        &paths.active(),
+        &[
+            ("session.db", false),
+            ("rfsd.log", false),
+            ("overlay", true),
+        ],
+    )
+    .map_err(|error| stale(paths, error.to_string()))?;
+    validate_directory_entries(
+        &paths.active().join("overlay"),
+        &[("data", true), ("tmp", true)],
+    )
+    .map_err(|error| stale(paths, error.to_string()))?;
     let previous: LockRecord = fs::read_to_string(paths.lock())
         .ok()
         .and_then(|value| serde_json::from_str(&value).ok())
@@ -363,20 +363,29 @@ fn validate_closed_session(paths: &StatePaths) -> Result<(), StateError> {
             format!("unsupported schema version {version}"),
         ));
     }
-    let row: Option<(String, String, Option<i64>, Option<i64>)> = connection.query_row(
-        "SELECT session_id, state, closed_at_seconds, closed_at_nanos FROM session_metadata WHERE singleton = 1",
-        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    let row: Option<ClosedSessionMetadata> = connection.query_row(
+        "SELECT session_id, daemon_pid, state, closed_at_seconds, closed_at_nanos FROM session_metadata WHERE singleton = 1",
+        [], |row| Ok(ClosedSessionMetadata {
+            session_id: row.get(0)?,
+            daemon_pid: row.get(1)?,
+            state: row.get(2)?,
+            closed_at_seconds: row.get(3)?,
+            closed_at_nanos: row.get(4)?,
+        }),
     ).optional().map_err(|source| stale(paths, source.to_string()))?;
-    let Some((id, state, seconds, nanos)) = row else {
+    let Some(metadata) = row else {
         return Err(stale(paths, "missing metadata".into()));
     };
-    if id != previous.session_id {
+    if metadata.session_id != previous.session_id || metadata.daemon_pid != previous.pid {
         return Err(stale(
             paths,
-            "lock and database session IDs do not match".into(),
+            "lock and database session identity do not match".into(),
         ));
     }
-    if state != "closed" || seconds.is_none() || nanos.is_none() {
+    if metadata.state != "closed"
+        || metadata.closed_at_seconds.is_none()
+        || metadata.closed_at_nanos.is_none()
+    {
         return Err(stale(paths, "session was not closed cleanly".into()));
     }
     Ok(())
@@ -450,6 +459,24 @@ fn now_parts() -> Result<(i64, i64), StateError> {
 }
 
 fn create_dir_private(path: &Path) -> Result<(), StateError> {
+    match fs::create_dir(path) {
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|source| fs_error(path, source)),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|source| fs_error(path, source))?;
+            if !metadata.file_type().is_dir() {
+                return Err(StateError::UnsafePath {
+                    path: path.to_path_buf(),
+                    reason: "expected a directory and will not follow a symlink".into(),
+                });
+            }
+            validate_existing_permissions(path, &metadata)
+        }
+        Err(source) => Err(fs_error(path, source)),
+    }
+}
+
+fn create_home_private(path: &Path) -> Result<(), StateError> {
     fs::create_dir_all(path).map_err(|source| fs_error(path, source))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|source| fs_error(path, source))
@@ -481,10 +508,60 @@ fn validate_existing_permissions(path: &Path, metadata: &fs::Metadata) -> Result
             reason: "entry is not owned by the effective user".into(),
         });
     }
-    if metadata.is_dir() && metadata.permissions().mode() & 0o022 != 0 {
+    if metadata.permissions().mode() & 0o077 != 0 {
         return Err(StateError::UnsafePath {
             path: path.to_path_buf(),
-            reason: "directory is group- or world-writable".into(),
+            reason: "entry is accessible by group or other users".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_directory_entries(
+    directory: &Path,
+    expected: &[(&str, bool)],
+) -> Result<(), StateError> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(directory).map_err(|source| fs_error(directory, source))? {
+        let entry = entry.map_err(|source| fs_error(directory, source))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Err(StateError::UnsafePath {
+                path: entry.path(),
+                reason: "entry name is not UTF-8".into(),
+            });
+        };
+        let Some((_, should_be_directory)) =
+            expected.iter().find(|(candidate, _)| *candidate == name)
+        else {
+            return Err(StateError::UnsafePath {
+                path: entry.path(),
+                reason: "unknown entry; inspect it manually".into(),
+            });
+        };
+        let metadata =
+            fs::symlink_metadata(entry.path()).map_err(|source| fs_error(&entry.path(), source))?;
+        let correct_type = if *should_be_directory {
+            metadata.file_type().is_dir()
+        } else {
+            metadata.file_type().is_file()
+        };
+        if !correct_type {
+            return Err(StateError::UnsafePath {
+                path: entry.path(),
+                reason: "entry has the wrong type".into(),
+            });
+        }
+        validate_existing_permissions(&entry.path(), &metadata)?;
+        found.push(name.to_owned());
+    }
+    if let Some((missing, _)) = expected
+        .iter()
+        .find(|(name, _)| !found.iter().any(|item| item == name))
+    {
+        return Err(StateError::UnsafePath {
+            path: directory.join(missing),
+            reason: "required entry is missing".into(),
         });
     }
     Ok(())
@@ -577,5 +654,35 @@ mod tests {
         paths.cleanup().unwrap();
         paths.cleanup().unwrap();
         assert_eq!(fs::read_dir(paths.home()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn existing_home_rejects_permissions_for_other_users() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = StatePaths::from_config(&Config { rfs_home: home });
+
+        assert!(matches!(result, Err(StateError::UnsafePath { .. })));
+    }
+
+    #[test]
+    fn closed_session_with_unknown_active_entry_is_not_replaced() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let mountpoint = temp.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let startup = SessionStartup::new(Digest::for_bytes(b"root"), mountpoint);
+        SessionStore::create(paths.clone(), startup.clone())
+            .unwrap()
+            .close_cleanly()
+            .unwrap();
+        fs::write(paths.active().join("unexpected"), b"preserve me").unwrap();
+
+        let result = SessionStore::create(paths, startup);
+
+        assert!(matches!(result, Err(StateError::StaleSession { .. })));
     }
 }
