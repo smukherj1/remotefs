@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coding Guidelines"
+  short_description: "Apply consistent code standards"
+  default_prompt: "Use $coding-guidelines to implement or review this code change."

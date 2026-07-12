@@ -1,4 +1,4 @@
-# RemoteFS Coding Guidelines
+# Coding Guidelines
 
 Write the simplest code that correctly handles the problem. Make control flow, ownership, invariants, and failure modes easy to identify.
 
