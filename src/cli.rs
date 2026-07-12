@@ -8,7 +8,11 @@ use thiserror::Error;
 
 use crate::cas::{CasClient, CasConfig};
 use crate::config::{Config, ConfigError};
+use crate::control::{self, PROTOCOL_VERSION};
 use crate::digest::{Digest, DigestError};
+use crate::state::{
+    RetainedSession, StatePaths, canonicalize_mountpoint, inspect_retained_session,
+};
 use crate::upload::{UploadOptions, UploadSummary, upload_local_directory};
 
 /// Parsed `rfs` command line.
@@ -235,18 +239,140 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             })
         }
         Commands::Unmount { mountpoint } => {
-            validate_optional_mountpoint(mountpoint.as_deref(), None)?;
-            Err(CliError::NotImplemented { command: "unmount" })
+            let config = Config::new().map_err(config_error)?;
+            let paths = StatePaths::from_config(&config).map_err(state_error)?;
+            run_unmount(&paths, mountpoint.as_deref()).await
         }
         Commands::Status { mountpoint } => {
-            validate_optional_mountpoint(mountpoint.as_deref(), None)?;
-            Err(CliError::NotImplemented { command: "status" })
+            let config = Config::new().map_err(config_error)?;
+            let paths = StatePaths::from_config(&config).map_err(state_error)?;
+            run_status(&paths, mountpoint.as_deref(), cli.json_output()).await
         }
         Commands::Cleanup => {
             let config = Config::new().map_err(config_error)?;
             let paths = crate::state::StatePaths::from_config(&config).map_err(state_error)?;
             paths.cleanup().map_err(state_error)
         }
+    }
+}
+
+async fn query_daemon(paths: &StatePaths) -> Result<crate::control::v1::StatusResponse, CliError> {
+    let mut client = control::connect(&paths.control_socket())
+        .await
+        .map_err(control_error)?;
+    client
+        .status(crate::control::v1::StatusRequest {
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .await
+        .map(|response| response.into_inner())
+        .map_err(|status| CliError::CommandFailed {
+            category: control::diagnostic_category(status.code()),
+            message: status.to_string(),
+        })
+}
+
+async fn run_status(
+    paths: &StatePaths,
+    supplied: Option<&Path>,
+    json: bool,
+) -> Result<(), CliError> {
+    if paths.control_socket().exists()
+        && let Ok(status) = query_daemon(paths).await
+    {
+        validate_supplied_mountpoint(supplied, Path::new(&status.mountpoint))?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"schema_version":1,"command":"status","ok":true,"data":{"state":"active","mountpoint":status.mountpoint,"root_digest":status.root_digest,"daemon_pid":status.daemon_pid,"control_socket":status.control_socket,"cache_path":status.cache_path,"session_path":status.session_path,"dirty":status.dirty,"dirty_files":status.dirty_files,"cached_blobs":status.cached_blobs,"snapshot_blockers":status.snapshot_blockers}})
+            );
+        } else {
+            println!(
+                "active session: mountpoint={} root_digest={} daemon_pid={} socket={} dirty={}",
+                status.mountpoint,
+                status.root_digest,
+                status.daemon_pid,
+                status.control_socket,
+                status.dirty
+            );
+        }
+        return Ok(());
+    }
+    match inspect_retained_session(paths) {
+        RetainedSession::None => {
+            if supplied.is_some() {
+                validate_optional_mountpoint(supplied, None)?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"command":"status","ok":true,"data":{"state":"none"}})
+                );
+            } else {
+                println!("no RemoteFS session");
+            }
+            Ok(())
+        }
+        RetainedSession::Closed(metadata) => {
+            validate_supplied_mountpoint(supplied, &metadata.mountpoint)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"command":"status","ok":true,"data":{"state":"closed","mountpoint":metadata.mountpoint,"root_digest":metadata.root_digest.to_string(),"daemon_pid":metadata.daemon_pid}})
+                );
+            } else {
+                println!(
+                    "closed session: mountpoint={} root_digest={} daemon_pid={}",
+                    metadata.mountpoint.display(),
+                    metadata.root_digest,
+                    metadata.daemon_pid
+                );
+            }
+            Ok(())
+        }
+        RetainedSession::Stale(reason) => Err(CliError::CommandFailed {
+            category: "stale_session",
+            message: format!("stale session state; run `rfs cleanup`: {reason}"),
+        }),
+    }
+}
+
+async fn run_unmount(paths: &StatePaths, supplied: Option<&Path>) -> Result<(), CliError> {
+    let status = query_daemon(paths).await?;
+    validate_supplied_mountpoint(supplied, Path::new(&status.mountpoint))?;
+    let mut client = control::connect(&paths.control_socket())
+        .await
+        .map_err(control_error)?;
+    client
+        .unmount(crate::control::v1::UnmountRequest {
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .await
+        .map_err(|status| CliError::CommandFailed {
+            category: control::diagnostic_category(status.code()),
+            message: status.to_string(),
+        })?;
+    println!("unmount requested for {}", status.mountpoint);
+    Ok(())
+}
+
+fn validate_supplied_mountpoint(supplied: Option<&Path>, active: &Path) -> Result<(), CliError> {
+    let supplied = supplied
+        .map(canonicalize_mountpoint)
+        .transpose()
+        .map_err(state_error)?;
+    validate_optional_mountpoint(supplied.as_deref(), Some(active))
+}
+
+fn control_error(error: control::ControlError) -> CliError {
+    let category = match &error {
+        control::ControlError::Rpc(status) => control::diagnostic_category(status.code()),
+        control::ControlError::IncompatibleProtocol { .. } => "daemon_protocol",
+        _ => "daemon_unavailable",
+    };
+    CliError::CommandFailed {
+        category,
+        message: error.to_string(),
     }
 }
 

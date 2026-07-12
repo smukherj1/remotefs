@@ -80,6 +80,11 @@ tasks:
     cmds:
       - cargo test --test state_integration
 
+  test:integration:daemon:
+    desc: Verify Unix control socket and daemon lifecycle behavior
+    cmds:
+      - cargo test --test daemon_integration
+
   fixture:upload:
     desc: Upload the checked-in tree fixture to the local bazel-remote CAS
     cmds:

@@ -2,30 +2,85 @@ syntax = "proto3";
 
 package remotefs.control.v1;
 
+// Controls the daemon that owns the active RemoteFS session.
 service Control {
+  // Verifies that the client and daemon use the same control protocol version.
+  rpc CheckProtocol(ProtocolRequest) returns (ProtocolResponse);
+  // Returns metadata and counters for the active session.
   rpc Status(StatusRequest) returns (StatusResponse);
+  // Creates a remote snapshot of the active session.
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+  // Requests a clean shutdown of the active session.
   rpc Unmount(UnmountRequest) returns (UnmountResponse);
 }
 
-message StatusRequest {}
-
-message StatusResponse {
-  bool mounted = 1;
-  string root_digest = 2;
-  string mountpoint = 3;
-  uint64 cached_blobs = 4;
-  uint64 dirty_files = 5;
+// Requests protocol compatibility validation.
+message ProtocolRequest {
+  // Control protocol version required by the client.
+  uint32 protocol_version = 1;
 }
 
-message SnapshotRequest {}
+// Reports the daemon's accepted protocol version.
+message ProtocolResponse {
+  // Control protocol version implemented by the daemon.
+  uint32 protocol_version = 1;
+}
 
+// Requests the active session's status.
+message StatusRequest {
+  // Control protocol version required by the client.
+  uint32 protocol_version = 1;
+}
+
+// Describes the active daemon session.
+message StatusResponse {
+  // Whether the session currently owns a FUSE mount.
+  bool mounted = 1;
+  // Canonical digest of the session's remote root.
+  string root_digest = 2;
+  // Canonical local mountpoint path.
+  string mountpoint = 3;
+  // Number of blobs currently available in the local cache.
+  uint64 cached_blobs = 4;
+  // Number of locally modified files.
+  uint64 dirty_files = 5;
+  // Control protocol version used to encode this response.
+  uint32 protocol_version = 6;
+  // Process identifier of the daemon that owns the session.
+  uint32 daemon_pid = 7;
+  // Path to the active session's Unix control socket.
+  string control_socket = 8;
+  // Path to the persistent local cache.
+  string cache_path = 9;
+  // Path to the active session state.
+  string session_path = 10;
+  // Whether the session contains local changes.
+  bool dirty = 11;
+  // Human-readable reasons that currently prevent a snapshot.
+  repeated string snapshot_blockers = 12;
+}
+
+// Requests creation of a remote snapshot.
+message SnapshotRequest {
+  // Control protocol version required by the client.
+  uint32 protocol_version = 1;
+}
+
+// Reports the snapshot root and upload work performed.
 message SnapshotResponse {
+  // Canonical digest of the new remote root.
   string root_digest = 1;
+  // Number of blobs uploaded while creating the snapshot.
   uint64 uploaded_blobs = 2;
+  // Total bytes uploaded while creating the snapshot.
   uint64 uploaded_bytes = 3;
 }
 
-message UnmountRequest {}
+// Requests a clean daemon shutdown.
+message UnmountRequest {
+  // Control protocol version required by the client.
+  uint32 protocol_version = 1;
+}
 
+// Confirms that the daemon accepted the shutdown request.
 message UnmountResponse {}

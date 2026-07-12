@@ -96,6 +96,10 @@ impl StatePaths {
     pub fn log(&self) -> PathBuf {
         self.active().join("rfsd.log")
     }
+    /// Returns the fixed Unix control-socket path for the active session.
+    pub fn control_socket(&self) -> PathBuf {
+        self.active().join("control.sock")
+    }
     pub fn overlay_data(&self) -> PathBuf {
         self.active().join("overlay/data")
     }
@@ -176,6 +180,30 @@ struct ClosedSessionMetadata {
     state: String,
     closed_at_seconds: Option<i64>,
     closed_at_nanos: Option<i64>,
+}
+
+/// Session metadata exposed by the daemon control API and retained-state inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMetadata {
+    /// Process identifier recorded when the session was created.
+    pub daemon_pid: u32,
+    /// Current durable session lifecycle state.
+    pub state: String,
+    /// Root digest mounted by the session.
+    pub root_digest: Digest,
+    /// Canonical mountpoint owned by the session.
+    pub mountpoint: PathBuf,
+}
+
+/// Result of inspecting session state when no live daemon can be reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainedSession {
+    /// No active or retained session directory exists.
+    None,
+    /// A valid, cleanly closed session remains available for inspection.
+    Closed(SessionMetadata),
+    /// Session state exists but cannot be trusted or safely reused.
+    Stale(String),
 }
 
 /// An exclusively held stable ownership lock.
@@ -280,6 +308,11 @@ impl SessionStore {
         &self.paths
     }
 
+    /// Returns metadata for the active session owned by this store.
+    pub fn metadata(&self) -> Result<SessionMetadata, StateError> {
+        read_session_metadata(&self.connection, &self.paths.database())
+    }
+
     /// Marks the session closed transactionally before releasing ownership.
     pub fn close_cleanly(self) -> Result<(), StateError> {
         append_log(&self.paths.log(), "session closing cleanly\n")?;
@@ -290,6 +323,50 @@ impl SessionStore {
         ).map_err(|source| db_error(&self.paths.database(), source))?;
         Ok(())
     }
+}
+
+/// Inspects retained state without modifying or replacing it.
+pub fn inspect_retained_session(paths: &StatePaths) -> RetainedSession {
+    if !paths.active().exists() {
+        return RetainedSession::None;
+    }
+    if let Err(error) = validate_closed_session(paths) {
+        return RetainedSession::Stale(error.to_string());
+    }
+    let connection =
+        match Connection::open_with_flags(paths.database(), OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(connection) => connection,
+            Err(error) => return RetainedSession::Stale(error.to_string()),
+        };
+    match read_session_metadata(&connection, &paths.database()) {
+        Ok(metadata) => RetainedSession::Closed(metadata),
+        Err(error) => RetainedSession::Stale(error.to_string()),
+    }
+}
+
+fn read_session_metadata(
+    connection: &Connection,
+    path: &Path,
+) -> Result<SessionMetadata, StateError> {
+    let (pid, state, hash, size, mountpoint): (i64, String, String, i64, String) = connection
+        .query_row(
+            "SELECT daemon_pid, state, root_digest_hash, root_digest_size, mountpoint FROM session_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .map_err(|source| db_error(path, source))?;
+    let daemon_pid =
+        u32::try_from(pid).map_err(|_| stale_path(path, "invalid daemon pid".into()))?;
+    let digest_text = format!("sha256:{hash}/{size}");
+    let root_digest = digest_text
+        .parse()
+        .map_err(|error| stale_path(path, format!("invalid root digest: {error}")))?;
+    Ok(SessionMetadata {
+        daemon_pid,
+        state,
+        root_digest,
+        mountpoint: PathBuf::from(mountpoint),
+    })
 }
 
 pub fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, StateError> {

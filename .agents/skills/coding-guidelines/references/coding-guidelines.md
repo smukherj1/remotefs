@@ -33,7 +33,7 @@ Write the simplest code that correctly handles the problem. Make control flow, o
 
 ## Errors
 
-- Add context at propagation boundaries when it identifies the operation or affected value.
+- Always add context on what was happening when propagating an error. Almost never use raw '?' to proagate errors.
 - Include stable identifiers such as paths, digests, operation names, instance names, resource names, entry names, environment variables, and proto paths.
 - Use lazy context when constructing the message requires formatting or allocation.
 - Use `anyhow::Context` only in functions returning `anyhow::Result`. Use RemoteFS context helpers for typed errors such as `TreeError`, `CasError`, `UploadError`, `DigestError`, and `ConfigError`.
@@ -42,6 +42,7 @@ Write the simplest code that correctly handles the problem. Make control flow, o
 
 ## Comments
 
+- All public methods, structs, fields, proto methods, requests must have comments as documentation.
 - Explain invariants, non-obvious decisions, protocol constraints, edge cases, and tradeoffs.
 - Do not narrate code that is clear from names and control flow. Improve the code instead.
 - Document private items when their contract or behavior is not evident from the implementation.

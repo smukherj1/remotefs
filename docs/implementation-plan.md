@@ -430,7 +430,7 @@ Definition of done:
 
 - Foreground `rfsd` can initialize and retain a session, log to `active/rfsd.log`, close it inspectably, and automatically replace only valid closed state on its next start.
 
-### Step 4.2: Control Socket Protocol
+### Step 4.2: Control Socket Protocol (Complete)
 
 Deliverables:
 

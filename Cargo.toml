@@ -6,8 +6,9 @@ edition = "2024"
 [dependencies]
 # Async runtime and gRPC
 tokio = { version = "1.38", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.11"
+tower = "0.4"
 prost = "0.12"
 prost-types = "0.12"
 bytes = "1.6"

@@ -1,5 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn test_rfs_help() {
@@ -84,6 +86,35 @@ fn test_rfs_cleanup_resets_rfs_home() {
         .arg("cleanup")
         .assert()
         .success();
+}
+
+#[test]
+fn test_rfs_status_reports_clean_no_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("rfs").unwrap();
+    cmd.env("RFS_HOME", temp.path().join("home"))
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no RemoteFS session"));
+}
+
+#[test]
+fn test_rfs_status_reports_stale_retained_state_with_cleanup_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    fs::create_dir(&home).unwrap();
+    fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(home.join("active")).unwrap();
+    fs::set_permissions(home.join("active"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut cmd = Command::cargo_bin("rfs").unwrap();
+    cmd.env("RFS_HOME", &home)
+        .arg("status")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stale_session"))
+        .stderr(predicate::str::contains("rfs cleanup"));
 }
 
 #[test]

@@ -1,5 +1,7 @@
+use anyhow::{Context, Result};
 use clap::Parser;
 use remotefs::config::Config;
+use remotefs::control;
 use remotefs::digest::Digest;
 use remotefs::state::{SessionStartup, SessionStore, StatePaths};
 use std::path::PathBuf;
@@ -46,16 +48,29 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
     if let Err(error) = run(cli).await {
-        eprintln!("{error}");
+        eprintln!("{error:#}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let digest: Digest = cli.root_digest.parse()?;
-    let paths = StatePaths::from_config(&Config::new()?)?;
-    let store = SessionStore::create(paths, SessionStartup::new(digest, cli.mountpoint))?;
-    tokio::signal::ctrl_c().await?;
-    store.close_cleanly()?;
+async fn run(cli: Cli) -> Result<()> {
+    let digest: Digest = cli
+        .root_digest
+        .parse()
+        .with_context(|| format!("parse daemon root digest {}", cli.root_digest))?;
+    let config = Config::new().context("load daemon state configuration")?;
+    let paths = StatePaths::from_config(&config)
+        .with_context(|| format!("validate daemon state home {}", config.rfs_home.display()))?;
+    let store = SessionStore::create(paths, SessionStartup::new(digest, cli.mountpoint.clone()))
+        .with_context(|| format!("create daemon session for {}", cli.mountpoint.display()))?;
+    let metadata = store
+        .metadata()
+        .context("read active daemon session metadata")?;
+    control::serve(store.paths().clone(), metadata)
+        .await
+        .context("serve active daemon control socket")?;
+    store
+        .close_cleanly()
+        .context("close daemon session after control server shutdown")?;
     Ok(())
 }
