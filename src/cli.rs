@@ -48,12 +48,6 @@ pub struct Cli {
     )]
     output_format: OutputFormat,
 
-    #[arg(long, global = true, help = "Path to custom cache directory")]
-    cache_dir: Option<PathBuf>,
-
-    #[arg(long, global = true, help = "Path to custom active session directory")]
-    session_dir: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -154,8 +148,6 @@ pub enum CliError {
     InvalidDigest { value: String, source: DigestError },
     #[error("mountpoint `{supplied}` does not match active session mountpoint `{active}`")]
     MountpointMismatch { supplied: PathBuf, active: PathBuf },
-    #[error("cleanup refused because active session lock `{lock_path}` belongs to live pid {pid}")]
-    ActiveSessionLock { lock_path: PathBuf, pid: u32 },
     #[error("{command} is not implemented yet")]
     NotImplemented { command: &'static str },
     #[error("{message}")]
@@ -172,7 +164,6 @@ impl CliError {
             Self::InvalidConfig { .. } => "invalid_config",
             Self::InvalidDigest { .. } => "invalid_digest",
             Self::MountpointMismatch { .. } => "mountpoint_mismatch",
-            Self::ActiveSessionLock { .. } => "active_session_lock",
             Self::NotImplemented { .. } => "not_implemented",
             Self::CommandFailed { category, .. } => category,
         }
@@ -181,13 +172,11 @@ impl CliError {
 
 /// Applies CLI flag precedence over environment variables and validates CAS config.
 ///
-/// `--cache-dir` and `--session-dir` override `RFS_CACHE_DIR` and
-/// `RFS_SESSION_DIR`. `--cas-url` and `--instance-name` override
+/// `--cas-url` and `--instance-name` override
 /// `RFS_CAS_URL` and `RFS_INSTANCE_NAME`. Missing or invalid CAS fields are
 /// returned as `CliError::InvalidConfig`.
 fn resolve_cli_config(cli: &Cli) -> Result<CliConfig, CliError> {
-    let state = Config::from_overrides(cli.cache_dir.clone(), cli.session_dir.clone())
-        .map_err(config_error)?;
+    let state = Config::new().map_err(config_error)?;
     let cas_url = cli
         .cas_url
         .clone()
@@ -254,10 +243,9 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             Err(CliError::NotImplemented { command: "status" })
         }
         Commands::Cleanup => {
-            let state = Config::from_overrides(cli.cache_dir.clone(), cli.session_dir.clone())
-                .map_err(config_error)?;
-            refuse_live_cleanup(&state.rfs_session_dir)?;
-            Err(CliError::NotImplemented { command: "cleanup" })
+            let config = Config::new().map_err(config_error)?;
+            let paths = crate::state::StatePaths::from_config(&config).map_err(state_error)?;
+            paths.cleanup().map_err(state_error)
         }
     }
 }
@@ -439,26 +427,20 @@ fn validate_cas_url(cas_url: &str) -> Result<(), CliError> {
     })
 }
 
-fn refuse_live_cleanup(session_dir: &Path) -> Result<(), CliError> {
-    let lock_path = session_dir.join("session.lock");
-    let Ok(contents) = fs::read_to_string(&lock_path) else {
-        return Ok(());
-    };
-    let Ok(pid) = contents.trim().parse::<u32>() else {
-        return Ok(());
-    };
-    if is_live_pid(pid) {
-        return Err(CliError::ActiveSessionLock { lock_path, pid });
-    }
-    Ok(())
-}
-
-fn is_live_pid(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
-}
-
 fn config_error(error: ConfigError) -> CliError {
     CliError::InvalidConfig {
+        message: error.to_string(),
+    }
+}
+
+fn state_error(error: crate::state::StateError) -> CliError {
+    CliError::CommandFailed {
+        category: match error {
+            crate::state::StateError::ActiveSession { .. } => "active_session",
+            crate::state::StateError::StaleSession { .. } => "stale_session",
+            crate::state::StateError::UnsafePath { .. } => "unsafe_state",
+            _ => "state",
+        },
         message: error.to_string(),
     }
 }
@@ -500,22 +482,17 @@ mod tests {
     }
 
     #[test]
-    fn cli_flags_override_environment_config() {
+    fn cas_flags_override_environment_config() {
         let _guard = crate::test_env::lock();
         clear_env();
         unsafe {
             env::set_var("HOME", "/home/testuser");
-            env::set_var("RFS_CACHE_DIR", "/env/cache");
-            env::set_var("RFS_SESSION_DIR", "/env/session");
+            env::set_var("RFS_HOME", "/state/home");
             env::set_var("RFS_CAS_URL", "grpc://env.example:9092");
             env::set_var("RFS_INSTANCE_NAME", "env/instance");
         }
         let cli = Cli::try_parse_from([
             "rfs",
-            "--cache-dir",
-            "/flag/cache",
-            "--session-dir",
-            "/flag/session",
             "--cas-url",
             "grpc://flag.example:9092",
             "--instance-name",
@@ -526,10 +503,15 @@ mod tests {
         .unwrap();
 
         let config = resolve_cli_config(&cli).unwrap();
-        assert_eq!(config.state.rfs_cache_dir, PathBuf::from("/flag/cache"));
-        assert_eq!(config.state.rfs_session_dir, PathBuf::from("/flag/session"));
+        assert_eq!(config.state.rfs_home, PathBuf::from("/state/home"));
         assert_eq!(config.cas_url, "grpc://flag.example:9092");
         assert_eq!(config.instance_name, "flag/instance");
+    }
+
+    #[test]
+    fn removed_state_path_flags_are_rejected() {
+        assert!(Cli::try_parse_from(["rfs", "--cache-dir", "/tmp/cache", "cleanup"]).is_err());
+        assert!(Cli::try_parse_from(["rfs", "--session-dir", "/tmp/active", "cleanup"]).is_err());
     }
 
     #[test]

@@ -1,6 +1,5 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
-use std::fs;
 
 #[test]
 fn test_rfs_help() {
@@ -78,20 +77,20 @@ fn test_rfs_invalid_log_level_exits_one() {
 }
 
 #[test]
-fn test_rfs_cleanup_refuses_live_session_lock() {
+fn test_rfs_cleanup_resets_rfs_home() {
     let temp = tempfile::tempdir().unwrap();
-    let session_dir = temp.path().join("active");
-    fs::create_dir_all(&session_dir).unwrap();
-    fs::write(
-        session_dir.join("session.lock"),
-        std::process::id().to_string(),
-    )
-    .unwrap();
-
     let mut cmd = Command::cargo_bin("rfs").unwrap();
-    cmd.args(["--session-dir", session_dir.to_str().unwrap(), "cleanup"])
+    cmd.env("RFS_HOME", temp.path().join("home"))
+        .arg("cleanup")
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_removed_state_path_flags_are_rejected() {
+    let mut cmd = Command::cargo_bin("rfs").unwrap();
+    cmd.args(["--session-dir", "/tmp/active", "cleanup"])
         .assert()
         .failure()
-        .code(1)
-        .stderr(predicate::str::contains("cleanup refused"));
+        .stderr(predicate::str::contains("unexpected argument"));
 }

@@ -1,4 +1,7 @@
 use clap::Parser;
+use remotefs::config::Config;
+use remotefs::digest::Digest;
+use remotefs::state::{SessionStartup, SessionStore, StatePaths};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -37,15 +40,22 @@ struct Cli {
         help = "Output format for daemon logs (text, json)"
     )]
     output_format: String,
-
-    #[arg(long, help = "Path to custom cache directory")]
-    cache_dir: Option<PathBuf>,
-
-    #[arg(long, help = "Path to custom active session directory")]
-    session_dir: Option<PathBuf>,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
-    println!("Starting RemoteFS Daemon with config: {:?}", cli);
+    if let Err(error) = run(cli).await {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let digest: Digest = cli.root_digest.parse()?;
+    let paths = StatePaths::from_config(&Config::new()?)?;
+    let store = SessionStore::create(paths, SessionStartup::new(digest, cli.mountpoint))?;
+    tokio::signal::ctrl_c().await?;
+    store.close_cleanly()?;
+    Ok(())
 }

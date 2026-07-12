@@ -75,6 +75,11 @@ tasks:
     cmds:
       - cargo test --test upload_integration
 
+  test:integration:state:
+    desc: Verify local state and foreground daemon lifecycle behavior
+    cmds:
+      - cargo test --test state_integration
+
   fixture:upload:
     desc: Upload the checked-in tree fixture to the local bazel-remote CAS
     cmds:
