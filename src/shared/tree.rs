@@ -6,9 +6,9 @@ use prost::Message;
 use prost_types::Timestamp;
 use thiserror::Error;
 
-use crate::digest::{Digest, DigestError};
-use crate::error_context::ResultContext as _;
-use crate::reapi::remote_execution::{
+use crate::shared::digest::{Digest, DigestError};
+use crate::shared::error_context::ResultContext as _;
+use crate::shared::reapi::remote_execution::{
     Directory, DirectoryNode, FileNode, NodeProperties, SymlinkNode,
 };
 
@@ -238,7 +238,7 @@ pub enum TreeError {
     },
 }
 
-impl crate::error_context::ResultContextError for TreeError {
+impl crate::shared::error_context::ResultContextError for TreeError {
     fn with_context(self, operation: String) -> Self {
         TreeError::Context {
             operation,
@@ -626,7 +626,7 @@ fn validate_node_properties(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reapi::remote_execution;
+    use crate::shared::reapi::remote_execution;
 
     fn digest() -> Digest {
         Digest::for_bytes(b"content")

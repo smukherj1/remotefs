@@ -7,10 +7,10 @@ use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use remotefs::cas::{Blob, CasClient, CasConfig};
-use remotefs::digest::Digest;
-use remotefs::tree::decode_directory;
-use remotefs::upload::{UploadOptions, upload_local_directory};
+use remotefs::shared::cas::{Blob, CasClient, CasConfig};
+use remotefs::shared::digest::Digest;
+use remotefs::shared::tree::decode_directory;
+use remotefs::shared::upload::{UploadOptions, upload_local_directory};
 use tempfile::tempdir;
 
 const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";

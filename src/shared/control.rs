@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::error_context::{ResultContext, ResultContextError};
+use crate::shared::error_context::{ResultContext, ResultContextError};
 use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, oneshot};
@@ -13,7 +13,7 @@ use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Code, Request, Response, Status};
 use tower::service_fn;
 
-use crate::state::{SessionMetadata, StatePaths};
+use crate::shared::state::{SessionMetadata, StatePaths};
 
 /// Version of the CLI-to-daemon control protocol implemented by this crate.
 pub const PROTOCOL_VERSION: u32 = 1;

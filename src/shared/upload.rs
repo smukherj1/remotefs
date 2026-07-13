@@ -11,10 +11,10 @@ use sha2::{Digest as ShaDigest, Sha256};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
-use crate::cas::{Blob, BlobStore, CasError};
-use crate::digest::Digest;
-use crate::error_context::ResultContext as _;
-use crate::tree::{
+use crate::shared::cas::{Blob, BlobStore, CasError};
+use crate::shared::digest::Digest;
+use crate::shared::error_context::ResultContext as _;
+use crate::shared::tree::{
     DirectoryBuilder, DirectoryEntry, EncodedDirectory, EncodedDirectoryTree, FileEntry, NodeKind,
     NodeMetadata, SymlinkEntry, TreeError, TreeWarnings,
 };
@@ -203,7 +203,7 @@ pub enum UploadError {
     },
 }
 
-impl crate::error_context::ResultContextError for UploadError {
+impl crate::shared::error_context::ResultContextError for UploadError {
     fn with_context(self, operation: String) -> Self {
         UploadError::Context {
             operation,
@@ -779,7 +779,7 @@ fn upload_tree_error(error: UploadError) -> TreeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cas::UploadStats;
+    use crate::shared::cas::UploadStats;
     use async_trait::async_trait;
     use bytes::Bytes;
     use std::collections::HashSet;

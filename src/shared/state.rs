@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::config::Config;
-use crate::digest::Digest;
+use crate::shared::config::Config;
+use crate::shared::digest::Digest;
 
 const SCHEMA_VERSION: i64 = 1;
 const LOCK_RECORD_VERSION: u32 = 1;

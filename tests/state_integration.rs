@@ -1,8 +1,8 @@
 use std::fs;
 
-use remotefs::config::Config;
-use remotefs::digest::Digest;
-use remotefs::state::{SessionStartup, SessionStore, StatePaths};
+use remotefs::shared::config::Config;
+use remotefs::shared::digest::Digest;
+use remotefs::shared::state::{SessionStartup, SessionStore, StatePaths};
 
 fn state_paths(temp: &tempfile::TempDir) -> StatePaths {
     StatePaths::from_config(&Config {

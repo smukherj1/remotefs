@@ -13,12 +13,12 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Request, Status};
 use uuid::Uuid;
 
-use crate::digest::{Digest, DigestError};
-use crate::error_context::ResultContext as _;
-use crate::reapi::bytestream::{
+use crate::shared::digest::{Digest, DigestError};
+use crate::shared::error_context::ResultContext as _;
+use crate::shared::reapi::bytestream::{
     ReadRequest, WriteRequest, WriteResponse, byte_stream_client::ByteStreamClient,
 };
-use crate::reapi::remote_execution::{
+use crate::shared::reapi::remote_execution::{
     BatchReadBlobsRequest, BatchUpdateBlobsRequest, FindMissingBlobsRequest,
     batch_update_blobs_request, compressor,
     content_addressable_storage_client::ContentAddressableStorageClient,
@@ -233,7 +233,7 @@ pub enum CasError {
     },
 }
 
-impl crate::error_context::ResultContextError for CasError {
+impl crate::shared::error_context::ResultContextError for CasError {
     fn with_context(self, operation: String) -> Self {
         CasError::Context {
             operation,

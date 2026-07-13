@@ -52,7 +52,7 @@ pub use google::bytestream;
 #[cfg(test)]
 mod tests {
     use super::remote_execution::{Directory, DirectoryNode, FileNode, NodeProperties};
-    use crate::{digest::Digest, reapi::remote_execution::NodeProperty};
+    use crate::shared::{digest::Digest, reapi::remote_execution::NodeProperty};
     use prost::Message;
     use prost_types::Timestamp;
 

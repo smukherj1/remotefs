@@ -18,6 +18,7 @@ The intended implementation order is:
 
 - Use `task` as the only documented workflow runner. Do not add `Makefile` targets.
 - Keep all behavior that can be tested without FUSE in ordinary Rust modules.
+- Preserve the source ownership boundary: `cli` and `daemon` may depend on `shared`, but must not depend on each other. Put code in `shared` only when both binaries consume it or the plan identifies a concrete consumer on each side.
 - Treat local integration and end-to-end tests as mandatory for the full test workflow. FUSE tests should fail with a clear prerequisite error when `/dev/fuse` or required mount permissions are unavailable.
 - Prefer small PR-sized slices where each slice has a runnable `task test:*` target.
 - Use `bazel-remote` as the default integration CAS target, with Buildbarn compatibility deferred until the main REAPI path is stable.
@@ -43,10 +44,14 @@ The intended implementation order is:
 Deliverables:
 
 - Restructure from two standalone binaries into a workspace-friendly layout:
-  - `src/bin/rfs.rs` remains the CLI entrypoint.
-  - `src/bin/rfsd.rs` remains the daemon entrypoint.
-  - `src/lib.rs` exposes shared modules.
-  - Initial modules: `config`, `digest`, `reapi`, `cas`, `tree`, `upload`, `state`, `control`, `fs`.
+  - `src/bin/rfs.rs` and `src/bin/rfsd.rs` remain thin process entrypoints.
+  - `src/cli/` contains `rfs`-only behavior.
+  - `src/daemon/` contains `rfsd`-only behavior, including the filesystem core and FUSE adapter.
+  - `src/shared/` contains cross-binary modules with concrete CLI and daemon consumers, including consumers assigned by later plan steps.
+  - `src/lib.rs` exposes the three ownership groups.
+  - Initial shared modules: `config`, `digest`, `reapi`, `cas`, `tree`, `upload`, `state`, and `control`.
+  - Initial daemon module: `fs`.
+  - Enforce the dependency direction `cli -> shared` and `daemon -> shared`; `cli` and `daemon` do not depend on each other.
 - Add dependency groups for:
   - Async runtime and gRPC: `tokio`, `tonic`, `prost`, `bytes`.
   - CLI/config/logging: `clap`, `serde`, `serde_json`, `toml`, `tracing`, `tracing-subscriber`.
@@ -228,7 +233,7 @@ Definition of done:
 
 - CAS calls are hidden behind a small trait so core filesystem tests can use an in-memory fake CAS.
 - CAS configuration requires a non-empty REAPI `instance_name` and sends it consistently on CAS and ByteStream calls.
-- Review comments in `src/cas.rs` are resolved and removed, either by implementing the requested change or by replacing the comment with a durable explanation of the chosen design.
+- Review comments in `src/shared/cas.rs` are resolved and removed, either by implementing the requested change or by replacing the comment with a durable explanation of the chosen design.
 
 ### Step 2.2: Canonical Tree Encoding (Complete)
 
@@ -262,7 +267,7 @@ Deliverables:
 - Reject or warn on unsupported file types according to CLI mode.
 - Preserve symlinks exactly, including absolute and escaping targets; emit warning counts for risky targets.
 - Decode raw directory bytes into validated REAPI `Directory` proto objects. Do not add a separate decoded internal representation or builder reconstruction API until a production caller needs it.
-- Add only the minimal local walker and generic uploader glue needed to integration-test a real fixture against CAS. The generic uploader lives in `src/upload.rs`, accepts file blobs and encoded directory nodes, performs `FindMissingBlobs`, uploads missing objects through `BlobStore`, and reports basic counters.
+- Add only the minimal local walker and generic uploader glue needed to integration-test a real fixture against CAS. The generic uploader lives in `src/shared/upload.rs`, accepts file blobs and encoded directory nodes, performs `FindMissingBlobs`, uploads missing objects through `BlobStore`, and reports basic counters.
 - Keep production upload scheduling, worker pools, backpressure, and CLI summaries for Step 3.2.
 
 Task targets:

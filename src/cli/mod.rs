@@ -6,14 +6,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use thiserror::Error;
 
-use crate::cas::{CasClient, CasConfig};
-use crate::config::{Config, ConfigError};
-use crate::control::{self, PROTOCOL_VERSION};
-use crate::digest::{Digest, DigestError};
-use crate::state::{
+use crate::shared::cas::{CasClient, CasConfig};
+use crate::shared::config::{Config, ConfigError};
+use crate::shared::control::{self, PROTOCOL_VERSION};
+use crate::shared::digest::{Digest, DigestError};
+use crate::shared::state::{
     RetainedSession, StatePaths, canonicalize_mountpoint, inspect_retained_session,
 };
-use crate::upload::{UploadOptions, UploadSummary, upload_local_directory};
+use crate::shared::upload::{UploadOptions, UploadSummary, upload_local_directory};
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -250,18 +250,21 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Commands::Cleanup => {
             let config = Config::new().map_err(config_error)?;
-            let paths = crate::state::StatePaths::from_config(&config).map_err(state_error)?;
+            let paths =
+                crate::shared::state::StatePaths::from_config(&config).map_err(state_error)?;
             paths.cleanup().map_err(state_error)
         }
     }
 }
 
-async fn query_daemon(paths: &StatePaths) -> Result<crate::control::v1::StatusResponse, CliError> {
+async fn query_daemon(
+    paths: &StatePaths,
+) -> Result<crate::shared::control::v1::StatusResponse, CliError> {
     let mut client = control::connect(&paths.control_socket())
         .await
         .map_err(control_error)?;
     client
-        .status(crate::control::v1::StatusRequest {
+        .status(crate::shared::control::v1::StatusRequest {
             protocol_version: PROTOCOL_VERSION,
         })
         .await
@@ -344,7 +347,7 @@ async fn run_unmount(paths: &StatePaths, supplied: Option<&Path>) -> Result<(), 
         .await
         .map_err(control_error)?;
     client
-        .unmount(crate::control::v1::UnmountRequest {
+        .unmount(crate::shared::control::v1::UnmountRequest {
             protocol_version: PROTOCOL_VERSION,
         })
         .await
@@ -387,7 +390,7 @@ struct JsonEnvelope<'a> {
     schema_version: u32,
     command: &'static str,
     ok: bool,
-    warnings: &'a crate::upload::UploadWarnings,
+    warnings: &'a crate::shared::upload::UploadWarnings,
     error: Option<JsonError>,
     data: Option<UploadData<'a>>,
 }
@@ -559,12 +562,12 @@ fn config_error(error: ConfigError) -> CliError {
     }
 }
 
-fn state_error(error: crate::state::StateError) -> CliError {
+fn state_error(error: crate::shared::state::StateError) -> CliError {
     CliError::CommandFailed {
         category: match error {
-            crate::state::StateError::ActiveSession { .. } => "active_session",
-            crate::state::StateError::StaleSession { .. } => "stale_session",
-            crate::state::StateError::UnsafePath { .. } => "unsafe_state",
+            crate::shared::state::StateError::ActiveSession { .. } => "active_session",
+            crate::shared::state::StateError::StaleSession { .. } => "stale_session",
+            crate::shared::state::StateError::UnsafePath { .. } => "unsafe_state",
             _ => "state",
         },
         message: error.to_string(),

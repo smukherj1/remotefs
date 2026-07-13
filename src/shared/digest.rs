@@ -3,7 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 
-use crate::reapi::remote_execution;
+use crate::shared::reapi::remote_execution;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {

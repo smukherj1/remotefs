@@ -1,14 +1,8 @@
-pub mod cas;
+//! RemoteFS library code grouped by binary ownership.
+
 pub mod cli;
-pub mod config;
-pub mod control;
-pub mod digest;
-pub mod error_context;
-pub mod fs;
-pub mod reapi;
-pub mod state;
-pub mod tree;
-pub mod upload;
+pub mod daemon;
+pub mod shared;
 
 #[cfg(test)]
 pub(crate) mod test_env {

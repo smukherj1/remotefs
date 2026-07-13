@@ -116,7 +116,45 @@ When implemented, `rfsd` will own:
 
 When implemented, `rfs mount` will start `rfsd` in the background by default and return only after the root directory is validated, the FUSE mount is active, and the control socket is reachable. Direct `rfsd` invocation will run in the foreground unless supervised externally.
 
-Current CLI behavior is deliberately narrower: `upload` is functional; `mount`, `snapshot`, `unmount`, `status`, and `cleanup` parse their stable arguments but return a clear not-implemented diagnostic (except that `cleanup` first refuses a possible live owner). `mount` validates its root digest before returning that diagnostic. `rfsd` currently only parses and prints its configuration; it does not create a session or mount FUSE.
+Current CLI behavior is deliberately narrower than the target surface: `upload`, `status`, `unmount`, and `cleanup` are functional through the daemon-foundation scope. `mount` validates its root digest before returning a clear not-implemented diagnostic, and `snapshot` remains unimplemented. Foreground `rfsd` creates and retains session state and serves the control socket, but it does not mount FUSE yet.
+
+## Rust Source Layout
+
+RemoteFS remains one Cargo package with one library crate and two thin binary entrypoints. Library modules are grouped by binary ownership:
+
+```text
+src/
+  lib.rs
+  bin/
+    rfs.rs
+    rfsd.rs
+  cli/
+    mod.rs
+  daemon/
+    mod.rs
+    fs.rs
+  shared/
+    mod.rs
+    cas.rs
+    config.rs
+    control.rs
+    digest.rs
+    error_context.rs
+    reapi.rs
+    state.rs
+    tree.rs
+    upload.rs
+```
+
+The top-level directories communicate ownership:
+
+- `cli/` contains behavior owned exclusively by the `rfs` CLI.
+- `daemon/` contains behavior owned exclusively by `rfsd`, including the filesystem core, FUSE adapter, overlay, and daemon snapshot orchestration as those are implemented.
+- `shared/` contains cross-binary domain and infrastructure modules. Code belongs here only when both sides consume it or the implementation plan identifies a concrete consumer on each side; testability or speculative reuse alone does not make a module shared.
+
+Both binaries may depend on `shared`. `cli` and `daemon` must not depend on each other. The files under `src/bin/` contain only process entrypoint concerns such as argument parsing, runtime startup, error rendering, and exit status; substantive behavior lives in the corresponding library module.
+
+This single-package layout keeps module ownership visible without introducing multiple Cargo manifests or cross-crate API overhead. Separate workspace packages may be considered later if an independently consumed library, materially different dependency sets or platform targets, compile-time isolation, or stronger compiler-enforced boundaries justify the added complexity.
 
 The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires `RFS_HOME/active.lock` before starting `rfsd`; if another process holds that advisory lock, the mount fails and reports its diagnostic lock metadata when readable. The lock is outside `RFS_HOME/active/` so cleanup or replacement never removes the inode that coordinates ownership. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts require distinct `RFS_HOME` values.
 
