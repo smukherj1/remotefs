@@ -18,7 +18,10 @@ The intended implementation order is:
 
 - Use `task` as the only documented workflow runner. Do not add `Makefile` targets.
 - Keep all behavior that can be tested without FUSE in ordinary Rust modules.
-- Preserve the source ownership boundary: `cli` and `daemon` may depend on `shared`, but must not depend on each other. Put code in `shared` only when both binaries consume it or the plan identifies a concrete consumer on each side.
+- Enforce coarse ownership with exactly three workspace packages: `rfs` and
+  `rfsd` each depend only on `rfs-common`, never on each other. Enforce the
+  client, bootstrap-upload, control-service, state-capability, and persistence
+  boundaries with modules and private types inside those packages.
 - Treat local integration and end-to-end tests as mandatory for the full test workflow. FUSE tests should fail with a clear prerequisite error when `/dev/fuse` or required mount permissions are unavailable.
 - Prefer small PR-sized slices where each slice has a runnable `task test:*` target.
 - Use `bazel-remote` as the default integration CAS target, with Buildbarn compatibility deferred until the main REAPI path is stable.
@@ -35,11 +38,13 @@ The intended implementation order is:
 - SQLite state uses `rusqlite` in daemon-owned blocking sections.
 - Generated Rust proto code is produced during build from checked-in pinned proto sources under `third_party/remote-apis/`.
 - Process exit codes are simple: `0` for success and `1` for any error.
-- Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence. `rfs cleanup` remains an explicit full local reset that also removes the cache; it is not an eviction policy.
+- Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence. Unrecoverable state is left untouched with guidance to delete `RFS_HOME` manually; there is no cleanup command in the MVP.
 
 ## Phase 0: Boilerplate and Workflow
 
 ### Step 0.1: Crate Layout (Complete)
+
+Superseded after step 4.2 by step 4.3. This section records the original single-package implementation and is not the current dependency design.
 
 Deliverables:
 
@@ -160,6 +165,10 @@ Definition of done:
 
 ### Step 2.1: Digest and CAS Client (Complete)
 
+The historical `src/shared/cas.rs` path in this completed step moved to
+`crates/rfs-common/src/cas.rs` in step 4.3; the behavior and acceptance criteria
+remain current.
+
 Status: implemented, with review cleanup required before building later filesystem code on this surface.
 
 Deliverables:
@@ -237,6 +246,10 @@ Definition of done:
 
 ### Step 2.2: Canonical Tree Encoding (Complete)
 
+The historical `src/shared/upload.rs` path in this completed step moved to
+`crates/rfs-common/src/upload.rs` in step 4.3; the behavior and acceptance
+criteria remain current.
+
 Deliverables:
 
 - Implement the constrained REAPI `Directory` encoder/decoder.
@@ -300,6 +313,8 @@ Definition of done:
 ## Phase 3: Bootstrap CLI
 
 ### Step 3.1: CLI Skeleton and Config (Complete)
+
+The original cleanup command in this historical step is superseded by step 4.3.
 
 Deliverables:
 
@@ -388,6 +403,10 @@ Definition of done:
 
 ### Step 4.1: Local State and SQLite Session Store (Complete)
 
+The original public store, cleanup command, and stale-state recovery contract in
+this historical step are superseded by the capability API and conservative
+manual-deletion policy in step 4.3.
+
 Deliverables:
 
 - Implement `$RFS_HOME` layout:
@@ -437,6 +456,9 @@ Definition of done:
 
 ### Step 4.2: Control Socket Protocol (Complete)
 
+The original combined control client/service module in this historical step is
+superseded by the client and daemon-service split in step 4.3.
+
 Deliverables:
 
 - Add one active-session Unix control socket under `RFS_HOME/active/`.
@@ -472,6 +494,54 @@ Tests:
 Definition of done:
 
 - Typed CLI-to-daemon communication is testable before a real FUSE mount exists.
+
+### Step 4.3: Architecture Boundary Correction (Complete)
+
+Deliverables:
+
+- Convert the repository to a Cargo workspace with exactly three packages:
+  `rfs`, `rfsd`, and `rfs-common`.
+- Make both binary packages depend only on `rfs-common` and never on each other;
+  enforce the workspace graph with Cargo metadata.
+- Keep the command-oriented daemon client and bootstrap upload workflow as
+  internal `rfs` modules. Keep the control service and filesystem as internal
+  `rfsd` modules.
+- Provide a narrow bootstrap uploader whose operation accepts a path and returns
+  only a digest or structured bootstrap error.
+- Expose `SessionStateReader` and `DaemonState` trait objects from the
+  `rfs-common::state` module.
+  Keep SQLite connections, SQL, migrations, and concrete stores private. Open
+  readers read-only without file creation, migration, lock acquisition, or state
+  mutation.
+- Move the daemon service and teardown coordination into the `rfsd` package. Expose
+  a concrete command-oriented client whose API contains no generated messages,
+  tonic clients, or daemon types.
+- Make unmount completion-based by closing durable daemon state before returning
+  success.
+- Remove `rfs cleanup`. Replace unsafe/corrupt-state repair with conservative
+  manual deletion guidance while leaving questionable state untouched.
+- Initialize shared tracing-based CLI stderr and daemon session-file logging with
+  error, warn, info, and debug levels and text/JSON Lines formats. Keep command
+  output separate and log operation summaries rather than per-entry activity.
+
+Tests:
+
+- Cargo metadata test for the exact three-package workspace and its two permitted
+  internal dependency edges.
+- Read-only state tests for no creation, unchanged database content, and no daemon
+  lock ownership.
+- State lifecycle tests for closed-session replacement and preserved stale state.
+- Daemon integration tests for status, exclusive ownership, completion-based
+  unmount, retained closed status, and lifecycle log events.
+- Existing unit and CLI suites plus CAS/upload integration workflows.
+
+Definition of done:
+
+- Formatting, linting, workspace unit, CLI, state integration, daemon integration,
+  upload integration, and full test workflows pass (external CAS workflows require
+  the documented local CAS prerequisite).
+- Workspace manifests and public APIs enforce the dependency and capability
+  boundaries described in `technical-design.md`.
 
 ## Phase 5: Read-Only Lazy Filesystem
 
@@ -790,7 +860,7 @@ Deliverables:
 - Use compact human-readable text output and logs by default and JSON summaries plus JSON Lines logs when `--output-format json` is selected.
 - Apply `--log-level` and `--output-format` to both `rfs` and any spawned `rfsd`.
 - Store effective daemon log level and format in SQLite session metadata for `rfs status`.
-- Preserve the session log file with `RFS_HOME/active` until the next mount replaces a clean session or `rfs cleanup` resets the home; no log rotation in the MVP.
+- Preserve the session log file with `RFS_HOME/active` until the next mount replaces a clean session or the user manually removes `RFS_HOME`; no log rotation in the MVP.
 - Include timestamp, level, target/module, session id, operation, path/digest where relevant, and message in daemon log events.
 
 Task targets:
@@ -825,7 +895,7 @@ Deliverables:
 - Normalize errors across CLI, daemon, CAS, and FUSE paths.
 - Include path, digest, operation, and remote context where available.
 - Ensure no empty, partial, or unverified content is served after fetch failures.
-- Document that automatic cache eviction and selective cache pruning are deferred; `rfs cleanup` is a full reset and removes the entire cache along with session state.
+- Document that automatic cache eviction and selective cache pruning are deferred; users may manually remove `RFS_HOME` only when no daemon owns it.
 
 Task targets:
 

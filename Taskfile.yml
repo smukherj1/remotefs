@@ -15,22 +15,22 @@ tasks:
   lint:
     desc: Lint the codebase
     cmds:
-      - cargo clippy --all-targets -- -D warnings
+      - cargo clippy --workspace --all-targets -- -D warnings
 
   build:
     desc: Build both rfs and rfsd binaries
     cmds:
-      - cargo build
+      - cargo build --workspace
 
   test:
     desc: Run all tests (unit and integration)
     cmds:
-      - cargo test
+      - cargo test --workspace
 
   test:unit:
     desc: Run only unit tests
     cmds:
-      - cargo test --lib
+      - cargo test --workspace --lib
 
   proto:check:
     desc: Check that pinned REAPI, ByteStream, and RemoteFS control protos generate cleanly
@@ -68,24 +68,24 @@ tasks:
   test:integration:cas:
     desc: Verify the local bazel-remote CAS test prerequisite
     cmds:
-      - cargo test --test cas_prerequisites
+      - cargo test -p rfs-common --test cas_prerequisites
 
   test:integration:upload:
     desc: Verify upload integration behavior against the local bazel-remote CAS
     cmds:
-      - cargo test --test upload_integration
+      - cargo test -p rfs --test upload_integration
 
   test:integration:state:
     desc: Verify local state and foreground daemon lifecycle behavior
     cmds:
-      - cargo test --test state_integration
+      - cargo test -p rfs-common --test state_integration
 
   test:integration:daemon:
     desc: Verify Unix control socket and daemon lifecycle behavior
     cmds:
-      - cargo test --test daemon_integration
+      - cargo test -p rfsd --test daemon_integration
 
   fixture:upload:
     desc: Upload the checked-in tree fixture to the local bazel-remote CAS
     cmds:
-      - cargo run --bin rfs -- --cas-url grpc://127.0.0.1:9092 --instance-name remotefs/fixtures upload tests/fixtures/tree-roundtrip
+      - cargo run -p rfs -- --cas-url grpc://127.0.0.1:9092 --instance-name remotefs/fixtures upload tests/fixtures/tree-roundtrip

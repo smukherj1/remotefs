@@ -101,10 +101,10 @@ rfs mount <root-digest> <mountpoint>
 rfs snapshot [mountpoint]
 rfs unmount [mountpoint]
 rfs status [mountpoint]
-rfs cleanup
 ```
 
-When implemented, `rfsd` will own:
+`rfsd` owns one immutable mount session. Its root digest and mountpoint are fixed
+at startup. The daemon owns:
 
 - The FUSE mount.
 - The mounted root digest.
@@ -113,48 +113,68 @@ When implemented, `rfsd` will own:
 - The active session SQLite database.
 - The active session overlay data directory.
 - The Unix control socket.
+- Snapshot upload for the mounted workspace.
+- Graceful session close before a successful unmount response.
+
+The CLI owns parsing, presentation, daemon process startup, read-only retained
+session inspection, and calls through the command-oriented daemon client. The
+only domain-work exception is bootstrap `rfs upload`, exposed through a narrow
+configured capability whose operation accepts a local path and returns a root
+digest. CAS clients, tree traversal, batching, and encoding are not CLI APIs.
 
 When implemented, `rfs mount` will start `rfsd` in the background by default and return only after the root directory is validated, the FUSE mount is active, and the control socket is reachable. Direct `rfsd` invocation will run in the foreground unless supervised externally.
 
-Current CLI behavior is deliberately narrower than the target surface: `upload`, `status`, `unmount`, and `cleanup` are functional through the daemon-foundation scope. `mount` validates its root digest before returning a clear not-implemented diagnostic, and `snapshot` remains unimplemented. Foreground `rfsd` creates and retains session state and serves the control socket, but it does not mount FUSE yet.
+Current CLI behavior is deliberately narrower than the target surface: `upload`,
+`status`, and `unmount` are functional through the daemon-foundation scope.
+`mount` validates its root digest before returning a clear not-implemented
+diagnostic, and `snapshot` remains unimplemented. Foreground `rfsd` creates and
+retains session state and serves the control socket, but it does not mount FUSE yet.
 
 ## Rust Source Layout
 
-RemoteFS remains one Cargo package with one library crate and two thin binary entrypoints. Library modules are grouped by binary ownership:
+RemoteFS is a Cargo workspace whose manifests enforce process ownership:
 
 ```text
-src/
-  lib.rs
-  bin/
-    rfs.rs
-    rfsd.rs
-  cli/
-    mod.rs
-  daemon/
-    mod.rs
-    fs.rs
-  shared/
-    mod.rs
-    cas.rs
-    config.rs
-    control.rs
-    digest.rs
-    error_context.rs
-    reapi.rs
-    state.rs
-    tree.rs
-    upload.rs
+crates/rfs/
+  src/main.rs            # rfs binary entrypoint
+  src/cli/               # command parsing, coordination, and presentation
+  src/daemon_client.rs   # command-oriented control client and private transport
+  src/bootstrap_upload.rs # narrow local-directory upload workflow
+crates/rfsd/
+  src/main.rs            # rfsd binary entrypoint
+  src/control_service.rs # daemon-side control protocol and shutdown
+  src/fs.rs              # filesystem, FUSE, and overlay behavior
+crates/rfs-common/
+  src/                   # shared domain, state, storage, protocol, and logging modules
 ```
 
-The top-level directories communicate ownership:
+Direct internal dependency edges are:
 
-- `cli/` contains behavior owned exclusively by the `rfs` CLI.
-- `daemon/` contains behavior owned exclusively by `rfsd`, including the filesystem core, FUSE adapter, overlay, and daemon snapshot orchestration as those are implemented.
-- `shared/` contains cross-binary domain and infrastructure modules. Code belongs here only when both sides consume it or the implementation plan identifies a concrete consumer on each side; testability or speculative reuse alone does not make a module shared.
+```text
+rfs  -> rfs-common
+rfsd -> rfs-common
+```
 
-Both binaries may depend on `shared`. `cli` and `daemon` must not depend on each other. The files under `src/bin/` contain only process entrypoint concerns such as argument parsing, runtime startup, error rendering, and exit status; substantive behavior lives in the corresponding library module.
+Cargo prevents either binary package from importing the other. Finer ownership
+boundaries are modules: daemon-client and bootstrap-upload orchestration stay in
+`rfs`; the control service and filesystem stay in `rfsd`; shared protocol,
+state, CAS, tree, and lower-level upload mechanics stay in `rfs-common`.
+Generated protocol messages and tonic clients are confined to the client and
+service adapter modules and are not CLI command/result types. SQLite types do
+not escape the common state module.
 
-This single-package layout keeps module ownership visible without introducing multiple Cargo manifests or cross-crate API overhead. Separate workspace packages may be considered later if an independently consumed library, materially different dependency sets or platform targets, compile-time isolation, or stronger compiler-enforced boundaries justify the added complexity.
+The `rfs-common::state` module exposes `SessionStateReader` and `DaemonState`
+trait objects.
+`open_reader` opens existing SQLite state read-only and never creates files,
+migrates, locks, or mutates lifecycle state. `open_daemon` owns validation,
+migration, locking, recoverable closed-session replacement, active-session
+creation, and explicit clean close. SQL, migrations, connections, and row models
+remain private.
+
+Packages and substantial modules retain owner-specific structured errors. Common
+helpers attach operation context without erasing those errors. The daemon maps
+implementation failures to safe control failures; the client exposes stable
+error codes without tonic types; only the CLI renders command errors.
 
 The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires `RFS_HOME/active.lock` before starting `rfsd`; if another process holds that advisory lock, the mount fails and reports its diagnostic lock metadata when readable. The lock is outside `RFS_HOME/active/` so cleanup or replacement never removes the inode that coordinates ownership. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts require distinct `RFS_HOME` values.
 
@@ -163,7 +183,7 @@ The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquir
 `rfs status` reports only session state:
 
 - If a live active session exists, it talks to the daemon through the active session's Unix control socket and reports mountpoint, root digest, daemon pid/socket, cache/session paths, counters, dirty state, and snapshot blockers.
-- If no live session exists but `RFS_HOME/active/` remains, it reports cleanly closed or stale session metadata as appropriate. Stale state includes cleanup guidance.
+- If no live session exists but `RFS_HOME/active/` remains, it reports cleanly closed or stale session metadata as appropriate. Stale state includes manual `RFS_HOME` deletion guidance.
 - If neither live nor retained session state exists, it reports a clean no-session state.
 
 RemoteFS does not include `rfs doctor` in the MVP. Configuration, CAS, path, FUSE, and root-digest validation happen in the commands that need them: `upload`, `mount`, `snapshot`, and `unmount`.
@@ -204,9 +224,7 @@ Active session state is isolated under `RFS_HOME/active/`:
 - Control socket.
 - Session logs and SQLite-backed session metadata.
 
-Only one active session may exist for an `RFS_HOME` at a time. Clean unmount transactionally marks the session `closed`, then leaves `RFS_HOME/active/` in place for inspection. The next mount, while holding `active.lock`, automatically removes only a valid cleanly closed `active/` tree and preserves the shared cache. Unclean, partial, malformed, or unsupported session state blocks mounting and requires `rfs cleanup`.
-
-`rfs cleanup` is an explicit full local reset. It refuses while another process holds `active.lock` or when the home contains unknown direct children or expected entries of unsafe type. Otherwise it removes both `active/` and `cache/` without following symlinks, removes `active.lock` last, and leaves `RFS_HOME` empty. It does not scan individual cache or overlay data files before removal.
+Only one active session may exist for an `RFS_HOME` at a time. Clean unmount transactionally marks the session `closed`, then leaves `RFS_HOME/active/` in place for inspection. The next mount, while holding `active.lock`, automatically removes only a valid cleanly closed `active/` tree and preserves the shared cache. Unclean, partial, malformed, corrupt, or unsupported session state is left untouched and blocks startup with guidance to delete the configured `RFS_HOME` manually. The MVP has no cleanup command or automated partial repair path.
 
 Local cache eviction is deferred. The earliest MVP may provide manual pruning only. Remote CAS eviction is a deployment concern and must be disabled or capacity-provisioned during MVP evaluation.
 
@@ -414,21 +432,25 @@ The implemented upload pipeline is:
 
 Canonical directory encoding and the root digest are independent of filesystem traversal and hashing completion order. The current object submission order is not a user-visible determinism guarantee.
 
-`rfs upload` writes the root digest alone to stdout in text mode and a compact counter line to stderr. In JSON mode it writes one versioned success envelope to stdout with `root_digest`, entry/object/byte counts, and warning counters. JSON failures are emitted as one versioned envelope on stderr. The upload-specific warning counters are hard links, masked setuid/setgid bits, absolute symlinks, and relative symlinks that escape the upload tree.
+`rfs upload` writes the root digest alone to stdout in text mode. In JSON mode it writes one versioned success envelope containing the root digest. Entry, object, byte, warning, and timing summaries are operation-level logs on stderr rather than stable command-result fields. JSON failures are emitted as one versioned envelope on stderr.
 
 ## Observability
 
 Structured logs and command summaries are the first observability layer.
 
-The completed upload slice supports:
+The completed architecture-boundary slice supports:
 
-- A stable JSON success/failure envelope for `rfs upload` with `schema_version`, `command`, `ok`, `warnings`, `error`, and `data`.
-- Upload results on stdout and the text-mode upload counter line on stderr.
+- Four standard levels: error, warn, info, and debug.
+- Text or JSON Lines process logging configured once at startup.
+- CLI logs on stderr and command results on stdout.
+- Daemon logs in `RFS_HOME/active/rfsd.log` after state layout establishment.
+- Lifecycle and upload-summary events with structured operation fields.
+- No routine per-file lookup, traversal, cache-probe, read, or write event stream.
 
-The later MVP observability work should support:
+The later MVP observability work should extend this with:
 
 - CLI logs go to stderr only. Command results and JSON summaries go to stdout.
-- `rfsd` logs go to `RFS_HOME/active/rfsd.log` and remain inspectable with the active or cleanly closed session until the next mount replaces that session or `rfs cleanup` resets the home.
+- `rfsd` logs remain inspectable with the active or cleanly closed session until the next mount replaces that session or the user manually removes `RFS_HOME`.
 - Human-readable compact text logs by default.
 - JSON Lines logs and JSON command summaries via `--output-format json`; text logs and human command summaries via `--output-format text`.
 - `--log-level` and `--output-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.
