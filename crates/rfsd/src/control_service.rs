@@ -2,6 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use rfs_common::cas::CasClient;
 use rfs_common::control_protocol as protocol;
 use rfs_common::state::{DaemonState, SessionView, StateError};
 use thiserror::Error;
@@ -10,6 +11,9 @@ use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+
+use crate::fs::ReadOnlyFilesystem;
+use crate::fuse::FuseMount;
 
 const PROTOCOL_VERSION: u32 = 1;
 
@@ -33,6 +37,8 @@ pub(crate) enum ControlError {
 struct ControlService {
     session: SessionView,
     state: Arc<Mutex<Option<Box<dyn DaemonState>>>>,
+    mount: Arc<Mutex<Option<FuseMount>>>,
+    filesystem: Arc<ReadOnlyFilesystem<CasClient>>,
     shutdown: Arc<AsyncMutex<Option<oneshot::Sender<()>>>>,
 }
 
@@ -70,10 +76,10 @@ impl protocol::control_server::Control for ControlService {
             return Err(error);
         }
         Ok(Response::new(protocol::StatusResponse {
-            mounted: false,
+            mounted: true,
             root_digest: self.session.root_digest.to_string(),
             mountpoint: self.session.mountpoint.to_string_lossy().into_owned(),
-            cached_blobs: 0,
+            cached_blobs: self.filesystem.cached_blobs(),
             dirty_files: 0,
             protocol_version: PROTOCOL_VERSION,
             daemon_pid: self.session.daemon_pid,
@@ -81,7 +87,7 @@ impl protocol::control_server::Control for ControlService {
             cache_path: self.session.cache_path.to_string_lossy().into_owned(),
             session_path: self.session.session_path.to_string_lossy().into_owned(),
             dirty: false,
-            snapshot_blockers: vec!["FUSE mount is not implemented".into()],
+            snapshot_blockers: vec!["snapshot is not implemented".into()],
         }))
     }
 
@@ -102,6 +108,18 @@ impl protocol::control_server::Control for ControlService {
         if let Some(error) = self.protocol_error(request.into_inner().protocol_version) {
             return Err(error);
         }
+        let mount = self
+            .mount
+            .lock()
+            .map_err(|_| Status::internal("FUSE mount lock is poisoned"))?
+            .take()
+            .ok_or_else(|| Status::failed_precondition("daemon shutdown is already in progress"))?;
+        tokio::task::spawn_blocking(move || mount.unmount())
+            .await
+            .map_err(|error| {
+                tracing::error!(operation = "unmount", error = %error, "FUSE teardown task failed");
+                Status::internal("daemon could not unmount its FUSE session cleanly")
+            })?;
         let state = self
             .state
             .lock()
@@ -124,27 +142,34 @@ impl protocol::control_server::Control for ControlService {
     }
 }
 
-pub(crate) async fn serve(state: Box<dyn DaemonState>) -> Result<(), ControlError> {
+pub(crate) async fn serve(
+    state: Box<dyn DaemonState>,
+    mount: FuseMount,
+    filesystem: Arc<ReadOnlyFilesystem<CasClient>>,
+) -> Result<(), ControlError> {
     let session = state.session()?.ok_or_else(|| StateError::StaleSession {
         path: PathBuf::new(),
         reason: "daemon state has no active session".into(),
     })?;
     let socket = session.control_endpoint.clone();
-    let listener = UnixListener::bind(&socket).map_err(|source| ControlError::Socket {
-        path: socket.clone(),
-        source,
-    })?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).map_err(
-        |source| ControlError::Socket {
-            path: socket.clone(),
-            source,
-        },
-    )?;
+    let listener = match prepare_listener(&socket) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tokio::task::spawn_blocking(move || mount.unmount())
+                .await
+                .map_err(|_| ControlError::StateLockPoisoned)?;
+            state.close()?;
+            return Err(error);
+        }
+    };
     let state = Arc::new(Mutex::new(Some(state)));
+    let mount = Arc::new(Mutex::new(Some(mount)));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let service = ControlService {
         session,
         state: Arc::clone(&state),
+        mount: Arc::clone(&mount),
+        filesystem,
         shutdown: Arc::new(AsyncMutex::new(Some(shutdown_tx))),
     };
     let shutdown = async move {
@@ -161,6 +186,15 @@ pub(crate) async fn serve(state: Box<dyn DaemonState>) -> Result<(), ControlErro
         .lock()
         .map_err(|_| ControlError::StateLockPoisoned)?
         .take();
+    let remaining_mount = mount
+        .lock()
+        .map_err(|_| ControlError::StateLockPoisoned)?
+        .take();
+    if let Some(mount) = remaining_mount {
+        tokio::task::spawn_blocking(move || mount.unmount())
+            .await
+            .map_err(|_| ControlError::StateLockPoisoned)?;
+    }
     if let Some(state) = remaining_state {
         state.close()?;
     }
@@ -168,9 +202,23 @@ pub(crate) async fn serve(state: Box<dyn DaemonState>) -> Result<(), ControlErro
         && source.kind() != std::io::ErrorKind::NotFound
     {
         return Err(ControlError::Socket {
-            path: socket,
+            path: socket.clone(),
             source,
         });
     }
     result.map_err(ControlError::Transport)
+}
+
+fn prepare_listener(socket: &PathBuf) -> Result<UnixListener, ControlError> {
+    let listener = UnixListener::bind(socket).map_err(|source| ControlError::Socket {
+        path: socket.clone(),
+        source,
+    })?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
+        ControlError::Socket {
+            path: socket.clone(),
+            source,
+        }
+    })?;
+    Ok(listener)
 }

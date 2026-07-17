@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+use rfs_common::cas::{CasClient, CasConfig};
 use rfs_common::config::Config;
 use rfs_common::digest::Digest;
 use rfs_common::logging::{self, LogFormat};
@@ -11,6 +12,7 @@ use rfs_common::state::{SessionStartup, open_daemon};
 
 mod control_service;
 pub mod fs;
+mod fuse;
 
 /// Command-line arguments accepted by `rfsd`.
 #[derive(Parser, Debug)]
@@ -69,9 +71,25 @@ pub async fn run(cli: Cli) -> Result<()> {
         .root_digest
         .parse()
         .with_context(|| format!("parse daemon root digest {}", cli.root_digest))?;
+    let cas_url = cli
+        .cas_url
+        .or_else(|| std::env::var("RFS_CAS_URL").ok())
+        .context("missing CAS URL; pass --cas-url or set RFS_CAS_URL")?;
+    let instance_name = cli
+        .instance_name
+        .or_else(|| std::env::var("RFS_INSTANCE_NAME").ok())
+        .context("missing instance name; pass --instance-name or set RFS_INSTANCE_NAME")?;
+    let cas_config =
+        CasConfig::new(cas_url, instance_name).context("validate daemon CAS configuration")?;
+    let cas = CasClient::connect(cas_config)
+        .await
+        .context("connect daemon to CAS")?;
     let config = Config::new().context("load daemon state configuration")?;
-    let state = open_daemon(config, SessionStartup::new(digest, cli.mountpoint.clone()))
-        .with_context(|| format!("create daemon session for {}", cli.mountpoint.display()))?;
+    let state = open_daemon(
+        config,
+        SessionStartup::new(digest.clone(), cli.mountpoint.clone()),
+    )
+    .with_context(|| format!("create daemon session for {}", cli.mountpoint.display()))?;
     let session = state
         .session()
         .context("read active daemon session metadata")?
@@ -92,7 +110,38 @@ pub async fn run(cli: Cli) -> Result<()> {
         digest = %session.root_digest,
         "daemon session active"
     );
-    control_service::serve(state)
+    let filesystem = match fs::ReadOnlyFilesystem::mount(
+        cas,
+        state.filesystem_state(),
+        session.cache_path.clone(),
+        digest,
+    )
+    .await
+    {
+        Ok(filesystem) => std::sync::Arc::new(filesystem),
+        Err(error) => {
+            state
+                .close()
+                .context("close daemon state after root validation failure")?;
+            return Err(error).context("validate root directory before FUSE mount");
+        }
+    };
+    let mount = match fuse::FuseMount::mount(
+        std::sync::Arc::clone(&filesystem),
+        &session.mountpoint,
+        tokio::runtime::Handle::current(),
+    ) {
+        Ok(mount) => mount,
+        Err(error) => {
+            state
+                .close()
+                .context("close daemon state after FUSE mount failure")?;
+            return Err(error).with_context(|| {
+                format!("mount FUSE filesystem at {}", session.mountpoint.display())
+            });
+        }
+    };
+    control_service::serve(state, mount, filesystem)
         .await
         .context("serve active daemon control socket")?;
     tracing::info!(operation = "daemon_stop", "daemon session closed");

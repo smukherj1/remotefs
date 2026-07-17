@@ -90,6 +90,18 @@ tasks:
     cmds:
       - cargo test -p rfsd --test readonly_integration
 
+  test:e2e:readonly:
+    desc: Verify the read-only FUSE workflow (requires local CAS and usable /dev/fuse)
+    cmds:
+      - cargo test -p rfsd --test readonly_e2e
+
+  mount:readonly:
+    desc: Mount ROOT at MOUNT through the local CAS for manual read-only testing
+    requires:
+      vars: [ROOT, MOUNT]
+    cmds:
+      - cargo run -p rfs -- --cas-url grpc://127.0.0.1:9092 --instance-name remotefs/fixtures mount {{.ROOT}} {{.MOUNT}}
+
   fixture:upload:
     desc: Upload the checked-in tree fixture to the local bazel-remote CAS
     cmds:

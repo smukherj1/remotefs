@@ -43,6 +43,8 @@ pub enum NodeKind {
 pub struct Node {
     /// Synthetic session-stable inode.
     pub inode: u64,
+    /// Synthetic inode of the parent; root refers to itself.
+    pub parent: u64,
     /// UTF-8 name relative to the parent, empty only for root.
     pub name: String,
     /// Immutable remote node kind.
@@ -76,6 +78,7 @@ struct AtomicCounters {
     directory_cache_hits: AtomicU64,
     blob_downloads: AtomicU64,
     blob_cache_hits: AtomicU64,
+    cached_blobs: AtomicU64,
 }
 
 /// Errors from lazy metadata resolution and verified file reads.
@@ -165,6 +168,7 @@ impl<S: BlobStore + Send> ReadOnlyFilesystem<S> {
     ) -> Result<Self, FilesystemError> {
         let root = Node {
             inode: ROOT_INODE,
+            parent: ROOT_INODE,
             name: String::new(),
             kind: NodeKind::Directory,
             digest: Some(root_digest),
@@ -172,6 +176,7 @@ impl<S: BlobStore + Send> ReadOnlyFilesystem<S> {
             mtime: None,
             symlink_target: None,
         };
+        let cached_blobs = count_cache_entries(&cache_root.join("blobs"))?;
         let filesystem = Self {
             store: Mutex::new(store),
             state,
@@ -180,7 +185,10 @@ impl<S: BlobStore + Send> ReadOnlyFilesystem<S> {
             directories: Mutex::new(HashMap::new()),
             directory_locks: StdMutex::new(HashMap::new()),
             blob_locks: StdMutex::new(HashMap::new()),
-            counters: AtomicCounters::default(),
+            counters: AtomicCounters {
+                cached_blobs: AtomicU64::new(cached_blobs),
+                ..AtomicCounters::default()
+            },
         };
         filesystem.ensure_directory(ROOT_INODE).await?;
         Ok(filesystem)
@@ -202,6 +210,11 @@ impl<S: BlobStore + Send> ReadOnlyFilesystem<S> {
     /// Lists one directory in canonical remote order.
     pub async fn readdir(&self, inode: u64) -> Result<Vec<Node>, FilesystemError> {
         Ok(self.ensure_directory(inode).await?.entries.clone())
+    }
+
+    /// Returns metadata and remote identity for one materialized inode.
+    pub async fn getattr(&self, inode: u64) -> Result<Node, FilesystemError> {
+        self.node(inode).await
     }
 
     /// Returns the exact stored target for a materialized symlink.
@@ -237,6 +250,11 @@ impl<S: BlobStore + Send> ReadOnlyFilesystem<S> {
             blob_downloads: self.counters.blob_downloads.load(Ordering::Relaxed),
             blob_cache_hits: self.counters.blob_cache_hits.load(Ordering::Relaxed),
         }
+    }
+
+    /// Returns the number of verified file blobs present in the shared cache.
+    pub fn cached_blobs(&self) -> u64 {
+        self.counters.cached_blobs.load(Ordering::Relaxed)
     }
 
     async fn node(&self, inode: u64) -> Result<Node, FilesystemError> {
@@ -361,6 +379,7 @@ impl<S: BlobStore + Send> ReadOnlyFilesystem<S> {
         }
         admit_bytes(&path, &bytes)?;
         self.counters.blob_downloads.fetch_add(1, Ordering::Relaxed);
+        self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
         Ok(path)
     }
 }
@@ -395,6 +414,7 @@ async fn materialize_nodes(
             },
             Node {
                 inode: 0,
+                parent,
                 name: child.name.clone(),
                 kind: NodeKind::Directory,
                 digest: Some(child_digest),
@@ -460,6 +480,7 @@ fn assign_inodes(
                             ),
                         },
                     })?;
+            node.parent = parent;
             Ok(node)
         })
         .collect()
@@ -469,6 +490,7 @@ fn file_node(file: &FileNode, digest: Digest) -> Node {
     let (mode, mtime) = properties(file.node_properties.as_ref());
     Node {
         inode: 0,
+        parent: 0,
         name: file.name.clone(),
         kind: NodeKind::File,
         digest: Some(digest),
@@ -482,6 +504,7 @@ fn symlink_node(symlink: &SymlinkNode) -> Node {
     let (mode, mtime) = properties(symlink.node_properties.as_ref());
     Node {
         inode: 0,
+        parent: 0,
         name: symlink.name.clone(),
         kind: NodeKind::Symlink,
         digest: None,
@@ -539,6 +562,37 @@ fn keyed_lock(
 fn cache_path(base: &Path, digest: &Digest) -> PathBuf {
     base.join(&digest.hash()[..2])
         .join(format!("{}-{}", digest.hash(), digest.size_bytes()))
+}
+
+fn count_cache_entries(path: &Path) -> Result<u64, FilesystemError> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let shards =
+        fs::read_dir(path).map_err(|source| cache_error("list blob cache", path, source))?;
+    let mut count = 0_u64;
+    for shard in shards {
+        let shard = shard.map_err(|source| cache_error("read blob cache entry", path, source))?;
+        let shard_path = shard.path();
+        if !shard_path.is_dir() {
+            continue;
+        }
+        let entries = fs::read_dir(&shard_path)
+            .map_err(|source| cache_error("list blob cache shard", &shard_path, source))?;
+        for entry in entries {
+            let entry = entry.map_err(|source| {
+                cache_error("read blob cache shard entry", &shard_path, source)
+            })?;
+            if entry
+                .file_type()
+                .map_err(|source| cache_error("stat blob cache entry", &entry.path(), source))?
+                .is_file()
+            {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn admit_bytes(path: &Path, bytes: &[u8]) -> Result<(), FilesystemError> {

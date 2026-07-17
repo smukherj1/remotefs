@@ -1,86 +1,45 @@
-use std::fs;
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::{SocketAddr, TcpStream};
+use std::time::Duration;
 
 use assert_cmd::cargo::cargo_bin;
 use predicates::prelude::*;
 
-const ROOT_DIGEST: &str =
-    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/0";
+const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";
 
 #[test]
-fn daemon_status_second_session_and_unmount_control_path() {
+fn daemon_rejects_a_missing_root_before_mounting_fuse() {
+    verify_cas_prerequisite();
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let mountpoint = temp.path().join("mount");
-    fs::create_dir(&mountpoint).unwrap();
+    std::fs::create_dir(&mountpoint).unwrap();
+    let missing = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/123";
 
-    let mut daemon = Command::new(cargo_bin("rfsd"))
+    assert_cmd::Command::new(cargo_bin("rfsd"))
         .env("RFS_HOME", &home)
-        .args([ROOT_DIGEST, mountpoint.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    wait_for_path(&home.join("active/control.sock"), &mut daemon);
-
-    assert_cmd::Command::cargo_bin("rfs")
-        .unwrap()
-        .env("RFS_HOME", &home)
-        .arg("status")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("active session"))
-        .stdout(predicate::str::contains(ROOT_DIGEST));
-
-    assert_cmd::Command::cargo_bin("rfsd")
-        .unwrap()
-        .env("RFS_HOME", &home)
-        .args([ROOT_DIGEST, mountpoint.to_str().unwrap()])
+        .args([
+            missing,
+            mountpoint.to_str().unwrap(),
+            "--cas-url",
+            "grpc://127.0.0.1:9092",
+            "--instance-name",
+            "remotefs/daemon-integration",
+        ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("another RemoteFS session"));
-
-    assert_cmd::Command::cargo_bin("rfs")
-        .unwrap()
-        .env("RFS_HOME", &home)
-        .args(["unmount", mountpoint.to_str().unwrap()])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("unmounted"));
-
-    let status = daemon.wait().unwrap();
-    assert!(status.success(), "daemon did not close cleanly: {status}");
-
-    let log = fs::read_to_string(home.join("active/rfsd.log")).unwrap();
-    assert!(log.contains("daemon session active"));
-    assert!(log.contains("session teardown completed"));
-    assert!(!log.contains("lookup"));
-    assert!(!log.contains("read directory entry"));
-
-    assert_cmd::Command::cargo_bin("rfs")
-        .unwrap()
-        .env("RFS_HOME", &home)
-        .arg("status")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("closed session"))
-        .stdout(predicate::str::contains("delete `RFS_HOME`").not());
+        .stderr(predicate::str::contains(
+            "validate root directory before FUSE mount",
+        ))
+        .stderr(predicate::str::contains(missing));
 }
 
-fn wait_for_path(path: &std::path::Path, child: &mut std::process::Child) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "daemon exited before creating control socket"
-        );
-        if path.exists() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    panic!("daemon did not create {}", path.display());
+fn verify_cas_prerequisite() {
+    let addr: SocketAddr = LOCAL_CAS_ADDR.parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap_or_else(|error| {
+        panic!(
+            "PREREQUISITE FAILED: local bazel-remote CAS is not reachable at \
+             grpc://{LOCAL_CAS_ADDR}: {error}. Run `task cas:up` before \
+             `task test:integration:daemon`."
+        )
+    });
 }

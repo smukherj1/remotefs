@@ -1,5 +1,8 @@
 use std::env;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
@@ -144,6 +147,15 @@ impl LogLevel {
     }
 }
 
+impl OutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+        }
+    }
+}
+
 /// CLI execution or validation error with a stable diagnostic category.
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum CliError {
@@ -229,10 +241,20 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             print_upload_output(digest, cli.json_output());
             Ok(())
         }
-        Commands::Mount { root_digest, .. } => {
-            parse_root_digest(root_digest)?;
-            resolve_cli_config(&cli)?;
-            Err(CliError::NotImplemented { command: "mount" })
+        Commands::Mount {
+            root_digest,
+            mountpoint,
+        } => {
+            let digest = parse_root_digest(root_digest)?;
+            let daemon_config = resolve_cli_config(&cli)?;
+            run_mount(
+                digest,
+                mountpoint,
+                daemon_config,
+                cli.log_level,
+                cli.output_format,
+            )
+            .await
         }
         Commands::Snapshot { mountpoint } => {
             validate_optional_mountpoint(mountpoint.as_deref(), None)?;
@@ -250,6 +272,116 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             let reader = open_reader(config).map_err(state_error)?;
             run_status(reader.as_ref(), mountpoint.as_deref(), cli.json_output()).await
         }
+    }
+}
+
+async fn run_mount(
+    digest: Digest,
+    mountpoint: &Path,
+    cas: CliConfig,
+    log_level: LogLevel,
+    output_format: OutputFormat,
+) -> Result<(), CliError> {
+    let mountpoint = canonicalize_mountpoint(mountpoint).map_err(state_error)?;
+    let daemon = daemon_executable()?;
+    let mut child = Command::new(&daemon)
+        .arg(digest.to_string())
+        .arg(&mountpoint)
+        .arg("--cas-url")
+        .arg(&cas.cas_url)
+        .arg("--instance-name")
+        .arg(&cas.instance_name)
+        .arg("--log-level")
+        .arg(log_level.as_str())
+        .arg("--output-format")
+        .arg(output_format.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| CliError::CommandFailed {
+            category: "daemon_start",
+            message: format!("start daemon `{}`: {source}", daemon.display()),
+        })?;
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|source| CliError::CommandFailed {
+            category: "daemon_start",
+            message: format!("inspect daemon process: {source}"),
+        })? {
+            return Err(daemon_exit_error(&mut child, status));
+        }
+        if let Ok(config) = Config::new()
+            && let Ok(reader) = open_reader(config)
+            && let Ok(mut client) = daemon_client(reader.as_ref()).await
+            && let Ok(status) = client.status().await
+        {
+            if status.root_digest != digest || status.mountpoint != mountpoint {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CliError::CommandFailed {
+                    category: "daemon_start",
+                    message: "daemon readiness identity did not match requested mount".to_owned(),
+                });
+            }
+            if output_format == OutputFormat::Json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"command":"mount","ok":true,"data":{"mountpoint":mountpoint,"root_digest":digest,"daemon_pid":status.daemon_pid}})
+                );
+            } else {
+                println!("mounted {} at {}", digest, mountpoint.display());
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(CliError::CommandFailed {
+                category: "daemon_start",
+                message: format!(
+                    "daemon did not validate the root, mount FUSE, and open its control socket within 15 seconds; inspect `{}`",
+                    mountpoint.display()
+                ),
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn daemon_executable() -> Result<PathBuf, CliError> {
+    let current = env::current_exe().map_err(|source| CliError::CommandFailed {
+        category: "daemon_start",
+        message: format!("locate current rfs executable: {source}"),
+    })?;
+    let daemon = current.with_file_name("rfsd");
+    if daemon.is_file() {
+        Ok(daemon)
+    } else {
+        Err(CliError::CommandFailed {
+            category: "daemon_start",
+            message: format!(
+                "could not find companion rfsd executable at `{}`",
+                daemon.display()
+            ),
+        })
+    }
+}
+
+fn daemon_exit_error(child: &mut Child, status: std::process::ExitStatus) -> CliError {
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stderr.take() {
+        let _ = stream.read_to_string(&mut stderr);
+    }
+    let detail = stderr.trim();
+    CliError::CommandFailed {
+        category: "daemon_start",
+        message: if detail.is_empty() {
+            format!("daemon exited before mount readiness with status {status}")
+        } else {
+            format!("daemon exited before mount readiness with status {status}: {detail}")
+        },
     }
 }
 
@@ -649,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_root_digest_is_reported_before_mount_stub() {
+    fn invalid_root_digest_is_reported_before_mount_start() {
         assert!(matches!(
             parse_root_digest("not-a-digest"),
             Err(CliError::InvalidDigest { .. })

@@ -124,11 +124,11 @@ digest. CAS clients, tree traversal, batching, and encoding are not CLI APIs.
 
 When implemented, `rfs mount` will start `rfsd` in the background by default and return only after the root directory is validated, the FUSE mount is active, and the control socket is reachable. Direct `rfsd` invocation will run in the foreground unless supervised externally.
 
-Current CLI behavior is deliberately narrower than the target surface: `upload`,
-`status`, and `unmount` are functional through the daemon-foundation scope.
-`mount` validates its root digest before returning a clear not-implemented
-diagnostic, and `snapshot` remains unimplemented. Foreground `rfsd` creates and
-retains session state and serves the control socket, but it does not mount FUSE yet.
+Current CLI behavior implements the read-only milestone: `upload`, `mount`,
+`status`, and `unmount` are functional, while `snapshot` remains unimplemented.
+`mount` starts `rfsd` in the background and returns after root validation, FUSE
+initialization, and control-socket readiness. Direct `rfsd` invocation keeps the
+same mount workflow in the foreground for tests and manual debugging.
 
 ## Rust Source Layout
 

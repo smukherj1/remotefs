@@ -581,7 +581,7 @@ Definition of done:
 
 - Lazy behavior is proven without FUSE.
 
-### Step 5.2: Read-Only FUSE Adapter
+### Step 5.2: Read-Only FUSE Adapter (Complete)
 
 Deliverables:
 
