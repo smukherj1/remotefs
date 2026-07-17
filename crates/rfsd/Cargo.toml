@@ -5,8 +5,12 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
 clap = { version = "4.5", features = ["derive"] }
+prost-types.workspace = true
 rfs-common = { path = "../rfs-common" }
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true

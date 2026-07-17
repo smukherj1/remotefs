@@ -85,6 +85,11 @@ tasks:
     cmds:
       - cargo test -p rfsd --test daemon_integration
 
+  test:integration:readonly:
+    desc: Verify lazy read-only filesystem behavior against local bazel-remote
+    cmds:
+      - cargo test -p rfsd --test readonly_integration
+
   fixture:upload:
     desc: Upload the checked-in tree fixture to the local bazel-remote CAS
     cmds:

@@ -17,8 +17,10 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::digest::Digest;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const LOCK_RECORD_VERSION: u32 = 1;
+/// Fixed inode number for the root of every mount session.
+pub const ROOT_INODE: u64 = 1;
 
 #[derive(Debug, Error)]
 pub enum StateError {
@@ -276,8 +278,67 @@ pub trait SessionStateReader: Send + Sync {
 
 /// Daemon-only state lifecycle capability.
 pub trait DaemonState: SessionStateReader {
+    /// Returns the durable inode and remote-directory materialization capability.
+    fn filesystem_state(&self) -> std::sync::Arc<dyn FilesystemState>;
+
     /// Marks the session cleanly closed and releases its ownership lock.
     fn close(self: Box<Self>) -> Result<(), StateError>;
+}
+
+/// Kind of an immutable remote node recorded in the session inode table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteNodeKind {
+    /// Regular file backed by a content digest.
+    File,
+    /// Directory backed by another REAPI `Directory` digest.
+    Directory,
+    /// Symbolic link backed by its exact target string.
+    Symlink,
+}
+
+impl RemoteNodeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+        }
+    }
+}
+
+/// Stable identity of one child discovered in an immutable remote directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteNodeIdentity {
+    /// UTF-8 name relative to the materialized parent.
+    pub name: String,
+    /// Immutable remote node kind.
+    pub kind: RemoteNodeKind,
+    /// File or directory digest, or the exact target for a symlink.
+    pub content_identity: String,
+}
+
+/// Session-stable inode allocated for a materialized remote child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedInode {
+    /// Synthetic inode stable for this session.
+    pub inode: u64,
+    /// Child name used to associate the allocation with its caller input.
+    pub name: String,
+}
+
+/// Daemon filesystem persistence without exposing SQLite implementation types.
+pub trait FilesystemState: Send + Sync {
+    /// Atomically records a fetched directory and allocates stable child inodes.
+    ///
+    /// Re-materializing the same immutable directory is idempotent. A changed
+    /// digest or child identity for an existing `(parent inode, name)` is
+    /// rejected as stale session state.
+    fn materialize_remote_directory(
+        &self,
+        inode: u64,
+        digest: &Digest,
+        children: &[RemoteNodeIdentity],
+    ) -> Result<Vec<MaterializedInode>, StateError>;
 }
 
 /// An exclusively held stable ownership lock.
@@ -338,8 +399,13 @@ impl Drop for SessionLock {
 /// Sole owner of a writable session database and its ownership lock.
 struct SessionStore {
     paths: StatePaths,
-    connection: Mutex<Connection>,
+    connection: std::sync::Arc<Mutex<Connection>>,
     _lock: SessionLock,
+}
+
+struct FilesystemStore {
+    paths: StatePaths,
+    connection: std::sync::Arc<Mutex<Connection>>,
 }
 
 impl SessionStore {
@@ -372,7 +438,7 @@ impl SessionStore {
             .map_err(|source| db_error(&paths.database(), source))?;
         Ok(Self {
             paths,
-            connection: Mutex::new(connection),
+            connection: std::sync::Arc::new(Mutex::new(connection)),
             _lock: lock,
         })
     }
@@ -392,7 +458,7 @@ impl SessionStore {
     /// Marks the session closed transactionally before releasing ownership.
     fn close_cleanly(self) -> Result<(), StateError> {
         let (seconds, nanos) = now_parts()?;
-        self.connection.into_inner().map_err(|_| StateError::StaleSession {
+        self.connection.lock().map_err(|_| StateError::StaleSession {
             path: self.paths.database(),
             reason: "state connection lock is poisoned".into(),
         })?.execute(
@@ -429,8 +495,152 @@ impl SessionStateReader for SessionStore {
 }
 
 impl DaemonState for SessionStore {
+    fn filesystem_state(&self) -> std::sync::Arc<dyn FilesystemState> {
+        std::sync::Arc::new(FilesystemStore {
+            paths: self.paths.clone(),
+            connection: self.connection.clone(),
+        })
+    }
+
     fn close(self: Box<Self>) -> Result<(), StateError> {
         (*self).close_cleanly()
+    }
+}
+
+impl FilesystemState for FilesystemStore {
+    fn materialize_remote_directory(
+        &self,
+        inode: u64,
+        digest: &Digest,
+        children: &[RemoteNodeIdentity],
+    ) -> Result<Vec<MaterializedInode>, StateError> {
+        let inode = i64::try_from(inode)
+            .map_err(|_| stale_path(&self.paths.database(), "inode exceeds SQLite range".into()))?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StateError::StaleSession {
+                path: self.paths.database(),
+                reason: "state connection lock is poisoned".into(),
+            })?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        let lifecycle: String = transaction
+            .query_row(
+                "SELECT state FROM session_metadata WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        if lifecycle != "active" {
+            return Err(stale_path(
+                &self.paths.database(),
+                format!("cannot materialize inodes while session is {lifecycle}"),
+            ));
+        }
+        let stored: Option<(String, i64)> = transaction
+            .query_row(
+                "SELECT content_identity, kind = 'directory' FROM remote_inodes WHERE inode = ?1",
+                [inode],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        match stored {
+            Some((identity, 1)) if identity == digest.to_string() => {}
+            Some(_) => {
+                return Err(stale_path(
+                    &self.paths.database(),
+                    format!("inode {inode} is not directory {digest}"),
+                ));
+            }
+            None => {
+                return Err(stale_path(
+                    &self.paths.database(),
+                    format!("directory inode {inode} is missing"),
+                ));
+            }
+        }
+
+        let prior_digest: Option<String> = transaction
+            .query_row(
+                "SELECT directory_digest FROM remote_directory_materializations WHERE inode = ?1",
+                [inode],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        if prior_digest
+            .as_deref()
+            .is_some_and(|value| value != digest.to_string())
+        {
+            return Err(stale_path(
+                &self.paths.database(),
+                format!("directory inode {inode} was materialized with another digest"),
+            ));
+        }
+
+        let mut materialized = Vec::with_capacity(children.len());
+        for child in children {
+            transaction
+                .execute(
+                    "INSERT INTO remote_inodes(parent_inode, name, kind, content_identity)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(parent_inode, name) DO NOTHING",
+                    params![
+                        inode,
+                        child.name,
+                        child.kind.as_str(),
+                        child.content_identity
+                    ],
+                )
+                .map_err(|source| db_error(&self.paths.database(), source))?;
+            let (child_inode, kind, identity): (i64, String, String) = transaction
+                .query_row(
+                    "SELECT inode, kind, content_identity FROM remote_inodes
+                     WHERE parent_inode = ?1 AND name = ?2",
+                    params![inode, child.name],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|source| db_error(&self.paths.database(), source))?;
+            if kind != child.kind.as_str() || identity != child.content_identity {
+                return Err(stale_path(
+                    &self.paths.database(),
+                    format!("remote identity changed for inode {inode}/{}", child.name),
+                ));
+            }
+            materialized.push(MaterializedInode {
+                inode: u64::try_from(child_inode).map_err(|_| {
+                    stale_path(&self.paths.database(), "stored inode is negative".into())
+                })?,
+                name: child.name.clone(),
+            });
+        }
+        let stored_children: i64 = transaction
+            .query_row(
+                "SELECT count(*) FROM remote_inodes WHERE parent_inode = ?1",
+                [inode],
+                |row| row.get(0),
+            )
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        if usize::try_from(stored_children).ok() != Some(children.len()) {
+            return Err(stale_path(
+                &self.paths.database(),
+                format!("remote child set changed for directory inode {inode}"),
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO remote_directory_materializations(inode, directory_digest)
+                 VALUES (?1, ?2) ON CONFLICT(inode) DO NOTHING",
+                params![inode, digest.to_string()],
+            )
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        transaction
+            .commit()
+            .map_err(|source| db_error(&self.paths.database(), source))?;
+        Ok(materialized)
     }
 }
 
@@ -643,6 +853,32 @@ fn migrate(connection: &Connection, path: &Path) -> Result<(), StateError> {
             );
             PRAGMA user_version = 1; COMMIT;").map_err(|source| db_error(path, source))?;
     }
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(|source| db_error(path, source))?;
+    if version == 1 {
+        connection
+            .execute_batch(
+                "BEGIN;
+             CREATE TABLE remote_inodes (
+               inode INTEGER PRIMARY KEY AUTOINCREMENT,
+               parent_inode INTEGER REFERENCES remote_inodes(inode),
+               name TEXT NOT NULL,
+               kind TEXT NOT NULL CHECK (kind IN ('file','directory','symlink')),
+               content_identity TEXT NOT NULL,
+               UNIQUE(parent_inode, name),
+               CHECK ((inode = 1 AND parent_inode IS NULL AND name = '') OR
+                      (inode > 1 AND parent_inode IS NOT NULL AND length(name) > 0))
+             );
+             CREATE TABLE remote_directory_materializations (
+               inode INTEGER PRIMARY KEY REFERENCES remote_inodes(inode),
+               directory_digest TEXT NOT NULL
+             );
+             PRAGMA user_version = 2;
+             COMMIT;",
+            )
+            .map_err(|source| db_error(path, source))?;
+    }
     Ok(())
 }
 
@@ -654,6 +890,16 @@ fn insert_metadata(
 ) -> Result<(), StateError> {
     let (seconds, nanos) = now_parts()?;
     connection.execute("INSERT INTO session_metadata VALUES (1, ?1, ?2, 'initializing', ?3, ?4, ?5, ?6, ?7, NULL, NULL)", params![session_id, i64::from(startup.daemon_pid), startup.root_digest.hash(), startup.root_digest.size_bytes(), startup.mountpoint.to_string_lossy(), seconds, nanos])
+        .map_err(|source| db_error(path, source))?;
+    connection
+        .execute(
+            "INSERT INTO remote_inodes(inode, parent_inode, name, kind, content_identity)
+             VALUES (?1, NULL, '', 'directory', ?2)",
+            params![
+                i64::try_from(ROOT_INODE).expect("root inode fits i64"),
+                startup.root_digest.to_string()
+            ],
+        )
         .map_err(|source| db_error(path, source))?;
     Ok(())
 }
@@ -888,5 +1134,54 @@ mod tests {
         let result = SessionStore::create(paths, startup);
 
         assert!(matches!(result, Err(StateError::StaleSession { .. })));
+    }
+
+    #[test]
+    fn remote_materialization_allocates_stable_inodes_and_rejects_identity_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let mountpoint = temp.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let root = Digest::for_bytes(b"root directory");
+        let store =
+            SessionStore::create(paths, SessionStartup::new(root.clone(), mountpoint)).unwrap();
+        let filesystem = store.filesystem_state();
+        let children = vec![
+            RemoteNodeIdentity {
+                name: "child".into(),
+                kind: RemoteNodeKind::Directory,
+                content_identity: Digest::for_bytes(b"child directory").to_string(),
+            },
+            RemoteNodeIdentity {
+                name: "file".into(),
+                kind: RemoteNodeKind::File,
+                content_identity: Digest::for_bytes(b"file").to_string(),
+            },
+        ];
+
+        let first = filesystem
+            .materialize_remote_directory(ROOT_INODE, &root, &children)
+            .unwrap();
+        let second = filesystem
+            .materialize_remote_directory(ROOT_INODE, &root, &children)
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(first.iter().all(|entry| entry.inode > ROOT_INODE));
+        assert!(matches!(
+            filesystem.materialize_remote_directory(ROOT_INODE, &root, &children[..1]),
+            Err(StateError::StaleSession { .. })
+        ));
+
+        let changed = vec![RemoteNodeIdentity {
+            name: "file".into(),
+            kind: RemoteNodeKind::File,
+            content_identity: Digest::for_bytes(b"different file").to_string(),
+        }];
+        assert!(matches!(
+            filesystem.materialize_remote_directory(ROOT_INODE, &root, &changed),
+            Err(StateError::StaleSession { .. })
+        ));
+        drop(filesystem);
+        store.close_cleanly().unwrap();
     }
 }

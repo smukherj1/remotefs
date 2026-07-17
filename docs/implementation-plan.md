@@ -545,7 +545,7 @@ Definition of done:
 
 ## Phase 5: Read-Only Lazy Filesystem
 
-### Step 5.1: Filesystem Core Without FUSE
+### Step 5.1: Filesystem Core Without FUSE (Complete)
 
 Deliverables:
 
