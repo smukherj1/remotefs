@@ -3,7 +3,7 @@ use std::os::fd::AsRawFd;
 
 use rfs_common::config::Config;
 use rfs_common::digest::Digest;
-use rfs_common::state::{SessionStartup, open_daemon, open_reader};
+use rfs_common::state::{SessionLifecycle, SessionStartup, open_daemon, open_reader};
 
 #[test]
 fn closed_session_is_replaced_but_cache_is_retained() {
@@ -89,7 +89,7 @@ fn reader_is_read_only_and_does_not_hold_daemon_lock() {
     })
     .unwrap();
     let session = reader.session().unwrap().unwrap();
-    assert_eq!(session.state, "closed");
+    assert_eq!(session.state, SessionLifecycle::Closed);
     assert_eq!(fs::read(&database).unwrap(), before);
 
     let lock = fs::OpenOptions::new()

@@ -25,6 +25,8 @@ pub(crate) enum ControlError {
     Transport(#[from] tonic::transport::Error),
     #[error("close daemon state: {0}")]
     State(#[from] StateError),
+    #[error("access daemon state during control-service teardown: state lock is poisoned")]
+    StateLockPoisoned,
 }
 
 #[derive(Clone)]
@@ -155,7 +157,11 @@ pub(crate) async fn serve(state: Box<dyn DaemonState>) -> Result<(), ControlErro
         .add_service(protocol::control_server::ControlServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await;
-    if let Some(state) = state.lock().expect("daemon state lock is poisoned").take() {
+    let remaining_state = state
+        .lock()
+        .map_err(|_| ControlError::StateLockPoisoned)?
+        .take();
+    if let Some(state) = remaining_state {
         state.close()?;
     }
     if let Err(source) = tokio::fs::remove_file(&socket).await

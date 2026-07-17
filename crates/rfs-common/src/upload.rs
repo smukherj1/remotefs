@@ -194,6 +194,9 @@ pub enum UploadError {
     /// Caller-provided options or pipeline invariants were invalid.
     #[error("Invalid upload option `{name}`: {reason}")]
     InvalidOption { name: &'static str, reason: String },
+    /// The blob store reported a missing digest that was not requested.
+    #[error("Blob store reported unrequested missing digest {digest}")]
+    UnexpectedMissingDigest { digest: Digest },
     /// Additional operation context attached while preserving the source error.
     #[error("{operation}: {source}")]
     Context {
@@ -265,7 +268,7 @@ pub(crate) async fn hash_files(
     validate_options(options)?;
     let semaphore = Arc::new(Semaphore::new(options.hash_workers));
     let chunk_bytes = hash_chunk_bytes(options);
-    let mut tasks = Vec::new();
+    let mut tasks = Vec::with_capacity(files.len());
 
     for file in files {
         let file = file.clone();
@@ -278,19 +281,27 @@ pub(crate) async fn hash_files(
                     name: "hash_workers",
                     reason: "worker semaphore closed unexpectedly".to_string(),
                 })?;
-        tasks.push(tokio::task::spawn_blocking(move || {
+        let relative_path = file.relative_path.clone();
+        let task = tokio::task::spawn_blocking(move || {
             let result = hash_file(&file, chunk_bytes);
             drop(permit);
             result
-        }));
+        });
+        tasks.push((relative_path, task));
     }
 
     let mut digests = Vec::with_capacity(tasks.len());
-    for task in tasks {
-        digests.push(task.await.map_err(|source| UploadError::InvalidOption {
+    for (relative_path, task) in tasks {
+        let digest = task.await.map_err(|source| UploadError::InvalidOption {
             name: "hash_workers",
-            reason: format!("hash worker panicked: {source}"),
-        })??);
+            reason: format!(
+                "hash worker for {} did not complete: {source}",
+                relative_path.display()
+            ),
+        })?;
+        digests.push(digest.with_context(|| {
+            format!("hash file {} in blocking worker", relative_path.display())
+        })?);
     }
     digests.sort_by(|left, right| {
         left.relative_path
@@ -387,8 +398,14 @@ async fn upload_encoded_tree<S: BlobStore + Send>(
         .with_context(|| format!("check {} unique CAS digest(s) for upload", digests.len()))?;
     let missing_sources = missing
         .iter()
-        .filter_map(|digest| sources_by_digest.get(digest).cloned())
-        .collect::<Vec<_>>();
+        .map(|digest| {
+            sources_by_digest.get(digest).cloned().ok_or_else(|| {
+                UploadError::UnexpectedMissingDigest {
+                    digest: digest.clone(),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let stats = store
         .upload_blobs(missing_sources)
         .await
@@ -790,6 +807,7 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         missing: HashSet<Digest>,
+        unexpected_missing: Option<Digest>,
         uploaded: Vec<Blob>,
     }
 
@@ -799,11 +817,13 @@ mod tests {
             &mut self,
             digests: &[Digest],
         ) -> Result<Vec<Digest>, CasError> {
-            Ok(digests
+            let mut missing = digests
                 .iter()
                 .filter(|digest| self.missing.contains(*digest))
                 .cloned()
-                .collect())
+                .collect::<Vec<_>>();
+            missing.extend(self.unexpected_missing.clone());
+            Ok(missing)
         }
 
         async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
@@ -937,6 +957,7 @@ mod tests {
             .collect::<HashSet<_>>();
         let mut store = FakeStore {
             missing,
+            unexpected_missing: None,
             uploaded: Vec::new(),
         };
 
@@ -949,5 +970,28 @@ mod tests {
         assert_eq!(summary.uploaded_blobs, 2);
         assert_eq!(summary.reused_blobs, 0);
         assert_eq!(store.uploaded.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_unrequested_missing_digest() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("file.txt"), b"hello").unwrap();
+        let unexpected = Digest::for_bytes(b"not requested");
+        let mut store = FakeStore {
+            missing: HashSet::new(),
+            unexpected_missing: Some(unexpected.clone()),
+            uploaded: Vec::new(),
+        };
+
+        let error = upload_local_directory(&mut store, temp.path(), UploadOptions::default())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            UploadError::Context { source, .. }
+                if matches!(source.as_ref(), UploadError::UnexpectedMissingDigest { digest } if digest == &unexpected)
+        ));
+        assert!(store.uploaded.is_empty());
     }
 }

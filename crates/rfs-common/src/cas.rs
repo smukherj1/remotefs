@@ -212,6 +212,12 @@ pub enum CasError {
         #[source]
         source: DigestError,
     },
+    #[error("CAS response for {operation} contained an invalid digest: {source}")]
+    InvalidResponseDigest {
+        operation: CasOperation,
+        #[source]
+        source: DigestError,
+    },
     #[error("CAS filesystem error during {operation} at {path}: {source}")]
     Io {
         operation: CasOperation,
@@ -396,15 +402,10 @@ impl CasClient {
             })?
             .into_inner();
 
-        response
-            .missing_blob_digests
-            .iter()
-            .map(Digest::from_reapi)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| CasError::Verification {
-                digest: Digest::for_bytes(&[]),
-                source,
-            })
+        parse_response_digests(
+            CasOperation::FindMissingBlobs,
+            &response.missing_blob_digests,
+        )
     }
 
     /// Uploads caller-selected blobs to the CAS.
@@ -533,17 +534,8 @@ impl CasClient {
             instance_name: self.config.instance_name.clone(),
             requests: batch
                 .iter()
-                .map(|blob| batch_update_blobs_request::Request {
-                    digest: Some(blob.digest.to_reapi()),
-                    data: match &blob.contents {
-                        BlobContents::Bytes(data) => data.to_vec(),
-                        BlobContents::FilePath(_) => {
-                            unreachable!("BatchUpdateBlobs batches contain byte-backed blobs")
-                        }
-                    },
-                    compressor: compressor::Value::Identity as i32,
-                })
-                .collect(),
+                .map(batch_update_request)
+                .collect::<Result<Vec<_>, _>>()?,
         };
         let response = self
             .retry_rpc(CasOperation::BatchUpdateBlobs, || {
@@ -757,6 +749,32 @@ impl CasClient {
             }
         }
     }
+}
+
+fn batch_update_request(blob: &Blob) -> Result<batch_update_blobs_request::Request, CasError> {
+    let BlobContents::Bytes(data) = &blob.contents else {
+        return Err(CasError::BlobStatus {
+            operation: CasOperation::BatchUpdateBlobs,
+            digest: blob.digest.clone(),
+            message: "batch construction requires byte-backed blob contents".to_string(),
+        });
+    };
+    Ok(batch_update_blobs_request::Request {
+        digest: Some(blob.digest.to_reapi()),
+        data: data.to_vec(),
+        compressor: compressor::Value::Identity as i32,
+    })
+}
+
+fn parse_response_digests(
+    operation: CasOperation,
+    digests: &[crate::reapi::remote_execution::Digest],
+) -> Result<Vec<Digest>, CasError> {
+    digests
+        .iter()
+        .map(Digest::from_reapi)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| CasError::InvalidResponseDigest { operation, source })
 }
 
 // Materializes a blob for BatchUpdateBlobs and verifies that its current size
@@ -1171,6 +1189,42 @@ mod tests {
         assert!(matches!(
             verify_download(&digest, b"jello"),
             Err(CasError::Verification { .. })
+        ));
+    }
+
+    #[test]
+    fn response_digest_conversion_identifies_the_cas_operation() {
+        let error = parse_response_digests(
+            CasOperation::FindMissingBlobs,
+            &[crate::reapi::remote_execution::Digest {
+                hash: "invalid".to_string(),
+                size_bytes: 1,
+            }],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CasError::InvalidResponseDigest {
+                operation: CasOperation::FindMissingBlobs,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn batch_request_rejects_path_backed_blob_instead_of_panicking() {
+        let digest = valid_digest(1);
+        let error =
+            batch_update_request(&Blob::from_file_path(digest.clone(), "/tmp/blob")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CasError::BlobStatus {
+                operation: CasOperation::BatchUpdateBlobs,
+                digest: actual,
+                ..
+            } if actual == digest
         ));
     }
 

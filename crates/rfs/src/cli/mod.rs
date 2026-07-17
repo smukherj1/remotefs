@@ -253,10 +253,10 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-async fn daemon_client(reader: &dyn SessionStateReader) -> Result<DaemonClient, CliError> {
-    DaemonClient::connect(ControlEndpoint(reader.control_endpoint()))
-        .await
-        .map_err(client_error)
+async fn daemon_client(
+    reader: &dyn SessionStateReader,
+) -> Result<DaemonClient, crate::daemon_client::ClientError> {
+    DaemonClient::connect(ControlEndpoint(reader.control_endpoint())).await
 }
 
 async fn run_status(
@@ -264,12 +264,18 @@ async fn run_status(
     supplied: Option<&Path>,
     json: bool,
 ) -> Result<(), CliError> {
-    if let Ok(mut client) = daemon_client(reader).await
-        && let Ok(status) = client.status().await
-    {
-        validate_supplied_mountpoint(supplied, &status.mountpoint)?;
-        render_active_status(status, json);
-        return Ok(());
+    match daemon_client(reader).await {
+        Ok(mut client) => match client.status().await {
+            Ok(status) => {
+                validate_supplied_mountpoint(supplied, &status.mountpoint)?;
+                render_active_status(status, json);
+                return Ok(());
+            }
+            Err(error) if error.is_unavailable() => {}
+            Err(error) => return Err(client_error(error)),
+        },
+        Err(error) if error.is_unavailable() => {}
+        Err(error) => return Err(client_error(error)),
     }
     match reader.session().map_err(state_error)? {
         None => {
@@ -331,7 +337,7 @@ async fn run_unmount(
     reader: &dyn SessionStateReader,
     supplied: Option<&Path>,
 ) -> Result<(), CliError> {
-    let mut client = daemon_client(reader).await?;
+    let mut client = daemon_client(reader).await.map_err(client_error)?;
     let status = client.status().await.map_err(client_error)?;
     validate_supplied_mountpoint(supplied, &status.mountpoint)?;
     let mountpoint = status.mountpoint;

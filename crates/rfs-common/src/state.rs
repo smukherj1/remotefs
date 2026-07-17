@@ -1,5 +1,6 @@
 //! Durable local state and exclusive foreground-session ownership.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -35,12 +36,52 @@ pub enum StateError {
         #[source]
         source: std::io::Error,
     },
-    #[error("SQLite operation on `{path}` failed: {message}")]
-    Database { path: PathBuf, message: String },
+    #[error("SQLite operation on `{path}` failed: {source}")]
+    Database {
+        path: PathBuf,
+        #[source]
+        source: rusqlite::Error,
+    },
     #[error("mountpoint `{path}` must be an existing directory")]
     InvalidMountpoint { path: PathBuf },
     #[error("system time is outside the supported timestamp range")]
     InvalidSystemTime,
+}
+
+/// Closed set of durable session lifecycle states stored in SQLite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionLifecycle {
+    /// Session metadata exists but startup has not completed.
+    Initializing,
+    /// The daemon owns the session and accepts control requests.
+    Active,
+    /// The daemon completed a clean, inspectable shutdown.
+    Closed,
+}
+
+impl SessionLifecycle {
+    fn parse(value: &str, path: &Path) -> Result<Self, StateError> {
+        match value {
+            "initializing" => Ok(Self::Initializing),
+            "active" => Ok(Self::Active),
+            "closed" => Ok(Self::Closed),
+            _ => Err(stale_path(
+                path,
+                format!("unknown session lifecycle state `{value}`"),
+            )),
+        }
+    }
+}
+
+impl fmt::Display for SessionLifecycle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Initializing => "initializing",
+            Self::Active => "active",
+            Self::Closed => "closed",
+        })
+    }
 }
 
 /// Canonical `RFS_HOME` and its fixed descendants.
@@ -158,12 +199,16 @@ impl StatePaths {
 
 #[derive(Debug, Clone)]
 pub struct SessionStartup {
+    /// Root digest fixed for the lifetime of the daemon session.
     pub root_digest: Digest,
+    /// Existing mountpoint directory; canonicalized during state creation.
     pub mountpoint: PathBuf,
+    /// Process identifier recorded in session and lock metadata.
     pub daemon_pid: u32,
 }
 
 impl SessionStartup {
+    /// Creates startup metadata for the current process.
     pub fn new(root_digest: Digest, mountpoint: PathBuf) -> Self {
         Self {
             root_digest,
@@ -194,7 +239,7 @@ struct SessionMetadata {
     /// Process identifier recorded when the session was created.
     pub daemon_pid: u32,
     /// Current durable session lifecycle state.
-    pub state: String,
+    pub state: SessionLifecycle,
     /// Root digest mounted by the session.
     pub root_digest: Digest,
     /// Canonical mountpoint owned by the session.
@@ -207,7 +252,7 @@ pub struct SessionView {
     /// Process identifier recorded when the session was created.
     pub daemon_pid: u32,
     /// Current durable lifecycle state.
-    pub state: String,
+    pub state: SessionLifecycle,
     /// Root digest mounted by the session.
     pub root_digest: Digest,
     /// Canonical mountpoint owned by the session.
@@ -443,6 +488,7 @@ fn read_session_metadata(
         .map_err(|source| db_error(path, source))?;
     let daemon_pid =
         u32::try_from(pid).map_err(|_| stale_path(path, "invalid daemon pid".into()))?;
+    let state = SessionLifecycle::parse(&state, path)?;
     let digest_text = format!("sha256:{hash}/{size}");
     let root_digest = digest_text
         .parse()
@@ -546,7 +592,7 @@ fn validate_closed_session(paths: &StatePaths) -> Result<(), StateError> {
             "lock and database session identity do not match".into(),
         ));
     }
-    if metadata.state != "closed"
+    if SessionLifecycle::parse(&metadata.state, &paths.database())? != SessionLifecycle::Closed
         || metadata.closed_at_seconds.is_none()
         || metadata.closed_at_nanos.is_none()
     {
@@ -751,7 +797,7 @@ fn fs_error(path: &Path, source: std::io::Error) -> StateError {
 fn db_error(path: &Path, source: rusqlite::Error) -> StateError {
     StateError::Database {
         path: path.to_path_buf(),
-        message: source.to_string(),
+        source,
     }
 }
 

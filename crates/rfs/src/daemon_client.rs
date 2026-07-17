@@ -27,15 +27,25 @@ pub struct DaemonIdentity {
 /// Domain status returned by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStatus {
+    /// Root digest fixed when the daemon session started.
     pub root_digest: Digest,
+    /// Canonical mountpoint owned by the daemon.
     pub mountpoint: PathBuf,
+    /// Process identifier reported by the daemon.
     pub daemon_pid: u32,
+    /// Unix socket used for control requests.
     pub control_socket: PathBuf,
+    /// Shared local cache path.
     pub cache_path: PathBuf,
+    /// Active session state path.
     pub session_path: PathBuf,
+    /// Whether the mounted workspace has unsnapshotted changes.
     pub dirty: bool,
+    /// Number of dirty files in the mounted workspace.
     pub dirty_files: u64,
+    /// Number of blobs currently present in the local cache.
     pub cached_blobs: u64,
+    /// Conditions that currently prevent snapshot creation.
     pub snapshot_blockers: Vec<String>,
 }
 
@@ -61,6 +71,21 @@ impl ClientError {
             Self::Remote { code, .. } => code,
             Self::InvalidResponse { .. } => "daemon_invalid_response",
         }
+    }
+
+    /// Returns whether the daemon endpoint could not be reached.
+    ///
+    /// Callers may use this to fall back to retained state. Protocol and
+    /// request failures must still be surfaced because a daemon did answer.
+    pub fn is_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Connect { .. }
+                | Self::Remote {
+                    code: "daemon_unavailable",
+                    ..
+                }
+        )
     }
 }
 
@@ -193,5 +218,42 @@ fn remote_error(status: tonic::Status) -> ClientError {
             _ => "daemon_error",
         },
         message: status.message().to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_connection_failures_allow_retained_state_fallback() {
+        assert!(
+            ClientError::Connect {
+                endpoint: "/tmp/control.sock".into(),
+                message: "refused".to_string(),
+            }
+            .is_unavailable()
+        );
+        assert!(
+            ClientError::Remote {
+                code: "daemon_unavailable",
+                message: "stopped".to_string(),
+            }
+            .is_unavailable()
+        );
+        assert!(
+            !ClientError::IncompatibleProtocol {
+                expected: 1,
+                actual: 2,
+            }
+            .is_unavailable()
+        );
+        assert!(
+            !ClientError::Remote {
+                code: "daemon_precondition",
+                message: "invalid state".to_string(),
+            }
+            .is_unavailable()
+        );
     }
 }
