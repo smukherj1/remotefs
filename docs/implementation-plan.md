@@ -35,7 +35,8 @@ The intended implementation order is:
 - `--instance-name` is required and non-empty for CAS and ByteStream requests.
 - `--cas-url` requires an explicit URI scheme. MVP supports `grpc://`; `grpcs://` is deferred.
 - The default local CAS for development and evaluation is `bazel-remote`; Buildbarn remains a documented secondary compatibility target until the main REAPI path is stable.
-- SQLite state uses `rusqlite` in daemon-owned blocking sections.
+- SQLite state uses `rusqlite` behind a daemon-owned state worker; SQLite row
+  translation and validation remain private to `rfs-common::state`.
 - Generated Rust proto code is produced during build from checked-in pinned proto sources under `third_party/remote-apis/`.
 - Process exit codes are simple: `0` for success and `1` for any error.
 - Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence. Unrecoverable state is left untouched with guidance to delete `RFS_HOME` manually; there is no cleanup command in the MVP.
@@ -405,7 +406,8 @@ Definition of done:
 
 The original public store, cleanup command, and stale-state recovery contract in
 this historical step are superseded by the capability API and conservative
-manual-deletion policy in step 4.3.
+manual-deletion policy in step 4.3. Its direct SQLite implementation is
+superseded by the `rusqlite` storage refactor in step 5.3.
 
 Deliverables:
 
@@ -424,7 +426,10 @@ Deliverables:
 - Preserve `RFS_HOME/active/` after clean unmount for inspection.
 - Automatically replace a valid cleanly closed `active/` on the next daemon startup while retaining the cache. Require explicit cleanup for unclean, partial, malformed, or unsupported session state.
 - Implement `rfs cleanup` as a guarded full reset: while holding `active.lock`, remove `active/` and `cache/`, then remove the lock last and leave `RFS_HOME` empty. Refuse unknown top-level content and possible live ownership.
-- Add a rollback-journal SQLite schema migration containing only session metadata and `initializing`, `active`, and `closed` lifecycle states. Defer inode, remote-directory, overlay-index, and counter tables until their first consumers.
+- Add migrations for a rollback-journal SQLite database, initially containing
+  only `session_metadata` and the `initializing`, `active`, and `closed`
+  lifecycle states. Defer inode and directory-materialization tables until
+  their first consumers.
 - Validate the root digest and require/canonicalize an existing mountpoint directory before creating session state.
 - Validate only fixed top-level and active-layout entries; never traverse cache shards or overlay data during startup. Create private files/directories and reject unsafe ownership, permissions, symlinks, and wrong entry types.
 - Wire the state owner into foreground `rfsd`; keep background daemon launch for the mount/FUSE step.
@@ -510,9 +515,9 @@ Deliverables:
   only a digest or structured bootstrap error.
 - Expose `SessionStateReader` and `DaemonState` trait objects from the
   `rfs-common::state` module.
-  Keep SQLite connections, SQL, migrations, and concrete stores private. Open
-  readers read-only without file creation, migration, lock acquisition, or state
-  mutation.
+  Keep database implementation types, connections, schema initialization, and
+  concrete stores private. Open readers read-only, without file creation,
+  schema initialization, lock acquisition, or state mutation.
 - Move the daemon service and teardown coordination into the `rfsd` package. Expose
   a concrete command-oriented client whose API contains no generated messages,
   tonic clients, or daemon types.
@@ -556,7 +561,10 @@ Deliverables:
   - Resolve lookup and readdir from remote tree metadata.
   - Read symlink targets.
   - Fetch file blobs on first read through the verified blob cache.
-- Add the first consumer-owned SQLite migrations for session-stable inodes and remote-directory materialization, including their allocation and identity invariants.
+- Add the consumer-owned SQLite migrations for session-stable inodes and remote
+  directory materialization, including their allocation, relation, and identity
+  invariants. Step 5.3 later consolidates table definitions into an embedded
+  SQL schema and moves domain validation into Rust.
 - Keep this layer independent of `fuser`.
 
 Task targets:
@@ -622,13 +630,77 @@ Definition of done:
 - Milestone 1 from the technical design works end-to-end:
   `local dir -> rfs upload -> CAS -> rfs mount -> lazy read -> remount same root`.
 
+### Step 5.3: `rusqlite` State Persistence Refactor (Complete)
+
+Deliverables:
+
+- Use direct `rusqlite` access in the private state storage layer.
+- Add private `state/schema.sql` as the source of table definitions. Embed it
+  into the state module with `include_str!` and execute its idempotent
+  `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` statements when
+  writable daemon state opens.
+- Consolidate the completed session, inode, and directory-materialization schema
+  with the planned overlay fields into one baseline SQL schema. Completed
+  steps 4.1 and 5.1 no longer own table definitions, and Phase 6 consumes the
+  existing tables without defining new ones.
+- Express indexes and foreign-key constraints in SQL. Keep lifecycle, digest,
+  timestamp, boolean, inode-shape, kind-specific field, path, and clean-close
+  validation in pure Rust row translation in the state layer; do not add SQL
+  `CHECK` constraints for domain rules.
+- Run one writable `rusqlite::Connection` on one daemon-owned state worker.
+  Preserve synchronous
+  `SessionStateReader`, `DaemonState`, and `FilesystemState` capabilities using
+  typed worker commands.
+- Open retained state with a read-only `rusqlite` connection. It must not
+  create a database, initialize the schema, acquire the daemon lock, or mutate
+  state.
+- Preserve rollback-journal mode, foreign-key enforcement, transaction
+  boundaries, error identifiers, file permissions, lifecycle behavior, and the
+  conservative stale-state policy.
+- Remove SeaORM and `sea-orm-migration` after all state reads, writes, and tests
+  use the private `rusqlite` repository.
+
+Task targets:
+
+```sh
+task test:unit
+task test:integration:state
+task test:integration:readonly
+task test:e2e:readonly
+```
+
+Tests:
+
+- Unit: embedded-schema tests cover every documented table, field, index, and
+  foreign key and verify that domain `CHECK` constraints are absent.
+- Unit: schema initialization is idempotent and rejects a database newer than
+  the supported `user_version`.
+- Unit: lifecycle and closed-time invariants fail in Rust with database-path
+  and invariant context.
+- Integration: create, reopen read-only, activate, materialize a directory,
+  close, and inspect a `rusqlite`-backed session.
+- Integration: read-only inspection does not create files or change database
+  bytes.
+- Integration: concurrent filesystem-state commands preserve stable inode
+  allocation and transaction atomicity through the single state worker.
+- E2E: the completed read-only mount workflow behaves identically after the
+  persistence refactor.
+
+Definition of done:
+
+- `rg 'sea-orm|sea_orm' crates/rfs-common Cargo.toml` returns no dependency or
+  state implementation use, all state capabilities retain their existing
+  domain API, the embedded schema matches the technical-design table inventory,
+  and completed read-only behavior has no regressions.
+
 ## Phase 6: Writable Copy-On-Write
 
 ### Step 6.1: Overlay Index and Merged View
 
 Deliverables:
 
-- Add the consumer-owned SQLite schema for overlay entries:
+- Use the overlay fields already defined on the central SQLite `inodes` table
+  for:
   - New files and directories.
   - Copied-up remote files.
   - Tombstones.
@@ -765,7 +837,8 @@ Definition of done:
 Deliverables:
 
 - Implement full-workspace snapshot from merged overlay state.
-- Open a short SQLite read transaction after the snapshot barrier passes to read a consistent overlay graph.
+- Open a short SQLite read transaction after the snapshot barrier passes to
+  read a consistent overlay graph.
 - Feed merged overlay entries into the shared tree encoder; keep overlay traversal separate from local filesystem upload traversal.
 - Reuse unchanged remote blob and subtree digests.
 - Hash dirty/new files at snapshot time.
@@ -859,7 +932,8 @@ Deliverables:
 - Write daemon logs to `RFS_HOME/active/rfsd.log`.
 - Use compact human-readable text output and logs by default and JSON summaries plus JSON Lines logs when `--output-format json` is selected.
 - Apply `--log-level` and `--output-format` to both `rfs` and any spawned `rfsd`.
-- Store effective daemon log level and format in SQLite session metadata for `rfs status`.
+- Store effective daemon log level and format in the SQLite
+  `session_metadata` table for `rfs status`.
 - Preserve the session log file with `RFS_HOME/active` until the next mount replaces a clean session or the user manually removes `RFS_HOME`; no log rotation in the MVP.
 - Include timestamp, level, target/module, session id, operation, path/digest where relevant, and message in daemon log events.
 
@@ -994,16 +1068,18 @@ task eval:snapshot
 4. Add CAS client with blob upload/download/existence integration tests.
 5. Add canonical tree encoder/decoder.
 6. Add `rfs upload`.
-7. Add daemon state layout and SQLite migrations.
+7. Add daemon state layout and initial SQLite schema.
 8. Add gRPC/protobuf Unix control socket and `rfs status`.
 9. Add read-only filesystem core with fake CAS tests.
 10. Add read-only FUSE mount E2E.
-11. Add overlay index and merged view core.
-12. Add whole-file COW core.
-13. Add writable FUSE operations.
-14. Add snapshot core.
-15. Add `rfs snapshot` daemon control flow.
-16. Add observability, failure tests, and evaluation fixtures.
+11. Refactor state persistence to `rusqlite`, embed the complete SQL schema,
+    and centralize row translation and validation in Rust.
+12. Add overlay index and merged view core.
+13. Add whole-file COW core.
+14. Add writable FUSE operations.
+15. Add snapshot core.
+16. Add `rfs snapshot` daemon control flow.
+17. Add observability, failure tests, and evaluation fixtures.
 
 ## Deferred Choices
 

@@ -15,7 +15,7 @@ This document captures implementation and architecture decisions. Product scope 
 - Ship two binaries:
   - `rfs`: user-facing CLI.
   - `rfsd`: long-running mount daemon.
-- Use SQLite for durable session and overlay state.
+- Use SQLite through `rusqlite` for durable session and overlay state.
 - Allow at most one active mount session per `RFS_HOME`, coordinated by a stable `RFS_HOME/active.lock` outside the removable session tree.
 - Use one Unix control socket per active `RFS_HOME` session for CLI-to-daemon commands.
 - Use whole-file copy-on-write for remote-backed file mutations.
@@ -160,16 +160,37 @@ boundaries are modules: daemon-client and bootstrap-upload orchestration stay in
 `rfs`; the control service and filesystem stay in `rfsd`; shared protocol,
 state, CAS, tree, and lower-level upload mechanics stay in `rfs-common`.
 Generated protocol messages and tonic clients are confined to the client and
-service adapter modules and are not CLI command/result types. SQLite types do
-not escape the common state module.
+service adapter modules and are not CLI command/result types. `rusqlite` and
+SQLite row types do not escape the common state module.
 
 The `rfs-common::state` module exposes `SessionStateReader` and `DaemonState`
 trait objects.
 `open_reader` opens existing SQLite state read-only and never creates files,
-migrates, locks, or mutates lifecycle state. `open_daemon` owns validation,
-migration, locking, recoverable closed-session replacement, active-session
-creation, and explicit clean close. SQL, migrations, connections, and row models
-remain private.
+initializes schema, locks, or mutates lifecycle state. `open_daemon` owns
+validation, schema initialization and version checks, locking, recoverable
+closed-session replacement, active-session creation, and explicit clean close.
+SQL queries, connections, and row models remain private.
+
+The state module uses `rusqlite`. A private `state/schema.sql` file is the
+source of truth for table shape, primary keys, indexes, and foreign keys. It
+uses `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`, is embedded
+with `include_str!`, and is executed when the daemon opens writable state.
+SQLite's `user_version` records the supported schema version.
+
+SQL does not encode domain checks. The state module owns private Rust row
+decoders and validates lifecycle values, digests, timestamps, booleans, inode
+shape, node-kind field combinations, paths, and other domain invariants when
+writing or reading a row. Adding or changing a persisted field requires
+updating `schema.sql`, the corresponding Rust translation and validation, and
+tests in the same change.
+
+FUSE callbacks and the public state capabilities are synchronous. One
+daemon-owned state worker owns a single `rusqlite::Connection` and serializes
+database commands; capability methods send typed requests to that worker and
+wait for typed results. The daemon connection enables foreign keys and retains
+SQLite rollback-journal mode. The retained-session reader opens a separate
+read-only connection and never creates tables, changes schema version, locks,
+or mutates lifecycle state.
 
 Packages and substantial modules retain owner-specific structured errors. Common
 helpers attach operation context without erasing those errors. The daemon maps
@@ -227,6 +248,51 @@ Active session state is isolated under `RFS_HOME/active/`:
 Only one active session may exist for an `RFS_HOME` at a time. Clean unmount transactionally marks the session `closed`, then leaves `RFS_HOME/active/` in place for inspection. The next mount, while holding `active.lock`, automatically removes only a valid cleanly closed `active/` tree and preserves the shared cache. Unclean, partial, malformed, corrupt, or unsupported session state is left untouched and blocks startup with guidance to delete the configured `RFS_HOME` manually. The MVP has no cleanup command or automated partial repair path.
 
 Local cache eviction is deferred. The earliest MVP may provide manual pruning only. Remote CAS eviction is a deployment concern and must be disabled or capacity-provisioned during MVP evaluation.
+
+## State Database Schema
+
+`state/schema.sql` documents the durable tables and columns. Private Rust row
+translation in the state module documents and enforces their domain meaning.
+The durable domain tables are:
+
+| Table | Purpose |
+| --- | --- |
+| `session_metadata` | The single mount session and its lifecycle. |
+| `inodes` | The session-stable merged namespace, including remote, local, copied-up, and tombstoned entries. |
+| `directory_materializations` | Records which immutable remote directories have been fetched completely. |
+
+Fields are intentionally compact:
+
+| Table | Field | Meaning |
+| --- | --- | --- |
+| `session_metadata` | `singleton` | Primary key fixed to `1`. |
+|  | `session_id` | Non-empty UUID identifying this mount session. |
+|  | `daemon_pid` | Positive daemon process ID. |
+|  | `lifecycle` | `initializing`, `active`, or `closed`. |
+|  | `root_digest_hash`, `root_digest_size` | Validated SHA-256 root digest components. |
+|  | `mountpoint` | Canonical absolute mountpoint. |
+|  | `created_at_seconds`, `created_at_nanos` | Session creation time. |
+|  | `closed_at_seconds`, `closed_at_nanos` | Clean-close time; both are present only when closed. |
+|  | `log_level`, `log_format` | Effective daemon logging settings. |
+| `inodes` | `inode` | Synthetic primary key; root is always `1`. |
+|  | `parent_inode`, `name` | Parent and UTF-8 basename; unique together. Root alone has no parent and an empty name. |
+|  | `kind` | `file`, `directory`, or `symlink`. |
+|  | `remote_digest` | Original file or directory digest, when remote-backed. |
+|  | `symlink_target` | Exact target for a symlink; null for other kinds. |
+|  | `overlay_file` | Relative overlay data filename for local content; never an absolute path. |
+|  | `mode` | Preserved Unix permission and supported special bits. |
+|  | `mtime_seconds`, `mtime_nanos` | Signed mtime seconds and normalized nanoseconds. |
+|  | `tombstone` | Whether this entry hides the remote name. |
+|  | `content_dirty` | Whether file bytes must be hashed at snapshot. |
+|  | `tree_dirty` | Whether this inode or a descendant changes directory encoding. |
+| `directory_materializations` | `inode` | Primary/foreign key to a directory in `inodes`. |
+|  | `directory_digest` | Remote directory digest whose full child set was recorded. |
+Boolean and closed-set fields use typed Rust enums or booleans at the state
+module boundary, not ad hoc strings in state operations. Rust validation
+enforces digest, timestamp, lifecycle, root-inode, kind-specific nullable-field,
+and clean-close invariants on reads and writes. SQL indexes enforce inode name
+uniqueness and lookup performance; foreign keys enforce the inode tree and
+materialization ownership.
 
 ## FUSE Model
 
@@ -286,7 +352,8 @@ Verified cache entries are trusted by default after admission; the client does n
 
 ## Overlay Model
 
-The mount daemon maintains an explicit durable overlay index in SQLite.
+The mount daemon maintains an explicit durable overlay index in the SQLite
+`inodes` table.
 
 The overlay index tracks:
 
@@ -454,7 +521,8 @@ The later MVP observability work should extend this with:
 - Human-readable compact text logs by default.
 - JSON Lines logs and JSON command summaries via `--output-format json`; text logs and human command summaries via `--output-format text`.
 - `--log-level` and `--output-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.
-- Effective daemon log level and format are written into SQLite session metadata so `rfs status` can report them.
+- Effective daemon log level and format are written into the SQLite
+  `session_metadata` table so `rfs status` can report them.
 - No log rotation in the MVP.
 - `rfs status`.
 - `rfs status --output-format json`.
@@ -502,7 +570,7 @@ Scope:
 
 Scope:
 
-- SQLite overlay index.
+- `rusqlite`-backed SQLite overlay index.
 - Synthetic inode stability.
 - Create/write/delete/rename.
 - Whole-file COW.

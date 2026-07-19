@@ -3,6 +3,7 @@ use std::os::fd::AsRawFd;
 
 use rfs_common::config::Config;
 use rfs_common::digest::Digest;
+use rfs_common::state::{ROOT_INODE, RemoteNodeIdentity, RemoteNodeKind};
 use rfs_common::state::{SessionLifecycle, SessionStartup, open_daemon, open_reader};
 
 #[test]
@@ -103,4 +104,53 @@ fn reader_is_read_only_and_does_not_hold_daemon_lock() {
         "read-only state unexpectedly acquired daemon lock"
     );
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+}
+
+#[test]
+fn concurrent_filesystem_commands_share_stable_atomic_allocations() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let mountpoint = temp.path().join("mount");
+    fs::create_dir(&mountpoint).unwrap();
+    let root = Digest::for_bytes(b"root");
+    let daemon = open_daemon(
+        Config { rfs_home: home },
+        SessionStartup::new(root.clone(), mountpoint),
+    )
+    .unwrap();
+    let filesystem = daemon.filesystem_state();
+    let children = vec![
+        RemoteNodeIdentity {
+            name: "directory".into(),
+            kind: RemoteNodeKind::Directory,
+            content_identity: Digest::for_bytes(b"directory").to_string(),
+        },
+        RemoteNodeIdentity {
+            name: "file".into(),
+            kind: RemoteNodeKind::File,
+            content_identity: Digest::for_bytes(b"file").to_string(),
+        },
+    ];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let filesystem = filesystem.clone();
+        let root = root.clone();
+        let children = children.clone();
+        let barrier = barrier.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            filesystem
+                .materialize_remote_directory(ROOT_INODE, &root, &children)
+                .unwrap()
+        }));
+    }
+    barrier.wait();
+    let allocations = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .collect::<Vec<_>>();
+    assert!(allocations.windows(2).all(|window| window[0] == window[1]));
+    drop(filesystem);
+    daemon.close().unwrap();
 }

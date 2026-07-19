@@ -11,7 +11,7 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 
 - Follow project and language rules when they conflict with this skill; report the tradeoff.
 - Before editing, identify operation boundaries, invariants, edge cases, and error identifiers. Inspect affected adjacent code, not only added lines.
-- Before handoff, audit the full diff and every changed function against all sections. Resolve violations or justify safer, clearer exceptions.
+- Before handoff, audit the full diff, each changed source file's item order, and every changed function against all sections. Resolve violations or justify safer, clearer exceptions.
 - State audit completion and exceptions in the final response.
 - In reviews, report supported findings with location, impact, and remediation; omit unsupported style preferences.
 
@@ -23,6 +23,7 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 
 ## Structure
 
+- Keep one contiguous public API section at the top of each source file, followed by private implementation items; do not resume public declarations after private ones.
 - Give each function one operation or decision; use early returns to expose the main path.
 - Extract branches that form distinct workflows or obscure control flow.
 - Keep orchestration at one abstraction level: named phases, not phase internals.
@@ -55,7 +56,7 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 
 ## Documentation
 
-- Document public methods, types, fields, proto methods, and requests: inputs, outputs, errors, preconditions, and side effects.
+- Document methods, types, fields, proto methods, db tables and columns, and requests: inputs, outputs, errors, preconditions, and side effects.
 - Introduce non-trivial modules and workflows with purpose, phase order, and guarantees.
 - Document hidden contracts: invariants, rationale, protocol constraints, edge cases, and tradeoffs.
 - Cover applicable filesystem and concurrency behavior: symlinks, unsupported nodes, mutation races, ordering, partial failure, cancellation, and retries.
