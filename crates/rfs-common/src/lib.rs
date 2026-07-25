@@ -8,7 +8,7 @@ pub mod digest;
 pub mod error_context;
 pub mod logging;
 pub mod reapi;
-pub mod state;
+pub mod session;
 pub mod tree;
 pub mod upload;
 

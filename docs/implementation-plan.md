@@ -35,8 +35,9 @@ The intended implementation order is:
 - `--instance-name` is required and non-empty for CAS and ByteStream requests.
 - `--cas-url` requires an explicit URI scheme. MVP supports `grpc://`; `grpcs://` is deferred.
 - The default local CAS for development and evaluation is `bazel-remote`; Buildbarn remains a documented secondary compatibility target until the main REAPI path is stable.
-- SQLite state uses `rusqlite` behind a daemon-owned state worker; SQLite row
-  translation and validation remain private to `rfs-common::state`.
+- SQLite state uses `rusqlite` behind a mutex-protected `SessionStore`
+  connection; SQLite row translation and validation remain private to
+  `rfs_common::session`.
 - Generated Rust proto code is produced during build from checked-in pinned proto sources under `third_party/remote-apis/`.
 - Process exit codes are simple: `0` for success and `1` for any error.
 - Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence. Unrecoverable state is left untouched with guidance to delete `RFS_HOME` manually; there is no cleanup command in the MVP.
@@ -692,6 +693,83 @@ Definition of done:
   state implementation use, all state capabilities retain their existing
   domain API, the embedded schema matches the technical-design table inventory,
   and completed read-only behavior has no regressions.
+
+### Step 5.4: Concrete Session Facade and Streaming Cache (Complete)
+
+This step supersedes the internal trait/worker/cache architecture left by the
+completed historical steps without changing the read-only command surface.
+`docs/state-module-simplification.md` is the detailed design handoff.
+
+Deliverables:
+
+- Rename the common facade module to `rfs_common::session` and introduce one
+  concrete, synchronous `Session`.
+- Split private ownership into `BlobCache` and `ActiveSession`, with
+  `ActiveSession` privately owning `SessionStore` and `OverlayStore`. Do not
+  expose child accessors.
+- Replace the database worker, command enum, channels, capability traits, trait
+  objects, and forwarding stores with one mutex-protected
+  `rusqlite::Connection` and focused transactionally complete store methods.
+- Introduce the agreed boundary types: `InodeId`, shared `NodeKind`, `NodeTime`,
+  `Node`, `RemoteChild`, `RemoteContent`, lazy lookup/read outcomes,
+  `BlobDownloader`, and the opaque write-only `BlobWriter`.
+- Make SQLite authoritative for visible nodes. Remove daemon inode and decoded
+  directory maps; lazily materialize complete remote child sets atomically and
+  idempotently through `Session`.
+- Unify file data and serialized REAPI directories under
+  `cache/blobs/<shard>/<hash>-<size>`. Ignore obsolete development
+  `cache/dirs` data; no migration support for existing development state is
+  required.
+- Keep every `Session` and `FilesystemService` operation synchronous.
+  `FilesystemService` remains in `rfsd`, owns the CAS and REAPI orchestration,
+  and uses a keyed map only to deduplicate in-progress remote downloads.
+- Add `BlobStore::stream_blob`; implement `download_blob` as a collecting
+  convenience over it. Stream large downloads into a shard-local
+  `BlobWriter`, then verify, sync, and atomically admit them through
+  `Session::finalize_blob`.
+- Use one contextual `SessionError` throughout the private local hierarchy.
+  Keep CAS, REAPI decoding, and remote orchestration errors owned by
+  `FilesystemService`.
+- Compose live daemon status from `Session::info` plus daemon telemetry and
+  feature state. Keep control-endpoint discovery separate from one-shot
+  retained inspection.
+
+Task targets:
+
+```sh
+task test:unit
+task test:integration:state
+task test:integration:readonly
+task test:e2e:readonly
+```
+
+Tests:
+
+- Unit: SQLite lookup, listing, and materialization return stable `Node` values
+  without an in-memory namespace map.
+- Unit: mode and mtime absence remain durable while `Node` exposes the agreed
+  effective defaults.
+- Unit: `BlobWriter` streams without seeking, rejects excess size, verifies
+  size and SHA-256, removes unfinished temporaries, and admits with atomic
+  no-clobber behavior.
+- Unit: concurrent missing reads cause one remote stream through the
+  service-owned per-digest lock.
+- Unit: complete directory objects use `read_blob`; large file content uses
+  inode-based range reads and `NeedsDownload` retry flow.
+- Integration: unified cache entries are reused by both directory decoding and
+  file reads across sequential fresh sessions.
+- Integration: retained inspection remains read-only, clean close remains
+  idempotent and completion-based, and stale state remains untouched.
+- E2E: the completed read-only mount workflow and status output have no
+  observable regressions.
+
+Definition of done:
+
+- The old state capability traits, trait objects, worker protocol, forwarding
+  stores, duplicate node-kind enums, split directory cache, and daemon
+  namespace maps are removed.
+- The workspace passes formatting, lint, unit, state integration, read-only
+  integration, and read-only end-to-end workflows.
 
 ## Phase 6: Writable Copy-On-Write
 

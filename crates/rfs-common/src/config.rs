@@ -18,7 +18,7 @@ pub struct Config {
 impl Config {
     /// Resolves `RFS_HOME`, defaulting to `$HOME/.rfs`.
     ///
-    /// Filesystem creation and canonicalization are performed by `StatePaths`
+    /// Filesystem creation and canonicalization are performed by `Session`
     /// at the boundary where local state is used.
     pub fn new() -> Result<Self, ConfigError> {
         let rfs_home = match env::var_os("RFS_HOME") {

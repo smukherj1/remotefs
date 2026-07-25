@@ -798,7 +798,6 @@ mod tests {
     use super::*;
     use crate::cas::UploadStats;
     use async_trait::async_trait;
-    use bytes::Bytes;
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
@@ -838,7 +837,11 @@ mod tests {
             Ok(stats)
         }
 
-        async fn download_blob(&mut self, _digest: &Digest) -> Result<Bytes, CasError> {
+        async fn stream_blob(
+            &mut self,
+            _digest: &Digest,
+            _destination: &mut (dyn std::io::Write + Send),
+        ) -> Result<(), CasError> {
             unreachable!("upload tests do not download")
         }
     }

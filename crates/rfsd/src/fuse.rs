@@ -1,8 +1,4 @@
-//! Synchronous FUSE adapter for the asynchronous read-only filesystem core.
-//!
-//! The kernel callbacks run on fuser's session thread and enter the daemon's
-//! Tokio runtime only while a core operation is in flight. The mount is
-//! reported ready only after the kernel has completed `FUSE_INIT`.
+//! Synchronous FUSE adapter for the read-only filesystem service.
 
 use std::ffi::OsStr;
 use std::io;
@@ -18,9 +14,9 @@ use fuser::{
 };
 use libc::{EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, EROFS};
 use rfs_common::cas::BlobStore;
-use tokio::runtime::Handle;
+use rfs_common::session::{InodeId, Node, NodeKind, SessionError};
 
-use crate::fs::{FilesystemError, Node, NodeKind, ReadOnlyFilesystem};
+use crate::filesystem::{FilesystemError, FilesystemService};
 
 const ATTRIBUTE_TTL: Duration = Duration::from_secs(1);
 
@@ -32,9 +28,8 @@ pub(crate) struct FuseMount {
 impl FuseMount {
     /// Mounts the validated core and waits until the kernel finishes FUSE init.
     pub(crate) fn mount<S>(
-        filesystem: Arc<ReadOnlyFilesystem<S>>,
+        filesystem: Arc<FilesystemService<S>>,
         mountpoint: &Path,
-        runtime: Handle,
     ) -> io::Result<Self>
     where
         S: BlobStore + Send + 'static,
@@ -42,7 +37,6 @@ impl FuseMount {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let adapter = FuseAdapter {
             filesystem,
-            runtime,
             ready: Some(ready_tx),
         };
         let session = fuser::spawn_mount2(
@@ -79,23 +73,22 @@ impl FuseMount {
 }
 
 struct FuseAdapter<S> {
-    filesystem: Arc<ReadOnlyFilesystem<S>>,
-    runtime: Handle,
+    filesystem: Arc<FilesystemService<S>>,
     ready: Option<SyncSender<()>>,
 }
 
 impl<S: BlobStore + Send + 'static> FuseAdapter<S> {
     fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<Node, i32> {
         let name = name.to_str().ok_or(ENOENT)?;
-        self.runtime
-            .block_on(self.filesystem.lookup(parent, name))
+        let parent = InodeId::new(parent).map_err(|_| EINVAL)?;
+        self.filesystem
+            .lookup(parent, name)
             .map_err(errno_for_error)
     }
 
     fn node(&self, inode: u64) -> Result<Node, i32> {
-        self.runtime
-            .block_on(self.filesystem.getattr(inode))
-            .map_err(errno_for_error)
+        let inode = InodeId::new(inode).map_err(|_| EINVAL)?;
+        self.filesystem.getattr(inode).map_err(errno_for_error)
     }
 }
 
@@ -144,7 +137,14 @@ impl<S: BlobStore + Send + 'static> Filesystem for FuseAdapter<S> {
                 return;
             }
         };
-        let children = match self.runtime.block_on(self.filesystem.readdir(inode)) {
+        let inode_id = match InodeId::new(inode) {
+            Ok(inode) => inode,
+            Err(_) => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let children = match self.filesystem.readdir(inode_id) {
             Ok(children) => children,
             Err(error) => {
                 reply.error(errno_for_error(error));
@@ -153,16 +153,18 @@ impl<S: BlobStore + Send + 'static> Filesystem for FuseAdapter<S> {
         };
         let entries = [
             (inode, FileType::Directory, ".".to_owned()),
-            (node.parent, FileType::Directory, "..".to_owned()),
+            (node.parent.get(), FileType::Directory, "..".to_owned()),
         ]
         .into_iter()
         .chain(
             children
                 .into_iter()
-                .map(|child| (child.inode, file_type(child.kind), child.name)),
+                .map(|child| (child.inode.get(), file_type(child.kind), child.name)),
         );
-        for (index, (entry_inode, kind, name)) in entries.enumerate().skip(offset as usize) {
-            if reply.add(entry_inode, (index + 1) as i64, kind, name) {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        for (index, (entry_inode, kind, name)) in entries.enumerate().skip(start) {
+            let next_offset = i64::try_from(index + 1).unwrap_or(i64::MAX);
+            if reply.add(entry_inode, next_offset, kind, name) {
                 break;
             }
         }
@@ -202,17 +204,29 @@ impl<S: BlobStore + Send + 'static> Filesystem for FuseAdapter<S> {
                 return;
             }
         };
-        match self
-            .runtime
-            .block_on(self.filesystem.read(inode, offset, size as usize))
-        {
+        let inode = match InodeId::new(inode) {
+            Ok(inode) => inode,
+            Err(_) => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        let size = usize::try_from(size).expect("u32 read size fits usize on supported targets");
+        match self.filesystem.read(inode, offset, size) {
             Ok(bytes) => reply.data(&bytes),
             Err(error) => reply.error(errno_for_error(error)),
         }
     }
 
     fn readlink(&mut self, _request: &Request<'_>, inode: u64, reply: ReplyData) {
-        match self.runtime.block_on(self.filesystem.readlink(inode)) {
+        let inode = match InodeId::new(inode) {
+            Ok(inode) => inode,
+            Err(_) => {
+                reply.error(EINVAL);
+                return;
+            }
+        };
+        match self.filesystem.readlink(inode) {
             Ok(target) => reply.data(target.as_bytes()),
             Err(error) => reply.error(errno_for_error(error)),
         }
@@ -337,23 +351,10 @@ impl<S: BlobStore + Send + 'static> Filesystem for FuseAdapter<S> {
 }
 
 fn file_attr(node: &Node) -> FileAttr {
-    let size = match node.kind {
-        NodeKind::File => node.digest.as_ref().map_or(0, |digest| {
-            u64::try_from(digest.size_bytes()).expect("validated digest sizes are non-negative")
-        }),
-        NodeKind::Symlink => node
-            .symlink_target
-            .as_ref()
-            .map_or(0, |target| target.len() as u64),
-        NodeKind::Directory => 0,
-    };
-    let mtime = node
-        .mtime
-        .as_ref()
-        .and_then(timestamp_to_system_time)
-        .unwrap_or(UNIX_EPOCH);
+    let size = node.size;
+    let mtime = timestamp_to_system_time(node.mtime);
     FileAttr {
-        ino: node.inode,
+        ino: node.inode.get(),
         size,
         blocks: size.div_ceil(512),
         atime: mtime,
@@ -377,12 +378,7 @@ fn file_attr(node: &Node) -> FileAttr {
 }
 
 fn permission_bits(node: &Node) -> u16 {
-    let default = match node.kind {
-        NodeKind::File => 0o444,
-        NodeKind::Directory => 0o555,
-        NodeKind::Symlink => 0o777,
-    };
-    u16::try_from(node.mode.unwrap_or(default) & 0o7777).unwrap_or(default as u16)
+    u16::try_from(node.mode & 0o7777).unwrap_or(0)
 }
 
 fn file_type(kind: NodeKind) -> FileType {
@@ -393,32 +389,58 @@ fn file_type(kind: NodeKind) -> FileType {
     }
 }
 
-fn timestamp_to_system_time(timestamp: &prost_types::Timestamp) -> Option<SystemTime> {
-    let seconds = u64::try_from(timestamp.seconds).ok()?;
-    let nanos = u32::try_from(timestamp.nanos).ok()?;
-    (nanos < 1_000_000_000).then(|| UNIX_EPOCH + Duration::new(seconds, nanos))
+fn timestamp_to_system_time(timestamp: rfs_common::session::NodeTime) -> SystemTime {
+    if timestamp.seconds() >= 0 {
+        UNIX_EPOCH
+            + Duration::new(
+                u64::try_from(timestamp.seconds()).expect("non-negative timestamp fits u64"),
+                timestamp.nanos(),
+            )
+    } else if timestamp.nanos() == 0 {
+        UNIX_EPOCH - Duration::from_secs(timestamp.seconds().unsigned_abs())
+    } else {
+        UNIX_EPOCH
+            - Duration::new(
+                timestamp.seconds().unsigned_abs() - 1,
+                1_000_000_000 - timestamp.nanos(),
+            )
+    }
 }
 
 fn errno_for_error(error: FilesystemError) -> i32 {
     match error {
-        FilesystemError::UnknownInode { .. } | FilesystemError::NotFound { .. } => ENOENT,
-        FilesystemError::WrongKind {
-            expected: NodeKind::Directory,
+        FilesystemError::Session {
+            source: SessionError::UnknownInode { .. } | SessionError::NotFound { .. },
+            ..
+        } => ENOENT,
+        FilesystemError::Session {
+            source:
+                SessionError::WrongKind {
+                    expected: NodeKind::Directory,
+                    ..
+                },
             ..
         } => ENOTDIR,
-        FilesystemError::WrongKind {
-            actual: NodeKind::Directory,
+        FilesystemError::Session {
+            source:
+                SessionError::WrongKind {
+                    actual: NodeKind::Directory,
+                    ..
+                },
             ..
         } => EISDIR,
-        FilesystemError::WrongKind { .. } => EINVAL,
+        FilesystemError::Session {
+            source: SessionError::WrongKind { .. } | SessionError::InvalidInode { .. },
+            ..
+        } => EINVAL,
         FilesystemError::MissingDigest { .. }
         | FilesystemError::InvalidDigest { .. }
+        | FilesystemError::InvalidTimestamp { .. }
         | FilesystemError::Cas { .. }
         | FilesystemError::Directory { .. }
-        | FilesystemError::DigestMismatch { .. }
-        | FilesystemError::State { .. }
-        | FilesystemError::StateTask { .. }
-        | FilesystemError::Cache { .. } => EIO,
+        | FilesystemError::Session { .. }
+        | FilesystemError::CasLock { .. }
+        | FilesystemError::DownloadLock { .. } => EIO,
     }
 }
 
@@ -428,26 +450,36 @@ mod tests {
 
     #[test]
     fn maps_lookup_and_kind_errors_to_posix_errno() {
+        let inode = InodeId::new(2).unwrap();
         assert_eq!(
-            errno_for_error(FilesystemError::NotFound {
-                parent: 1,
-                name: "missing".to_owned(),
+            errno_for_error(FilesystemError::Session {
+                inode,
+                source: SessionError::NotFound {
+                    parent: InodeId::ROOT,
+                    name: "missing".to_owned(),
+                },
             }),
             ENOENT
         );
         assert_eq!(
-            errno_for_error(FilesystemError::WrongKind {
-                inode: 2,
-                expected: NodeKind::Directory,
-                actual: NodeKind::File,
+            errno_for_error(FilesystemError::Session {
+                inode,
+                source: SessionError::WrongKind {
+                    inode,
+                    expected: NodeKind::Directory,
+                    actual: NodeKind::File,
+                },
             }),
             ENOTDIR
         );
         assert_eq!(
-            errno_for_error(FilesystemError::WrongKind {
-                inode: 2,
-                expected: NodeKind::File,
-                actual: NodeKind::Directory,
+            errno_for_error(FilesystemError::Session {
+                inode,
+                source: SessionError::WrongKind {
+                    inode,
+                    expected: NodeKind::File,
+                    actual: NodeKind::Directory,
+                },
             }),
             EISDIR
         );
@@ -456,16 +488,13 @@ mod tests {
     #[test]
     fn converts_remote_metadata_to_read_only_attributes() {
         let node = Node {
-            inode: 9,
-            parent: 1,
+            inode: InodeId::new(9).unwrap(),
+            parent: InodeId::ROOT,
             name: "tool".to_owned(),
             kind: NodeKind::File,
-            digest: Some(rfs_common::digest::Digest::for_bytes(b"abc")),
-            mode: Some(0o100755),
-            mtime: Some(prost_types::Timestamp {
-                seconds: 123,
-                nanos: 456,
-            }),
+            size: 3,
+            mode: 0o100755,
+            mtime: rfs_common::session::NodeTime::new(123, 456).unwrap(),
             symlink_target: None,
         };
         let attr = file_attr(&node);

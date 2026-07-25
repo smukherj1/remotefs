@@ -13,7 +13,7 @@ use crate::daemon_client::{ControlEndpoint, DaemonClient, SessionStatus};
 use rfs_common::config::{Config, ConfigError};
 use rfs_common::digest::{Digest, DigestError};
 use rfs_common::logging::{self, LogFormat};
-use rfs_common::state::{SessionStateReader, SessionView, canonicalize_mountpoint, open_reader};
+use rfs_common::session::{RetainedSession, Session, SessionError, canonicalize_mountpoint};
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -264,13 +264,11 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         }
         Commands::Unmount { mountpoint } => {
             let config = Config::new().map_err(config_error)?;
-            let reader = open_reader(config).map_err(state_error)?;
-            run_unmount(reader.as_ref(), mountpoint.as_deref()).await
+            run_unmount(&config, mountpoint.as_deref()).await
         }
         Commands::Status { mountpoint } => {
             let config = Config::new().map_err(config_error)?;
-            let reader = open_reader(config).map_err(state_error)?;
-            run_status(reader.as_ref(), mountpoint.as_deref(), cli.json_output()).await
+            run_status(&config, mountpoint.as_deref(), cli.json_output()).await
         }
     }
 }
@@ -313,8 +311,7 @@ async fn run_mount(
             return Err(daemon_exit_error(&mut child, status));
         }
         if let Ok(config) = Config::new()
-            && let Ok(reader) = open_reader(config)
-            && let Ok(mut client) = daemon_client(reader.as_ref()).await
+            && let Ok(mut client) = daemon_client(&config).await
             && let Ok(status) = client.status().await
         {
             if status.root_digest != digest || status.mountpoint != mountpoint {
@@ -385,18 +382,18 @@ fn daemon_exit_error(child: &mut Child, status: std::process::ExitStatus) -> Cli
     }
 }
 
-async fn daemon_client(
-    reader: &dyn SessionStateReader,
-) -> Result<DaemonClient, crate::daemon_client::ClientError> {
-    DaemonClient::connect(ControlEndpoint(reader.control_endpoint())).await
+async fn daemon_client(config: &Config) -> Result<DaemonClient, crate::daemon_client::ClientError> {
+    let endpoint = Session::control_endpoint(config).map_err(|error| {
+        crate::daemon_client::ClientError::Connect {
+            endpoint: config.rfs_home.join("active/control.sock"),
+            message: format!("derive session control endpoint: {error}"),
+        }
+    })?;
+    DaemonClient::connect(ControlEndpoint(endpoint)).await
 }
 
-async fn run_status(
-    reader: &dyn SessionStateReader,
-    supplied: Option<&Path>,
-    json: bool,
-) -> Result<(), CliError> {
-    match daemon_client(reader).await {
+async fn run_status(config: &Config, supplied: Option<&Path>, json: bool) -> Result<(), CliError> {
+    match daemon_client(config).await {
         Ok(mut client) => match client.status().await {
             Ok(status) => {
                 validate_supplied_mountpoint(supplied, &status.mountpoint)?;
@@ -409,7 +406,7 @@ async fn run_status(
         Err(error) if error.is_unavailable() => {}
         Err(error) => return Err(client_error(error)),
     }
-    match reader.session().map_err(state_error)? {
+    match Session::inspect(config).map_err(state_error)? {
         None => {
             validate_optional_mountpoint(supplied, None)?;
             if json {
@@ -448,7 +445,7 @@ fn render_active_status(status: SessionStatus, json: bool) {
     }
 }
 
-fn render_retained_status(session: SessionView, json: bool) {
+fn render_retained_status(session: RetainedSession, json: bool) {
     if json {
         println!(
             "{}",
@@ -465,11 +462,8 @@ fn render_retained_status(session: SessionView, json: bool) {
     }
 }
 
-async fn run_unmount(
-    reader: &dyn SessionStateReader,
-    supplied: Option<&Path>,
-) -> Result<(), CliError> {
-    let mut client = daemon_client(reader).await.map_err(client_error)?;
+async fn run_unmount(config: &Config, supplied: Option<&Path>) -> Result<(), CliError> {
+    let mut client = daemon_client(config).await.map_err(client_error)?;
     let status = client.status().await.map_err(client_error)?;
     validate_supplied_mountpoint(supplied, &status.mountpoint)?;
     let mountpoint = status.mountpoint;
@@ -593,12 +587,12 @@ fn config_error(error: ConfigError) -> CliError {
     }
 }
 
-fn state_error(error: rfs_common::state::StateError) -> CliError {
+fn state_error(error: SessionError) -> CliError {
     CliError::CommandFailed {
         category: match error {
-            rfs_common::state::StateError::ActiveSession { .. } => "active_session",
-            rfs_common::state::StateError::StaleSession { .. } => "stale_session",
-            rfs_common::state::StateError::UnsafePath { .. } => "unsafe_state",
+            SessionError::ActiveSession { .. } => "active_session",
+            SessionError::StaleSession { .. } => "stale_session",
+            SessionError::UnsafePath { .. } => "unsafe_state",
             _ => "state",
         },
         message: error.to_string(),

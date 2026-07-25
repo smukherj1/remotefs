@@ -1,7 +1,4 @@
--- Durable RemoteFS state schema.
---
--- Domain values and cross-column invariants are validated in the Rust storage
--- layer. SQL owns only persistence shape, keys, indexes, and foreign keys.
+-- Durable RemoteFS state schema. Rust owns domain validation; SQL owns shape.
 
 CREATE TABLE IF NOT EXISTS session_metadata (
     singleton INTEGER PRIMARY KEY,

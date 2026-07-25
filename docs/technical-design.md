@@ -89,7 +89,15 @@ Small blob and directory uploads use `BatchUpdateBlobs` packing to reduce RPC ov
 - A near-threshold entry that cannot fit in the batch budget by itself is uploaded through ByteStream.
 - Entry order within a `BatchUpdateBlobs` request is not semantically significant and is not part of RemoteFS determinism guarantees. Determinism is required for tree encoding, root digests, and user-visible summaries.
 
-The CAS client exposes only RemoteFS-level operations to callers: existence checks, blob upload, and verified blob download. ByteStream resource-name construction, response verification, batch packing, retry classification, and transport-specific helper functions remain private implementation details unless another module has a concrete need for them. Public methods are documented with expected arguments, return values, and error behavior.
+The CAS client exposes only RemoteFS-level operations to callers: existence
+checks, blob upload, and verified blob download. `BlobStore::stream_blob`
+writes a download incrementally to a caller-provided `Write` destination;
+`download_blob` is a collecting convenience over the same implementation.
+ByteStream resource-name construction, response verification, batch packing,
+retry classification, and transport-specific helper functions remain private
+implementation details unless another module has a concrete need for them.
+Public methods are documented with expected arguments, return values, and
+error behavior.
 
 ## Process Model
 
@@ -143,9 +151,11 @@ crates/rfs/
 crates/rfsd/
   src/main.rs            # rfsd binary entrypoint
   src/control_service.rs # daemon-side control protocol and shutdown
-  src/fs.rs              # filesystem, FUSE, and overlay behavior
+  src/filesystem.rs      # remote-aware filesystem orchestration
+  src/fuse.rs            # synchronous FUSE adapter
 crates/rfs-common/
-  src/                   # shared domain, state, storage, protocol, and logging modules
+  src/session/           # concrete local-session facade and private components
+  src/                   # shared domain, storage, protocol, and logging modules
 ```
 
 Direct internal dependency edges are:
@@ -158,44 +168,55 @@ rfsd -> rfs-common
 Cargo prevents either binary package from importing the other. Finer ownership
 boundaries are modules: daemon-client and bootstrap-upload orchestration stay in
 `rfs`; the control service and filesystem stay in `rfsd`; shared protocol,
-state, CAS, tree, and lower-level upload mechanics stay in `rfs-common`.
+session, CAS, tree, and lower-level upload mechanics stay in `rfs-common`.
 Generated protocol messages and tonic clients are confined to the client and
 service adapter modules and are not CLI command/result types. `rusqlite` and
-SQLite row types do not escape the common state module.
+SQLite row types do not escape the common session module.
 
-The `rfs-common::state` module exposes `SessionStateReader` and `DaemonState`
-trait objects.
-`open_reader` opens existing SQLite state read-only and never creates files,
-initializes schema, locks, or mutates lifecycle state. `open_daemon` owns
-validation, schema initialization and version checks, locking, recoverable
-closed-session replacement, active-session creation, and explicit clean close.
-SQL queries, connections, and row models remain private.
+`rfs_common::session::Session` is the one concrete facade for local state used
+by the daemon filesystem. It owns a unified `BlobCache` and one
+`ActiveSession`; `ActiveSession` privately owns `SessionStore` and
+`OverlayStore`. Callers cannot access those children. `Session::open` owns
+validation, schema-version checks, locking, recoverable closed-session
+replacement, active-session creation, and explicit idempotent clean close.
+`Session::control_endpoint` discovers the fixed socket without opening SQLite,
+and `Session::inspect` performs one-shot retained inspection without creating,
+locking, initializing, or mutating state.
 
-The state module uses `rusqlite`. A private `state/schema.sql` file is the
+The session module uses `rusqlite`. A private embedded `schema.sql` file is the
 source of truth for table shape, primary keys, indexes, and foreign keys. It
-uses `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`, is embedded
-with `include_str!`, and is executed when the daemon opens writable state.
-SQLite's `user_version` records the supported schema version.
+uses `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` and is
+executed when the daemon opens writable state. SQLite's `user_version` records
+the supported schema version.
 
-SQL does not encode domain checks. The state module owns private Rust row
+SQL does not encode domain checks. The session module owns private Rust row
 decoders and validates lifecycle values, digests, timestamps, booleans, inode
 shape, node-kind field combinations, paths, and other domain invariants when
 writing or reading a row. Adding or changing a persisted field requires
 updating `schema.sql`, the corresponding Rust translation and validation, and
 tests in the same change.
 
-FUSE callbacks and the public state capabilities are synchronous. One
-daemon-owned state worker owns a single `rusqlite::Connection` and serializes
-database commands; capability methods send typed requests to that worker and
-wait for typed results. The daemon connection enables foreign keys and retains
-SQLite rollback-journal mode. The retained-session reader opens a separate
-read-only connection and never creates tables, changes schema version, locks,
-or mutates lifecycle state.
+FUSE callbacks, `FilesystemService`, and all `Session` operations are
+synchronous. `SessionStore` owns one mutex-protected
+`rusqlite::Connection`; focused repository operations serialize through that
+mutex without a worker thread or mirrored command protocol. The daemon
+connection enables foreign keys and retains SQLite rollback-journal mode.
+Retained inspection opens a separate read-only connection and closes it after
+one validated result.
 
-Packages and substantial modules retain owner-specific structured errors. Common
-helpers attach operation context without erasing those errors. The daemon maps
-implementation failures to safe control failures; the client exposes stable
-error codes without tonic types; only the CLI renders command errors.
+The local hierarchy uses one contextual `SessionError`; private helpers attach
+the owning operation and stable entity while preserving I/O and SQLite sources.
+`FilesystemService` separately owns CAS, REAPI, and orchestration errors. The
+daemon maps failures to safe control responses; the client exposes stable error
+codes without tonic types; only the CLI renders command errors.
+
+`FilesystemService` is daemon-owned and keeps SQLite authoritative for the
+namespace. Its only mutable operation-coordination state is a keyed map that
+deduplicates in-progress remote blob downloads. `Session` exposes an opaque
+write-only `BlobWriter`; the service streams through `BlobStore::stream_blob`
+and then asks `Session` to verify, sync, and atomically admit the completed
+object. The async tonic implementation is bridged inside the remote-aware
+daemon layer and does not make the FUSE or local-session APIs asynchronous.
 
 The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires `RFS_HOME/active.lock` before starting `rfsd`; if another process holds that advisory lock, the mount fails and reports its diagnostic lock metadata when readable. The lock is outside `RFS_HOME/active/` so cleanup or replacement never removes the inode that coordinates ownership. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts require distinct `RFS_HOME` values.
 
@@ -220,9 +241,6 @@ $HOME/.rfs/
     blobs/
       <2-hex-prefix>/
         <sha256-hex>-<size>
-    dirs/
-      <2-hex-prefix>/
-        <sha256-hex>-<size>
   active/
     session.db
     rfsd.log
@@ -236,7 +254,14 @@ $HOME/.rfs/
 
 The shared cache is content-addressed and may be reused across sequential mount sessions on the same runner.
 
-Blob and directory cache paths are sharded by hash prefix to avoid very large flat directories. The size is included in the filename so the cache path preserves the full structured digest identity. Directory cache entries store raw serialized REAPI `Directory` bytes keyed by digest; decoded forms may be cached in memory but are not persisted as an internal representation.
+One unified blob cache stores both regular-file contents and raw serialized
+REAPI `Directory` messages. Paths are sharded by hash prefix to avoid very
+large flat directories, and size remains in the filename so the path preserves
+the complete structured digest identity. A large download streams into an
+opaque temporary file beside its final shard entry; finalization verifies the
+digest, syncs the file, and atomically admits it without overwriting an existing
+entry. Decoded directories and inode maps are not retained as a second
+authoritative namespace view.
 
 Active session state is isolated under `RFS_HOME/active/`:
 
@@ -251,8 +276,9 @@ Local cache eviction is deferred. The earliest MVP may provide manual pruning on
 
 ## State Database Schema
 
-`state/schema.sql` documents the durable tables and columns. Private Rust row
-translation in the state module documents and enforces their domain meaning.
+`session/active/schema.sql` documents the durable tables and columns. Private
+Rust row translation in the session module documents and enforces their domain
+meaning.
 The durable domain tables are:
 
 | Table | Purpose |

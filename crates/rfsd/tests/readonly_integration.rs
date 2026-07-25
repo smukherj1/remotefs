@@ -5,9 +5,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use rfs_common::cas::{CasClient, CasConfig};
 use rfs_common::config::Config;
-use rfs_common::state::{ROOT_INODE, SessionStartup, open_daemon};
+use rfs_common::session::{InodeId, Session};
 use rfs_common::upload::{UploadOptions, upload_local_directory};
-use rfsd::fs::ReadOnlyFilesystem;
+use rfsd::filesystem::FilesystemService;
 
 const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";
 
@@ -39,36 +39,30 @@ async fn uploaded_fixture_is_read_lazily_through_verified_cache() -> Result<()> 
 
     let mountpoint = temp.path().join("mount");
     fs::create_dir(&mountpoint).context("create integration mountpoint")?;
-    let state = open_daemon(
+    let session = std::sync::Arc::new(Session::open(
         Config {
             rfs_home: temp.path().join("rfs-home"),
         },
-        SessionStartup::new(summary.root_digest.clone(), mountpoint),
-    )?;
-    let session = state
-        .session()?
-        .context("active integration session is missing")?;
-    let filesystem_state = state.filesystem_state();
+        summary.root_digest.clone(),
+        mountpoint,
+    )?);
     let reader = CasClient::connect(cas_config).await?;
-    let filesystem = ReadOnlyFilesystem::mount(
-        reader,
-        filesystem_state,
-        session.cache_path,
-        summary.root_digest,
-    )
-    .await?;
-
-    let nested = filesystem.lookup(ROOT_INODE, "nested").await?;
-    let child = filesystem.lookup(nested.inode, "child.txt").await?;
-    assert_eq!(
-        filesystem.read(child.inode, 0, 64).await?.as_ref(),
-        b"child contents"
-    );
-    let counters = filesystem.counters();
+    let runtime = tokio::runtime::Handle::current();
+    let workflow_session = std::sync::Arc::clone(&session);
+    let counters = tokio::task::spawn_blocking(move || -> Result<_> {
+        let filesystem = FilesystemService::mount(reader, workflow_session, runtime)?;
+        let nested = filesystem.lookup(InodeId::ROOT, "nested")?;
+        let child = filesystem.lookup(nested.inode, "child.txt")?;
+        assert_eq!(
+            filesystem.read(child.inode, 0, 64)?.as_ref(),
+            b"child contents"
+        );
+        Ok(filesystem.counters())
+    })
+    .await??;
     assert_eq!(counters.directory_downloads, 2);
     assert_eq!(counters.blob_downloads, 1);
 
-    drop(filesystem);
-    state.close()?;
+    session.close()?;
     Ok(())
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio_stream::StreamExt;
@@ -225,6 +226,12 @@ pub enum CasError {
         #[source]
         source: std::io::Error,
     },
+    #[error("write streamed CAS blob {digest} to caller destination failed: {source}")]
+    StreamWrite {
+        digest: Digest,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("Error converting between RE API and native object: {operation}: {source}")]
     ReApiConversion {
         operation: String,
@@ -308,11 +315,22 @@ pub trait BlobStore {
     /// Uploads the given blobs to the BlobStore.
     async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError>;
 
+    /// Streams and verifies the blob identified by `digest` into `destination`.
+    async fn stream_blob(
+        &mut self,
+        digest: &Digest,
+        destination: &mut (dyn std::io::Write + Send),
+    ) -> Result<(), CasError>;
+
     /// Downloads and verifies the blob identified by `digest`.
     ///
     /// Returns verified bytes. A digest hash or size mismatch is reported as a
     /// verification error and is not retried as a semantic success.
-    async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError>;
+    async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
+        let mut bytes = Vec::new();
+        self.stream_blob(digest, &mut bytes).await?;
+        Ok(Bytes::from(bytes))
+    }
 }
 
 /// Client to the CAS server allowing the transfer of blobs.
@@ -438,12 +456,30 @@ impl CasClient {
     /// `BatchReadBlobs`; larger blobs use ByteStream. The returned bytes are
     /// verified against `digest`, and mismatches return `CasError::Verification`.
     pub async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
+        let mut bytes = Vec::new();
+        self.stream_blob(digest, &mut bytes).await?;
+        Ok(Bytes::from(bytes))
+    }
+
+    /// Streams a verified blob without accumulating ByteStream responses in memory.
+    pub async fn stream_blob(
+        &mut self,
+        digest: &Digest,
+        destination: &mut (dyn std::io::Write + Send),
+    ) -> Result<(), CasError> {
         if digest_size_usize(digest)? <= self.config.download_blob_stream_threshold_bytes {
-            self.batch_read_blob(digest)
+            let bytes = self
+                .batch_read_blob(digest)
                 .await
-                .with_context(|| format!("download blob {digest} through BatchReadBlobs"))
+                .with_context(|| format!("download blob {digest} through BatchReadBlobs"))?;
+            destination
+                .write_all(&bytes)
+                .map_err(|source| CasError::StreamWrite {
+                    digest: digest.clone(),
+                    source,
+                })
         } else {
-            self.bytestream_read(digest)
+            self.bytestream_read_into(digest, destination)
                 .await
                 .with_context(|| format!("download blob {digest} through ByteStream.Read"))
         }
@@ -638,7 +674,11 @@ impl CasClient {
             .map(|_| ())
     }
 
-    async fn bytestream_read(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
+    async fn bytestream_read_into(
+        &mut self,
+        digest: &Digest,
+        destination: &mut (dyn std::io::Write + Send),
+    ) -> Result<(), CasError> {
         let resource_name = bytestream_read_resource_name(&self.config.instance_name, digest);
         let response = self
             .retry_rpc(CasOperation::ByteStreamRead, || {
@@ -661,7 +701,8 @@ impl CasClient {
             })?
             .into_inner();
 
-        let mut data = Vec::new();
+        let mut hasher = Sha256::new();
+        let mut written = 0_u64;
         while let Some(chunk) =
             tokio::time::timeout(self.config.bytestream_idle_timeout, response.next())
                 .await
@@ -675,28 +716,52 @@ impl CasClient {
                     ))),
                 })?
         {
-            data.extend_from_slice(
-                &chunk
-                    .map_err(|status| CasError::Rpc {
-                        operation: CasOperation::ByteStreamRead,
-                        attempts: 1,
-                        cas_url: self.config.cas_url.clone(),
-                        instance_name: self.config.instance_name.clone(),
-                        status: Box::new(Status::new(
-                            status.code(),
-                            format!(
-                                "read next ByteStream chunk for {digest} resource {resource_name}: {}",
-                                status.message()
-                            ),
-                        )),
-                    })?
-                    .data,
-            );
+            let data = chunk
+                .map_err(|status| CasError::Rpc {
+                    operation: CasOperation::ByteStreamRead,
+                    attempts: 1,
+                    cas_url: self.config.cas_url.clone(),
+                    instance_name: self.config.instance_name.clone(),
+                    status: Box::new(Status::new(
+                        status.code(),
+                        format!(
+                            "read next ByteStream chunk for {digest} resource {resource_name}: {}",
+                            status.message()
+                        ),
+                    )),
+                })?
+                .data;
+            destination
+                .write_all(&data)
+                .map_err(|source| CasError::StreamWrite {
+                    digest: digest.clone(),
+                    source,
+                })?;
+            hasher.update(&data);
+            written = written
+                .checked_add(u64::try_from(data.len()).expect("chunk length fits u64"))
+                .ok_or_else(|| CasError::BlobStatus {
+                    operation: CasOperation::ByteStreamRead,
+                    digest: digest.clone(),
+                    message: "downloaded byte counter overflowed u64".into(),
+                })?;
         }
-        verify_download(digest, &data).with_context(|| {
-            format!("verify ByteStream.Read response for {digest} resource {resource_name}")
-        })?;
-        Ok(Bytes::from(data))
+        let actual = Digest::new(
+            hex::encode(hasher.finalize()),
+            i64::try_from(written).map_err(|source| CasError::ReApiConversion {
+                operation: format!("convert streamed size for {digest} into i64"),
+                source: Box::new(source),
+            })?,
+        )
+        .expect("SHA-256 output and non-negative size form a valid digest");
+        if actual != *digest {
+            return Err(CasError::BlobStatus {
+                operation: CasOperation::ByteStreamRead,
+                digest: digest.clone(),
+                message: format!("downloaded digest was {actual}"),
+            });
+        }
+        Ok(())
     }
 
     async fn retry_rpc<F, Fut, T>(
@@ -1081,8 +1146,12 @@ impl BlobStore for CasClient {
         CasClient::upload_blobs(self, blobs).await
     }
 
-    async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
-        CasClient::download_blob(self, digest).await
+    async fn stream_blob(
+        &mut self,
+        digest: &Digest,
+        destination: &mut (dyn std::io::Write + Send),
+    ) -> Result<(), CasError> {
+        CasClient::stream_blob(self, digest, destination).await
     }
 }
 

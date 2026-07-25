@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use rfs_common::cas::CasClient;
 use rfs_common::control_protocol as protocol;
-use rfs_common::state::{DaemonState, SessionView, StateError};
+use rfs_common::session::{Session, SessionError, SessionInfo};
 use thiserror::Error;
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
@@ -12,7 +12,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use crate::fs::ReadOnlyFilesystem;
+use crate::filesystem::FilesystemService;
 use crate::fuse::FuseMount;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -28,17 +28,17 @@ pub(crate) enum ControlError {
     #[error("control transport failed: {0}")]
     Transport(#[from] tonic::transport::Error),
     #[error("close daemon state: {0}")]
-    State(#[from] StateError),
-    #[error("access daemon state during control-service teardown: state lock is poisoned")]
-    StateLockPoisoned,
+    State(#[from] SessionError),
+    #[error("access daemon resources during control-service teardown: lock is poisoned")]
+    ResourceLockPoisoned,
 }
 
 #[derive(Clone)]
 struct ControlService {
-    session: SessionView,
-    state: Arc<Mutex<Option<Box<dyn DaemonState>>>>,
+    info: SessionInfo,
+    session: Arc<Session>,
     mount: Arc<Mutex<Option<FuseMount>>>,
-    filesystem: Arc<ReadOnlyFilesystem<CasClient>>,
+    filesystem: Arc<FilesystemService<CasClient>>,
     shutdown: Arc<AsyncMutex<Option<oneshot::Sender<()>>>>,
 }
 
@@ -77,15 +77,15 @@ impl protocol::control_server::Control for ControlService {
         }
         Ok(Response::new(protocol::StatusResponse {
             mounted: true,
-            root_digest: self.session.root_digest.to_string(),
-            mountpoint: self.session.mountpoint.to_string_lossy().into_owned(),
+            root_digest: self.info.root_digest.to_string(),
+            mountpoint: self.info.mountpoint.to_string_lossy().into_owned(),
             cached_blobs: self.filesystem.cached_blobs(),
             dirty_files: 0,
             protocol_version: PROTOCOL_VERSION,
-            daemon_pid: self.session.daemon_pid,
-            control_socket: self.session.control_endpoint.to_string_lossy().into_owned(),
-            cache_path: self.session.cache_path.to_string_lossy().into_owned(),
-            session_path: self.session.session_path.to_string_lossy().into_owned(),
+            daemon_pid: self.info.daemon_pid,
+            control_socket: self.info.control_endpoint.to_string_lossy().into_owned(),
+            cache_path: self.info.cache_root.to_string_lossy().into_owned(),
+            session_path: self.info.active_root.to_string_lossy().into_owned(),
             dirty: false,
             snapshot_blockers: vec!["snapshot is not implemented".into()],
         }))
@@ -120,13 +120,13 @@ impl protocol::control_server::Control for ControlService {
                 tracing::error!(operation = "unmount", error = %error, "FUSE teardown task failed");
                 Status::internal("daemon could not unmount its FUSE session cleanly")
             })?;
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| Status::internal("daemon state lock is poisoned"))?
-            .take()
-            .ok_or_else(|| Status::failed_precondition("daemon shutdown is already in progress"))?;
-        state.close().map_err(|error| {
+        remove_socket(&self.info.control_endpoint)
+            .await
+            .map_err(|error| {
+                tracing::error!(operation = "unmount", error = %error, "control socket removal failed");
+                Status::internal("daemon could not remove its control socket cleanly")
+            })?;
+        self.session.close().map_err(|error| {
             tracing::error!(operation = "unmount", error = %error, "clean session close failed");
             Status::internal("daemon could not close its session cleanly")
         })?;
@@ -143,31 +143,28 @@ impl protocol::control_server::Control for ControlService {
 }
 
 pub(crate) async fn serve(
-    state: Box<dyn DaemonState>,
+    session: Arc<Session>,
     mount: FuseMount,
-    filesystem: Arc<ReadOnlyFilesystem<CasClient>>,
+    filesystem: Arc<FilesystemService<CasClient>>,
 ) -> Result<(), ControlError> {
-    let session = state.session()?.ok_or_else(|| StateError::StaleSession {
-        path: PathBuf::new(),
-        reason: "daemon state has no active session".into(),
-    })?;
-    let socket = session.control_endpoint.clone();
+    let info = session.info();
+    let socket = info.control_endpoint.clone();
     let listener = match prepare_listener(&socket) {
         Ok(listener) => listener,
         Err(error) => {
             tokio::task::spawn_blocking(move || mount.unmount())
                 .await
-                .map_err(|_| ControlError::StateLockPoisoned)?;
-            state.close()?;
+                .map_err(|_| ControlError::ResourceLockPoisoned)?;
+            remove_socket(&socket).await?;
+            session.close()?;
             return Err(error);
         }
     };
-    let state = Arc::new(Mutex::new(Some(state)));
     let mount = Arc::new(Mutex::new(Some(mount)));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let service = ControlService {
-        session,
-        state: Arc::clone(&state),
+        info,
+        session: Arc::clone(&session),
         mount: Arc::clone(&mount),
         filesystem,
         shutdown: Arc::new(AsyncMutex::new(Some(shutdown_tx))),
@@ -182,31 +179,29 @@ pub(crate) async fn serve(
         .add_service(protocol::control_server::ControlServer::new(service))
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await;
-    let remaining_state = state
-        .lock()
-        .map_err(|_| ControlError::StateLockPoisoned)?
-        .take();
     let remaining_mount = mount
         .lock()
-        .map_err(|_| ControlError::StateLockPoisoned)?
+        .map_err(|_| ControlError::ResourceLockPoisoned)?
         .take();
     if let Some(mount) = remaining_mount {
         tokio::task::spawn_blocking(move || mount.unmount())
             .await
-            .map_err(|_| ControlError::StateLockPoisoned)?;
+            .map_err(|_| ControlError::ResourceLockPoisoned)?;
     }
-    if let Some(state) = remaining_state {
-        state.close()?;
-    }
-    if let Err(source) = tokio::fs::remove_file(&socket).await
-        && source.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(ControlError::Socket {
+    remove_socket(&socket).await?;
+    session.close()?;
+    result.map_err(ControlError::Transport)
+}
+
+async fn remove_socket(socket: &PathBuf) -> Result<(), ControlError> {
+    match tokio::fs::remove_file(socket).await {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ControlError::Socket {
             path: socket.clone(),
             source,
-        });
+        }),
     }
-    result.map_err(ControlError::Transport)
 }
 
 fn prepare_listener(socket: &PathBuf) -> Result<UnixListener, ControlError> {

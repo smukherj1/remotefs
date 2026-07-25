@@ -22,7 +22,7 @@ const SYMLINK_MODE_MASK: u32 = PERMISSION_BITS;
 const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
 const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
-/// Filesystem node kind used when normalizing metadata for REAPI nodes.
+/// Transport-independent filesystem node kind shared by trees and sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeKind {
     File,

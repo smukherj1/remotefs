@@ -1,147 +1,121 @@
 use std::fs;
 use std::os::fd::AsRawFd;
+use std::sync::{Arc, Barrier};
 
 use rfs_common::config::Config;
 use rfs_common::digest::Digest;
-use rfs_common::state::{ROOT_INODE, RemoteNodeIdentity, RemoteNodeKind};
-use rfs_common::state::{SessionLifecycle, SessionStartup, open_daemon, open_reader};
+use rfs_common::session::{
+    InodeId, NodeKind, RemoteChild, RemoteContent, Session, SessionLifecycle,
+};
+
+fn open_session(temp: &tempfile::TempDir, root: Digest) -> Arc<Session> {
+    let mountpoint = temp.path().join("mount");
+    if !mountpoint.exists() {
+        fs::create_dir(&mountpoint).unwrap();
+    }
+    Arc::new(
+        Session::open(
+            Config {
+                rfs_home: temp.path().join("home"),
+            },
+            root,
+            mountpoint,
+        )
+        .unwrap(),
+    )
+}
 
 #[test]
 fn closed_session_is_replaced_but_cache_is_retained() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let mountpoint = temp.path().join("mount");
-    fs::create_dir(&mountpoint).unwrap();
-    let startup = SessionStartup::new(Digest::for_bytes(b"root"), mountpoint);
+    let root = Digest::for_bytes(b"root");
+    let session = open_session(&temp, root.clone());
+    session.close().unwrap();
+    session.close().unwrap();
+    fs::write(temp.path().join("home/cache/retained"), b"data").unwrap();
 
-    open_daemon(
-        Config {
-            rfs_home: home.clone(),
-        },
-        startup.clone(),
-    )
-    .unwrap()
-    .close()
-    .unwrap();
-    fs::write(home.join("cache/retained"), b"data").unwrap();
-
-    open_daemon(
-        Config {
-            rfs_home: home.clone(),
-        },
-        startup,
-    )
-    .unwrap()
-    .close()
-    .unwrap();
-    assert!(home.join("cache/retained").exists());
-    assert!(home.join("active/session.db").exists());
+    let replacement = open_session(&temp, root);
+    replacement.close().unwrap();
+    assert!(temp.path().join("home/cache/retained").exists());
+    assert!(temp.path().join("home/active/session.db").exists());
 }
 
 #[test]
 fn stale_session_is_preserved_and_requires_manual_deletion() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let mountpoint = temp.path().join("mount");
-    fs::create_dir(&mountpoint).unwrap();
-    let startup = SessionStartup::new(Digest::for_bytes(b"root"), mountpoint);
+    let root = Digest::for_bytes(b"root");
+    drop(open_session(&temp, root.clone()));
 
-    drop(
-        open_daemon(
-            Config {
-                rfs_home: home.clone(),
-            },
-            startup.clone(),
-        )
-        .unwrap(),
-    );
-    let error = open_daemon(
+    let mountpoint = temp.path().join("mount");
+    let error = Session::open(
         Config {
-            rfs_home: home.clone(),
+            rfs_home: temp.path().join("home"),
         },
-        startup,
+        root,
+        mountpoint,
     )
     .err()
     .expect("stale state must block startup");
     assert!(error.to_string().contains("delete `RFS_HOME`"));
-    assert!(home.join("active/session.db").exists());
+    assert!(temp.path().join("home/active/session.db").exists());
 }
 
 #[test]
-fn reader_is_read_only_and_does_not_hold_daemon_lock() {
+fn inspection_is_read_only_and_does_not_hold_daemon_lock() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let mountpoint = temp.path().join("mount");
-    fs::create_dir(&mountpoint).unwrap();
-    open_daemon(
-        Config {
-            rfs_home: home.clone(),
-        },
-        SessionStartup::new(Digest::for_bytes(b"root"), mountpoint),
-    )
-    .unwrap()
-    .close()
-    .unwrap();
-    let database = home.join("active/session.db");
+    let root = Digest::for_bytes(b"root");
+    let session = open_session(&temp, root);
+    session.close().unwrap();
+    let config = Config {
+        rfs_home: temp.path().join("home"),
+    };
+    let database = config.rfs_home.join("active/session.db");
     let before = fs::read(&database).unwrap();
 
-    let reader = open_reader(Config {
-        rfs_home: home.clone(),
-    })
-    .unwrap();
-    let session = reader.session().unwrap().unwrap();
-    assert_eq!(session.state, SessionLifecycle::Closed);
+    let retained = Session::inspect(&config).unwrap().unwrap();
+    assert_eq!(retained.state, SessionLifecycle::Closed);
     assert_eq!(fs::read(&database).unwrap(), before);
 
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(home.join("active.lock"))
+        .open(config.rfs_home.join("active.lock"))
         .unwrap();
     let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    assert_eq!(
-        result, 0,
-        "read-only state unexpectedly acquired daemon lock"
-    );
+    assert_eq!(result, 0, "inspection unexpectedly acquired daemon lock");
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
 }
 
 #[test]
-fn concurrent_filesystem_commands_share_stable_atomic_allocations() {
+fn concurrent_materialization_uses_stable_atomic_allocations() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
-    let mountpoint = temp.path().join("mount");
-    fs::create_dir(&mountpoint).unwrap();
     let root = Digest::for_bytes(b"root");
-    let daemon = open_daemon(
-        Config { rfs_home: home },
-        SessionStartup::new(root.clone(), mountpoint),
-    )
-    .unwrap();
-    let filesystem = daemon.filesystem_state();
+    let session = open_session(&temp, root.clone());
     let children = vec![
-        RemoteNodeIdentity {
+        RemoteChild {
             name: "directory".into(),
-            kind: RemoteNodeKind::Directory,
-            content_identity: Digest::for_bytes(b"directory").to_string(),
+            content: RemoteContent::Directory(Digest::for_bytes(b"directory")),
+            mode: None,
+            mtime: None,
         },
-        RemoteNodeIdentity {
+        RemoteChild {
             name: "file".into(),
-            kind: RemoteNodeKind::File,
-            content_identity: Digest::for_bytes(b"file").to_string(),
+            content: RemoteContent::File(Digest::for_bytes(b"file")),
+            mode: Some(0o640),
+            mtime: None,
         },
     ];
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+    let barrier = Arc::new(Barrier::new(9));
     let mut threads = Vec::new();
     for _ in 0..8 {
-        let filesystem = filesystem.clone();
+        let session = Arc::clone(&session);
         let root = root.clone();
         let children = children.clone();
-        let barrier = barrier.clone();
+        let barrier = Arc::clone(&barrier);
         threads.push(std::thread::spawn(move || {
             barrier.wait();
-            filesystem
-                .materialize_remote_directory(ROOT_INODE, &root, &children)
+            session
+                .materialize_directory(InodeId::ROOT, &root, children)
                 .unwrap()
         }));
     }
@@ -151,6 +125,41 @@ fn concurrent_filesystem_commands_share_stable_atomic_allocations() {
         .map(|thread| thread.join().unwrap())
         .collect::<Vec<_>>();
     assert!(allocations.windows(2).all(|window| window[0] == window[1]));
-    drop(filesystem);
-    daemon.close().unwrap();
+    assert!(allocations[0].iter().all(|node| node.inode > InodeId::ROOT));
+    session.close().unwrap();
+}
+
+#[test]
+fn sqlite_is_authoritative_and_applies_effective_metadata_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = Digest::for_bytes(b"root");
+    let session = open_session(&temp, root.clone());
+    let nodes = session
+        .materialize_directory(
+            InodeId::ROOT,
+            &root,
+            vec![RemoteChild {
+                name: "file".into(),
+                content: RemoteContent::File(Digest::for_bytes(b"contents")),
+                mode: None,
+                mtime: None,
+            }],
+        )
+        .unwrap();
+    let file = &nodes[0];
+    assert_eq!(file.kind, NodeKind::File);
+    assert_eq!(file.mode, 0o444);
+    assert_eq!(file.mtime.seconds(), 0);
+    assert_eq!(session.node(file.inode).unwrap(), *file);
+    session.close().unwrap();
+}
+
+#[test]
+fn missing_home_inspection_creates_nothing() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = Config {
+        rfs_home: temp.path().join("missing"),
+    };
+    assert!(Session::inspect(&config).unwrap().is_none());
+    assert!(!config.rfs_home.exists());
 }
