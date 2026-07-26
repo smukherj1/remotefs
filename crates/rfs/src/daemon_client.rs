@@ -35,10 +35,6 @@ pub struct SessionStatus {
     pub daemon_pid: u32,
     /// Unix socket used for control requests.
     pub control_socket: PathBuf,
-    /// Shared local cache path.
-    pub cache_path: PathBuf,
-    /// Active session state path.
-    pub session_path: PathBuf,
     /// Whether the mounted workspace has unsnapshotted changes.
     pub dirty: bool,
     /// Number of dirty files in the mounted workspace.
@@ -167,8 +163,6 @@ impl DaemonClient {
             mountpoint: response.mountpoint.into(),
             daemon_pid: response.daemon_pid,
             control_socket: response.control_socket.into(),
-            cache_path: response.cache_path.into(),
-            session_path: response.session_path.into(),
             dirty: response.dirty,
             dirty_files: response.dirty_files,
             cached_blobs: response.cached_blobs,

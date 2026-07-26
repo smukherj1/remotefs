@@ -16,7 +16,7 @@ This document captures implementation and architecture decisions. Product scope 
   - `rfs`: user-facing CLI.
   - `rfsd`: long-running mount daemon.
 - Use SQLite through `rusqlite` for durable session and overlay state.
-- Allow at most one active mount session per `RFS_HOME`, coordinated by a stable `RFS_HOME/active.lock` outside the removable session tree.
+- Allow at most one active mount session per `RFS_HOME`, coordinated by a stable `RFS_HOME/session.lock` outside the removable session tree.
 - Use one Unix control socket per active `RFS_HOME` session for CLI-to-daemon commands.
 - Use whole-file copy-on-write for remote-backed file mutations.
 - Use full-workspace snapshotting for the earliest writable MVP.
@@ -145,7 +145,7 @@ RemoteFS is a Cargo workspace whose manifests enforce process ownership:
 ```text
 crates/rfs/
   src/main.rs            # rfs binary entrypoint
-  src/cli/               # command parsing, coordination, and presentation
+  src/cli.rs             # command parsing, coordination, and presentation
   src/daemon_client.rs   # command-oriented control client and private transport
   src/bootstrap_upload.rs # narrow local-directory upload workflow
 crates/rfsd/
@@ -154,7 +154,8 @@ crates/rfsd/
   src/filesystem.rs      # remote-aware filesystem orchestration
   src/fuse.rs            # synchronous FUSE adapter
 crates/rfs-common/
-  src/session/           # concrete local-session facade and private components
+  src/session.rs         # concrete local-session facade and public API
+  src/session/           # private cache, overlay, store, and schema components
   src/                   # shared domain, storage, protocol, and logging modules
 ```
 
@@ -218,15 +219,29 @@ and then asks `Session` to verify, sync, and atomically admit the completed
 object. The async tonic implementation is bridged inside the remote-aware
 daemon layer and does not make the FUSE or local-session APIs asynchronous.
 
-The MVP permits only one active mount session per `RFS_HOME`. `rfs mount` acquires `RFS_HOME/active.lock` before starting `rfsd`; if another process holds that advisory lock, the mount fails and reports its diagnostic lock metadata when readable. The lock is outside `RFS_HOME/active/` so cleanup or replacement never removes the inode that coordinates ownership. This simplifies daemon discovery and prevents two writable overlays from sharing the same active state root. Concurrent mounts require distinct `RFS_HOME` values.
+The MVP permits only one active mount session per `RFS_HOME`. `rfs mount`
+acquires `RFS_HOME/session.lock` before starting `rfsd`; if another process
+holds that advisory lock, the mount fails and reports its diagnostic lock
+metadata when readable. The lock is outside `RFS_HOME/session/` so replacement
+never removes the inode that coordinates ownership. This simplifies daemon
+discovery and prevents two writable overlays from sharing the same session
+state root. Concurrent mounts require distinct `RFS_HOME` values.
 
 `rfs snapshot`, `rfs status`, and `rfs unmount` discover session state from `RFS_HOME`. Their mountpoint argument is optional in the MVP. If supplied, the CLI requires it to exist as a directory, canonicalizes it to an absolute path with symlinks resolved, and validates that it matches the canonical active-session mountpoint before sending the request.
 
 `rfs status` reports only session state:
 
-- If a live active session exists, it talks to the daemon through the active session's Unix control socket and reports mountpoint, root digest, daemon pid/socket, cache/session paths, counters, dirty state, and snapshot blockers.
-- If no live session exists but `RFS_HOME/active/` remains, it reports cleanly closed or stale session metadata as appropriate. Stale state includes manual `RFS_HOME` deletion guidance.
-- If neither live nor retained session state exists, it reports a clean no-session state.
+- If a live active session exists, it talks to the daemon through the session's
+  Unix control socket and reports mountpoint, root digest, daemon PID/socket,
+  counters, dirty state, and snapshot blockers. Cache and session paths remain
+  private implementation details and are not part of the control response or
+  CLI JSON.
+- If no live session exists but `RFS_HOME/session/` remains, it reports cleanly
+  closed or stale session metadata as appropriate. Stale state includes manual
+  `RFS_HOME` deletion guidance.
+- If `RFS_HOME` exists but contains neither live nor retained session state, it
+  reports a clean no-session state. A missing `RFS_HOME` is an inspection error
+  rather than an implicit no-session result.
 
 RemoteFS does not include `rfs doctor` in the MVP. Configuration, CAS, path, FUSE, and root-digest validation happen in the commands that need them: `upload`, `mount`, `snapshot`, and `unmount`.
 
@@ -236,14 +251,13 @@ Default state root:
 
 ```text
 $HOME/.rfs/
-  active.lock
+  session.lock
   cache/
-    blobs/
-      <2-hex-prefix>/
-        <sha256-hex>-<size>
-  active/
+    <2-hex-prefix>/
+      <sha256-hex>-<size>
+  session/
     session.db
-    rfsd.log
+    session.log
     overlay/
       data/
       tmp/
@@ -263,20 +277,27 @@ digest, syncs the file, and atomically admits it without overwriting an existing
 entry. Decoded directories and inode maps are not retained as a second
 authoritative namespace view.
 
-Active session state is isolated under `RFS_HOME/active/`:
+Active session state is isolated under `RFS_HOME/session/`:
 
 - SQLite overlay/session database.
 - Local files for copied-up and newly created file contents.
 - Control socket.
 - Session logs and SQLite-backed session metadata.
 
-Only one active session may exist for an `RFS_HOME` at a time. Clean unmount transactionally marks the session `closed`, then leaves `RFS_HOME/active/` in place for inspection. The next mount, while holding `active.lock`, automatically removes only a valid cleanly closed `active/` tree and preserves the shared cache. Unclean, partial, malformed, corrupt, or unsupported session state is left untouched and blocks startup with guidance to delete the configured `RFS_HOME` manually. The MVP has no cleanup command or automated partial repair path.
+Only one active session may exist for an `RFS_HOME` at a time. Clean unmount
+transactionally marks the session `closed`, then leaves `RFS_HOME/session/` in
+place for inspection. The next mount, while holding `session.lock`,
+automatically removes only a valid cleanly closed `session/` tree and preserves
+the shared cache. Unclean, partial, malformed, corrupt, or unsupported session
+state is left untouched and blocks startup with guidance to delete the
+configured `RFS_HOME` manually. The MVP has no cleanup command or automated
+partial repair path.
 
 Local cache eviction is deferred. The earliest MVP may provide manual pruning only. Remote CAS eviction is a deployment concern and must be disabled or capacity-provisioned during MVP evaluation.
 
 ## State Database Schema
 
-`session/active/schema.sql` documents the durable tables and columns. Private
+`session/schema.sql` documents the durable tables and columns. Private
 Rust row translation in the session module documents and enforces their domain
 meaning.
 The durable domain tables are:
@@ -536,14 +557,15 @@ The completed architecture-boundary slice supports:
 - Four standard levels: error, warn, info, and debug.
 - Text or JSON Lines process logging configured once at startup.
 - CLI logs on stderr and command results on stdout.
-- Daemon logs in `RFS_HOME/active/rfsd.log` after state layout establishment.
+- Daemon logs in `RFS_HOME/session/session.log` after state layout establishment.
 - Lifecycle and upload-summary events with structured operation fields.
 - No routine per-file lookup, traversal, cache-probe, read, or write event stream.
 
 The later MVP observability work should extend this with:
 
 - CLI logs go to stderr only. Command results and JSON summaries go to stdout.
-- `rfsd` logs remain inspectable with the active or cleanly closed session until the next mount replaces that session or the user manually removes `RFS_HOME`.
+- `rfsd` logs remain inspectable with the active or cleanly closed session until
+  the next mount replaces that session or the user manually removes `RFS_HOME`.
 - Human-readable compact text logs by default.
 - JSON Lines logs and JSON command summaries via `--output-format json`; text logs and human command summaries via `--output-format text`.
 - `--log-level` and `--output-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.

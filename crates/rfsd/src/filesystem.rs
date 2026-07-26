@@ -80,6 +80,9 @@ pub enum FilesystemError {
         #[source]
         source: SessionError,
     },
+    /// An inode has an invalid state.
+    #[error("inode {inode} has an invalid state: {reason}")]
+    InvalidInode { inode: InodeId, reason: String },
     /// The mutex serializing the CAS client was poisoned.
     #[error("CAS client lock is poisoned while downloading {digest}")]
     CasLock { digest: Digest },
@@ -165,15 +168,11 @@ impl<S: BlobStore + Send> FilesystemService<S> {
                 },
             ));
         }
-        node.symlink_target.ok_or_else(|| {
-            session_error(
+        node.symlink_target
+            .ok_or_else(|| FilesystemError::InvalidInode {
                 inode,
-                SessionError::StaleSession {
-                    path: self.session.info().active_root,
-                    reason: format!("symlink inode {inode} has no target"),
-                },
-            )
-        })
+                reason: format!("symlink {} is missing a target", node.name),
+            })
     }
 
     /// Reads a byte range after ensuring complete immutable content is admitted.
@@ -204,13 +203,13 @@ impl<S: BlobStore + Send> FilesystemService<S> {
                     .map_err(|source| session_error(inode, source))?
                 {
                     LocalRead::Ready(bytes) => Ok(bytes),
-                    LocalRead::NeedsDownload { digest } => Err(session_error(
+                    LocalRead::NeedsDownload { digest } => Err(FilesystemError::InvalidInode {
                         inode,
-                        SessionError::StaleSession {
-                            path: self.session.info().cache_root,
-                            reason: format!("blob {digest} remained missing after admission"),
-                        },
-                    )),
+                        reason: format!(
+                            "inode with digest {} remained missing after admission",
+                            digest
+                        ),
+                    }),
                 }
             }
         }
@@ -276,16 +275,9 @@ impl<S: BlobStore + Send> FilesystemService<S> {
                 self.session
                     .read_blob(digest)
                     .map_err(|source| session_error(inode, source))?
-                    .ok_or_else(|| {
-                        session_error(
-                            inode,
-                            SessionError::StaleSession {
-                                path: self.session.info().cache_root,
-                                reason: format!(
-                                    "directory blob {digest} remained missing after admission"
-                                ),
-                            },
-                        )
+                    .ok_or_else(|| FilesystemError::InvalidInode {
+                        inode,
+                        reason: format!("directory node {digest} remained missing after admission"),
                     })?
             }
         };

@@ -431,7 +431,21 @@ fn render_active_status(status: SessionStatus, json: bool) {
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema_version":1,"command":"status","ok":true,"data":{"state":"active","mountpoint":status.mountpoint,"root_digest":status.root_digest,"daemon_pid":status.daemon_pid,"control_socket":status.control_socket,"cache_path":status.cache_path,"session_path":status.session_path,"dirty":status.dirty,"dirty_files":status.dirty_files,"cached_blobs":status.cached_blobs,"snapshot_blockers":status.snapshot_blockers}})
+            serde_json::json!({
+                "schema_version":1,
+                "command":"status",
+                "ok":true,"data":{
+                    "state":"active",
+                    "mountpoint":status.mountpoint,
+                    "root_digest":status.root_digest,
+                    "daemon_pid":status.daemon_pid,
+                    "control_socket":status.control_socket,
+                    "dirty":status.dirty,
+                    "dirty_files":status.dirty_files,
+                    "cached_blobs":status.cached_blobs,
+                    "snapshot_blockers":status.snapshot_blockers
+                }
+            })
         );
     } else {
         println!(

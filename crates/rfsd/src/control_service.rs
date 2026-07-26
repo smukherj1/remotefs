@@ -45,12 +45,11 @@ struct ControlService {
 impl ControlService {
     fn protocol_error(&self, version: u32) -> Option<Status> {
         if version == PROTOCOL_VERSION {
-            None
-        } else {
-            Some(Status::failed_precondition(format!(
-                "incompatible protocol version {version}; daemon requires {PROTOCOL_VERSION}"
-            )))
+            return None;
         }
+        Some(Status::failed_precondition(format!(
+            "incompatible protocol version {version}; daemon requires {PROTOCOL_VERSION}"
+        )))
     }
 }
 
@@ -84,8 +83,6 @@ impl protocol::control_server::Control for ControlService {
             protocol_version: PROTOCOL_VERSION,
             daemon_pid: self.info.daemon_pid,
             control_socket: self.info.control_endpoint.to_string_lossy().into_owned(),
-            cache_path: self.info.cache_root.to_string_lossy().into_owned(),
-            session_path: self.info.active_root.to_string_lossy().into_owned(),
             dirty: false,
             snapshot_blockers: vec!["snapshot is not implemented".into()],
         }))

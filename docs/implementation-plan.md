@@ -697,13 +697,17 @@ Definition of done:
 ### Step 5.4: Concrete Session Facade and Streaming Cache (Complete)
 
 This step supersedes the internal trait/worker/cache architecture left by the
-completed historical steps without changing the read-only command surface.
-`docs/state-module-simplification.md` is the detailed design handoff.
+completed historical steps without changing the read-only command surface. Its
+settled architecture is incorporated here and in `docs/technical-design.md`;
+the temporary design-handoff document has been removed.
 
 Deliverables:
 
 - Rename the common facade module to `rfs_common::session` and introduce one
   concrete, synchronous `Session`.
+- Use the modern Rust module layout: keep the facade in `src/session.rs` and
+  its private cache, overlay, store, and schema components under `src/session/`;
+  keep the CLI module in `crates/rfs/src/cli.rs`.
 - Split private ownership into `BlobCache` and `ActiveSession`, with
   `ActiveSession` privately owning `SessionStore` and `OverlayStore`. Do not
   expose child accessors.
@@ -717,9 +721,15 @@ Deliverables:
   directory maps; lazily materialize complete remote child sets atomically and
   idempotently through `Session`.
 - Unify file data and serialized REAPI directories under
-  `cache/blobs/<shard>/<hash>-<size>`. Ignore obsolete development
+  `cache/<shard>/<hash>-<size>`. Ignore obsolete development `cache/blobs` and
   `cache/dirs` data; no migration support for existing development state is
   required.
+- Centralize fixed paths in the private session layout:
+  `RFS_HOME/session.lock`, `RFS_HOME/session/`,
+  `RFS_HOME/session/control.sock`, and
+  `RFS_HOME/session/session.log`. Do not expose cache or session roots through
+  `SessionInfo`; it contains only the root digest, mountpoint, daemon PID,
+  control endpoint, and log path needed by daemon startup.
 - Keep every `Session` and `FilesystemService` operation synchronous.
   `FilesystemService` remains in `rfsd`, owns the CAS and REAPI orchestration,
   and uses a keyed map only to deduplicate in-progress remote downloads.
@@ -729,10 +739,14 @@ Deliverables:
   `Session::finalize_blob`.
 - Use one contextual `SessionError` throughout the private local hierarchy.
   Keep CAS, REAPI decoding, and remote orchestration errors owned by
-  `FilesystemService`.
+  `FilesystemService`. Represent impossible post-admission inode states with a
+  daemon-owned `FilesystemError::InvalidInode` and map them to `EIO`, rather
+  than fabricating path-based stale-session errors.
 - Compose live daemon status from `Session::info` plus daemon telemetry and
-  feature state. Keep control-endpoint discovery separate from one-shot
-  retained inspection.
+  feature state. Keep cache and session roots out of the control protocol and
+  CLI JSON. Keep control-endpoint discovery separate from one-shot retained
+  inspection; inspection of a missing `RFS_HOME` is an error, while an existing
+  home without a session returns the clean no-session outcome.
 
 Task targets:
 
@@ -759,9 +773,10 @@ Tests:
 - Integration: unified cache entries are reused by both directory decoding and
   file reads across sequential fresh sessions.
 - Integration: retained inspection remains read-only, clean close remains
-  idempotent and completion-based, and stale state remains untouched.
+  idempotent and completion-based, stale state remains untouched, and missing
+  `RFS_HOME` is distinguished from an existing home with no retained session.
 - E2E: the completed read-only mount workflow and status output have no
-  observable regressions.
+  cache-path or session-path fields.
 
 Definition of done:
 
@@ -1007,12 +1022,14 @@ Deliverables:
   - Require a `schema_version` bump before removing fields or changing field types.
   - Print one JSON object on `--output-format json` failure for machine consumers; keep logs separate.
 - Route CLI logs to stderr only. Command results and JSON summaries go to stdout.
-- Write daemon logs to `RFS_HOME/active/rfsd.log`.
+- Write daemon logs to `RFS_HOME/session/session.log`.
 - Use compact human-readable text output and logs by default and JSON summaries plus JSON Lines logs when `--output-format json` is selected.
 - Apply `--log-level` and `--output-format` to both `rfs` and any spawned `rfsd`.
 - Store effective daemon log level and format in the SQLite
   `session_metadata` table for `rfs status`.
-- Preserve the session log file with `RFS_HOME/active` until the next mount replaces a clean session or the user manually removes `RFS_HOME`; no log rotation in the MVP.
+- Preserve the session log file with `RFS_HOME/session` until the next mount
+  replaces a clean session or the user manually removes `RFS_HOME`; no log
+  rotation in the MVP.
 - Include timestamp, level, target/module, session id, operation, path/digest where relevant, and message in daemon log events.
 
 Task targets:
@@ -1031,8 +1048,11 @@ Tests:
 - Unit: JSON failure output uses the same envelope with `ok: false`.
 - Unit: CLI logs use stderr and command summaries use stdout.
 - Unit: output format flag selects text or JSON Lines formatting.
-- Integration: daemon status includes mount root, cache paths, session paths, and counters.
-- Integration: spawned daemon writes `RFS_HOME/active/rfsd.log` and status reports log level/format.
+- Integration: daemon status includes mount root, daemon PID/control socket,
+  counters, dirty state, and snapshot blockers without exposing cache or
+  session roots.
+- Integration: spawned daemon writes `RFS_HOME/session/session.log` and status
+  reports log level/format.
 - Integration: status reports cleanly closed session metadata after clean unmount and distinguishes it from stale state.
 - E2E: read a file through mount and observe counter changes.
 

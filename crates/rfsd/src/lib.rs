@@ -101,7 +101,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     .context("initialize daemon session logging")?;
     tracing::info!(
         operation = "daemon_start",
-        session_path = %info.active_root.display(),
         mountpoint = %info.mountpoint.display(),
         digest = %info.root_digest,
         "daemon session active"

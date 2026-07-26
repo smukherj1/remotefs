@@ -33,6 +33,7 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 - Check an invariant once per function. Revalidate across boundaries only if data may change or the check prevents memory corruption, termination, or an invalid external operation.
 - Keep refactors within the ownership boundary of the change. Separate unrelated cleanup.
 - Prefer direct code over single-use abstractions that hide control flow.
+- ALWAYS use the modern rust module layout, i.e., NEVER create <module name>/mod.rs. Instead create <module name>.rs and <mod ulename>/<sub module>.rs files.
 
 ## Types, Configuration, and Data
 

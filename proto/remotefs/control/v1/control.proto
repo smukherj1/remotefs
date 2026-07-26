@@ -50,14 +50,10 @@ message StatusResponse {
   uint32 daemon_pid = 7;
   // Path to the active session's Unix control socket.
   string control_socket = 8;
-  // Path to the persistent local cache.
-  string cache_path = 9;
-  // Path to the active session state.
-  string session_path = 10;
   // Whether the session contains local changes.
-  bool dirty = 11;
+  bool dirty = 9;
   // Human-readable reasons that currently prevent a snapshot.
-  repeated string snapshot_blockers = 12;
+  repeated string snapshot_blockers = 10;
 }
 
 // Requests creation of a remote snapshot.

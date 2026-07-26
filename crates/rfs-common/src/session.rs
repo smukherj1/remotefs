@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::digest::Digest;
-use crate::error_context::ResultContextError;
+use crate::error_context::{ResultContext, ResultContextError};
 
 pub use crate::tree::NodeKind;
 pub use cache::{BlobDownloader, BlobWriter};
@@ -205,15 +205,11 @@ pub struct SessionInfo {
     pub root_digest: Digest,
     /// Canonical mounted workspace path.
     pub mountpoint: PathBuf,
-    /// Process identifier recorded at construction.
+    /// Daemon process ID.
     pub daemon_pid: u32,
-    /// Fixed Unix control-socket path.
+    /// Path to the Unix socket serving the daemon's control endpoint.
     pub control_endpoint: PathBuf,
-    /// Shared cache root used for diagnostics.
-    pub cache_root: PathBuf,
-    /// Active-session root used for diagnostics.
-    pub active_root: PathBuf,
-    /// Daemon log path used during logging initialization.
+    /// Path to the file containing the daemon logs for a session.
     pub log_path: PathBuf,
 }
 
@@ -310,7 +306,9 @@ impl ResultContextError for SessionError {
 
 /// Concrete synchronous facade for all local storage used by one workspace.
 pub struct Session {
-    info: SessionInfo,
+    root_digest: Digest,
+    mountpoint: PathBuf,
+    layout: SessionLayout,
     cache: BlobCache,
     active: ActiveSession,
 }
@@ -322,27 +320,43 @@ impl Session {
         root_digest: Digest,
         mountpoint: impl AsRef<Path>,
     ) -> Result<Self, SessionError> {
-        let mountpoint = canonicalize_mountpoint(mountpoint.as_ref())?;
-        let home = writable_home(&config)?;
-        validate_top_level(&home)?;
-        let cache = BlobCache::open(home.join("cache/blobs"))?;
+        let mountpoint = canonicalize_mountpoint(mountpoint.as_ref()).with_context(|| {
+            format!(
+                "unable to canonizalize session mountpoint {}",
+                mountpoint.as_ref().display()
+            )
+        })?;
+        let home = writable_home(&config)
+            .with_context(|| format!("unable to set up the session writable home directory"))?;
+        validate_top_level(&home).with_context(|| {
+            format!("while validating session home directory {}", home.display())
+        })?;
+        let layout = SessionLayout::new(&home);
+        let cache = BlobCache::open(layout.cache.clone()).with_context(|| {
+            format!(
+                "while initializing the blob cache in {}",
+                layout.cache.display()
+            )
+        })?;
+
         let active = ActiveSession::open(
-            home.join("active"),
-            home.join("active.lock"),
+            layout.session.clone(),
+            layout.session_lock.clone(),
             root_digest.clone(),
             mountpoint.clone(),
-        )?;
-        let info = SessionInfo {
+        )
+        .with_context(|| {
+            format!(
+                "while initializing active session in {} with lock {}",
+                layout.session.display(),
+                layout.session_lock.display()
+            )
+        })?;
+
+        Ok(Self {
             root_digest,
             mountpoint,
-            daemon_pid: std::process::id(),
-            control_endpoint: active.root.join("control.sock"),
-            cache_root: home.join("cache"),
-            active_root: active.root.clone(),
-            log_path: active.root.join("rfsd.log"),
-        };
-        Ok(Self {
-            info,
+            layout,
             cache,
             active,
         })
@@ -350,18 +364,29 @@ impl Session {
 
     /// Returns immutable startup and live-status facts without rereading SQLite.
     pub fn info(&self) -> SessionInfo {
-        self.info.clone()
+        SessionInfo {
+            root_digest: self.root_digest.clone(),
+            mountpoint: self.mountpoint.clone(),
+            daemon_pid: std::process::id(),
+            control_endpoint: self.layout.control_endpoint.clone(),
+            log_path: self.layout.session_logs.clone(),
+        }
     }
 
     /// Derives the fixed control endpoint without opening SQLite or mutating state.
     pub fn control_endpoint(config: &Config) -> Result<PathBuf, SessionError> {
-        Ok(reader_home(config)?.join("active/control.sock"))
+        let home = reader_home(config)
+            .with_context(|| format!("unable to open home directory for inspection"))?;
+        let layout = SessionLayout::new(&home);
+        Ok(layout.control_endpoint.clone())
     }
 
     /// Performs one-shot read-only retained-session inspection.
     pub fn inspect(config: &Config) -> Result<Option<RetainedSession>, SessionError> {
-        let home = reader_home(config)?;
-        ActiveSession::inspect(&home.join("active"), &home.join("active.lock"))
+        let home = reader_home(config)
+            .with_context(|| format!("unable to open home directory for inspection"))?;
+        let layout = SessionLayout::new(&home);
+        ActiveSession::inspect(&layout.session, &layout.session_lock)
     }
 
     /// Returns one visible inode from authoritative SQLite state.
@@ -455,7 +480,6 @@ pub fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, SessionError> {
 }
 
 struct ActiveSession {
-    root: PathBuf,
     resources: Mutex<Option<ActiveResources>>,
 }
 
@@ -500,7 +524,6 @@ impl ActiveSession {
             mountpoint,
         )?;
         Ok(Self {
-            root,
             resources: Mutex::new(Some(ActiveResources {
                 store,
                 overlay,
@@ -707,10 +730,16 @@ fn writable_home(config: &Config) -> Result<PathBuf, SessionError> {
 
 fn reader_home(config: &Config) -> Result<PathBuf, SessionError> {
     if config.rfs_home.exists() {
-        canonical_private_home(&config.rfs_home)
-    } else {
-        Ok(config.rfs_home.clone())
+        return canonical_private_home(&config.rfs_home);
     }
+
+    Err(SessionError::StaleSession {
+        path: config.rfs_home.clone(),
+        reason: format!(
+            "unable to query session status because session home directory {} does not exist",
+            config.rfs_home.display()
+        ),
+    })
 }
 
 fn canonical_private_home(path: &Path) -> Result<PathBuf, SessionError> {
@@ -898,5 +927,35 @@ pub(super) fn db_error(
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+/// Layout of files under the home directory maintain by the rfs daemon. This
+/// includes both the blob cache that can live across sessions as well as
+/// files created for a specific daemon session.
+struct SessionLayout {
+    /// Directory containing cached blobs downloaded from the CAS server.
+    cache: PathBuf,
+    /// Directory containing files and directories for the active session.
+    session: PathBuf,
+    /// Lock file for the active session.
+    session_lock: PathBuf,
+    /// The UDS socket serving the daemon's control endpoint.
+    control_endpoint: PathBuf,
+    /// File containing daemon logs for the session.
+    session_logs: PathBuf,
+}
+
+impl SessionLayout {
+    // Initialize a new session layout under the given rfsd home directory.
+    fn new(home: &PathBuf) -> Self {
+        let session = home.join("session");
+        Self {
+            cache: home.join("cache"),
+            session: session.clone(),
+            session_lock: home.join("session.lock"),
+            control_endpoint: session.join("control.sock"),
+            session_logs: session.join("session.log"),
+        }
     }
 }

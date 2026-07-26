@@ -440,6 +440,7 @@ fn errno_for_error(error: FilesystemError) -> i32 {
         | FilesystemError::Directory { .. }
         | FilesystemError::Session { .. }
         | FilesystemError::CasLock { .. }
+        | FilesystemError::InvalidInode { .. }
         | FilesystemError::DownloadLock { .. } => EIO,
     }
 }
