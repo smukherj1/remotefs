@@ -1,4 +1,7 @@
-version: '3'
+version: "3"
+
+env:
+  RUST_TEST_NOCAPTURE: "1"
 
 vars:
   HOST_UID:
@@ -75,10 +78,10 @@ tasks:
     cmds:
       - cargo test -p rfs --test upload_integration
 
-  test:integration:state:
-    desc: Verify local state and foreground daemon lifecycle behavior
+  test:integration:session:
+    desc: Verify local session and foreground daemon lifecycle behavior
     cmds:
-      - cargo test -p rfs-common --test state_integration
+      - cargo test -p rfs-common --test session_integration
 
   test:integration:daemon:
     desc: Verify Unix control socket and daemon lifecycle behavior

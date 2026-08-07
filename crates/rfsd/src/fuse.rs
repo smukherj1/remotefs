@@ -441,7 +441,8 @@ fn errno_for_error(error: FilesystemError) -> i32 {
         | FilesystemError::Session { .. }
         | FilesystemError::CasLock { .. }
         | FilesystemError::InvalidInode { .. }
-        | FilesystemError::DownloadLock { .. } => EIO,
+        | FilesystemError::DownloadLock { .. }
+        | FilesystemError::Context { .. } => EIO,
     }
 }
 

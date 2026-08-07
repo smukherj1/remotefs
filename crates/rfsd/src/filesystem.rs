@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use rfs_common::cas::{BlobStore, CasError};
-use rfs_common::digest::{Digest, DigestError};
+use rfs_common::digest::{Digest, DigestError, EMPTY_DIGEST};
+use rfs_common::error_context::{ResultContext, ResultContextError};
 use rfs_common::reapi::remote_execution::{Directory, NodeProperties};
 use rfs_common::session::{
-    BlobDownloader, InodeId, LocalRead, Lookup, Node, NodeKind, NodeTime, RemoteChild,
-    RemoteContent, Session, SessionError,
+    InodeId, LocalRead, Lookup, Node, NodeKind, NodeTime, RemoteChild, RemoteContent, Session,
+    SessionError,
 };
 use rfs_common::tree::{TreeError, decode_directory};
 use thiserror::Error;
@@ -87,12 +88,29 @@ pub enum FilesystemError {
     #[error("CAS client lock is poisoned while downloading {digest}")]
     CasLock { digest: Digest },
     /// A per-digest download-coordination mutex was poisoned.
-    #[error("download lock is poisoned for {digest}")]
-    DownloadLock { digest: Digest },
+    #[error("download lock is poisoned for {digest}: {details}")]
+    DownloadLock { digest: Digest, details: String },
+    /// Additional owning-operation context for another filesystem error.
+    #[error("{operation}: {source}")]
+    Context {
+        operation: String,
+        #[source]
+        source: Box<FilesystemError>,
+    },
+}
+
+impl ResultContextError for FilesystemError {
+    fn with_context(self, operation: String) -> Self {
+        Self::Context {
+            operation,
+            source: Box::new(self),
+        }
+    }
 }
 
 /// Remote-aware synchronous filesystem service.
 pub struct FilesystemService<S> {
+    // TODO: Remove mutex. Clone client before using.
     store: Mutex<S>,
     session: Arc<Session>,
     runtime: Handle,
@@ -129,6 +147,9 @@ impl<S: BlobStore + Send> FilesystemService<S> {
 
     /// Looks up one direct child without fetching child directory metadata.
     pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Node, FilesystemError> {
+        let mut materialized = false;
+        let mut last_digest = EMPTY_DIGEST.clone();
+
         loop {
             match self
                 .session
@@ -136,8 +157,24 @@ impl<S: BlobStore + Send> FilesystemService<S> {
                 .map_err(|source| session_error(parent, source))?
             {
                 Lookup::Ready(node) => return Ok(node),
+                Lookup::NeedsMaterialization { digest } if !materialized => {
+                    tracing::info!(
+                        "Materializing directory inode {} with digest {}",
+                        parent,
+                        digest
+                    );
+                    self.materialize_remote_directory(parent, &digest).with_context(|| format!("failed to materialize node named {} with digest {} in parent inode {}", name, digest, parent))?;
+                    materialized = true;
+                    last_digest = digest;
+                }
                 Lookup::NeedsMaterialization { digest } => {
-                    self.materialize_remote_directory(parent, &digest)?;
+                    return Err(FilesystemError::InvalidInode {
+                        inode: parent,
+                        reason: format!(
+                            "child node {} in inode {} needs materialization as digest {} despite just being materialized as digest {}",
+                            name, parent, digest, last_digest
+                        ),
+                    });
                 }
             }
         }
@@ -177,42 +214,48 @@ impl<S: BlobStore + Send> FilesystemService<S> {
 
     /// Reads a byte range after ensuring complete immutable content is admitted.
     pub fn read(&self, inode: InodeId, offset: u64, size: usize) -> Result<Bytes, FilesystemError> {
-        match self
+        let read_result = self
             .session
             .read_range(inode, offset, size)
-            .map_err(|source| session_error(inode, source))?
-        {
-            LocalRead::Ready(bytes) => {
-                self.counters
-                    .blob_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                Ok(bytes)
-            }
-            LocalRead::NeedsDownload { digest } => {
-                if self.ensure_blob(&digest, "file blob")? {
-                    self.counters.blob_downloads.fetch_add(1, Ordering::Relaxed);
-                    self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.counters
-                        .blob_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                match self
-                    .session
-                    .read_range(inode, offset, size)
-                    .map_err(|source| session_error(inode, source))?
-                {
-                    LocalRead::Ready(bytes) => Ok(bytes),
-                    LocalRead::NeedsDownload { digest } => Err(FilesystemError::InvalidInode {
-                        inode,
-                        reason: format!(
-                            "inode with digest {} remained missing after admission",
-                            digest
-                        ),
-                    }),
-                }
-            }
+            .map_err(|source| session_error(inode, source))?;
+        if let LocalRead::Ready(bytes) = read_result {
+            self.counters
+                .blob_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(bytes);
         }
+        let LocalRead::NeedsDownload { digest } = read_result else {
+            return Err(FilesystemError::InvalidInode {
+                inode,
+                reason: format!(
+                    "inode read returned unhandled local result: {}",
+                    read_result
+                ),
+            });
+        };
+        if self.ensure_blob(&digest, "file blob")? {
+            self.counters.blob_downloads.fetch_add(1, Ordering::Relaxed);
+            self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters
+                .blob_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let LocalRead::Ready(bytes) = self
+            .session
+            .read_range(inode, offset, size)
+            .map_err(|source| session_error(inode, source))
+            .with_context(|| format!("reading blob {} after downloading", digest))?
+        else {
+            return Err(FilesystemError::InvalidInode {
+                inode,
+                reason: format!(
+                    "inode backed by blob {} failed to register in blob cache despite downloading it",
+                    digest
+                ),
+            });
+        };
+        Ok(bytes)
     }
 
     /// Returns a point-in-time snapshot of read-only fetch counters.
@@ -231,6 +274,7 @@ impl<S: BlobStore + Send> FilesystemService<S> {
     }
 
     fn ensure_directory(&self, inode: InodeId) -> Result<Vec<Node>, FilesystemError> {
+        // TODO: wth is this loop.
         loop {
             match self
                 .session
@@ -294,34 +338,44 @@ impl<S: BlobStore + Send> FilesystemService<S> {
         Ok(())
     }
 
+    // TODO: Ensure blob should first check if blob exists in cache before locking and return
+    // cache hit (i.e. false) if it does. Otherwise, it should acquire lock and download blob.
+    // Then callers don't need to do the unlocked check.
     fn ensure_blob(&self, digest: &Digest, object: &'static str) -> Result<bool, FilesystemError> {
         let lock = self.download_lock(digest)?;
         let _guard = lock.lock().map_err(|_| FilesystemError::DownloadLock {
             digest: digest.clone(),
+            details: "while locking the digest specific lock".to_string(),
         })?;
-        match self
+        if self.session.exists(digest) {
+            return Ok(false);
+        }
+        let mut writer = self
             .session
             .start_blob_download(digest)
-            .map_err(|source| session_error(InodeId::ROOT, source))?
-        {
-            BlobDownloader::Exists => Ok(false),
-            BlobDownloader::Writer(mut writer) => {
-                let mut store = self.store.lock().map_err(|_| FilesystemError::CasLock {
-                    digest: digest.clone(),
-                })?;
-                self.runtime
-                    .block_on(store.stream_blob(digest, &mut writer))
-                    .map_err(|source| FilesystemError::Cas {
-                        object,
-                        digest: digest.clone(),
-                        source: Box::new(source),
-                    })?;
-                self.session
-                    .finalize_blob(*writer)
-                    .map_err(|source| session_error(InodeId::ROOT, source))?;
-                Ok(true)
-            }
-        }
+            .map_err(|source| session_error(InodeId::ROOT, source))
+            .with_context(|| {
+                format!(
+                    "starting download for blob {} that missed the cache",
+                    digest
+                )
+            })?;
+        let mut store = self.store.lock().map_err(|_| FilesystemError::CasLock {
+            digest: digest.clone(),
+        })?;
+        self.runtime
+            .block_on(store.stream_blob(digest, &mut writer))
+            .map_err(|source| FilesystemError::Cas {
+                object,
+                digest: digest.clone(),
+                source: Box::new(source),
+            })
+            .with_context(|| "streaming blob contents from CAS".to_string())?;
+        self.session
+            .finalize_blob(writer)
+            .map_err(|source| session_error(InodeId::ROOT, source))
+            .with_context(|| format!("finalizing downloaded blob {}", digest))?;
+        Ok(true)
     }
 
     fn download_lock(&self, digest: &Digest) -> Result<Arc<Mutex<()>>, FilesystemError> {
@@ -330,6 +384,8 @@ impl<S: BlobStore + Send> FilesystemService<S> {
             .lock()
             .map_err(|_| FilesystemError::DownloadLock {
                 digest: digest.clone(),
+                details: "acquiring lock on the lookup containing digest download locks"
+                    .to_string(),
             })?
             .entry(digest.clone())
             .or_default()
@@ -426,8 +482,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use async_trait::async_trait;
+    use googletest::prelude::*;
     use rfs_common::cas::{Blob, CasOperation, UploadStats};
     use rfs_common::config::Config;
+    use rfs_common::logging;
     use rfs_common::tree::{DirectoryBuilder, FileEntry, NodeKind as TreeNodeKind, NodeMetadata};
 
     use super::*;
@@ -562,6 +620,7 @@ mod tests {
 
     #[test]
     fn unified_cache_is_reused_for_directory_and_file_across_sessions() {
+        logging::init_test();
         let fixture = fixture();
         let temp = tempfile::tempdir().unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -628,13 +687,14 @@ mod tests {
         )
         .unwrap();
         let file = filesystem.lookup(InodeId::ROOT, "hello.txt").unwrap();
-        assert!(matches!(
-            filesystem.read(file.inode, 0, 1),
-            Err(FilesystemError::Session {
-                source: SessionError::BlobIntegrity { .. },
-                ..
-            })
-        ));
+        let Err(read_err) = filesystem.read(file.inode, 0, 1) else {
+            panic!("Lookup of corrupted blob succeeded, expected error.");
+        };
+        read_err.to_string().contains("blob verification failed");
+        assert_that!(
+            read_err.to_string(),
+            contains_substring("blob verification failed")
+        );
         drop(filesystem);
         session.close().unwrap();
     }

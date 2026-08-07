@@ -11,9 +11,9 @@ mod store;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,11 +28,11 @@ use crate::digest::Digest;
 use crate::error_context::{ResultContext, ResultContextError};
 
 pub use crate::tree::NodeKind;
-pub use cache::{BlobDownloader, BlobWriter};
+pub use cache::BlobWriter;
 
 use cache::BlobCache;
 use overlay::OverlayStore;
-use store::{ReadSource, SessionMetadata, SessionStore};
+use store::{ROOT_INODE_ID, ReadSource, SessionStore};
 
 const LOCK_RECORD_VERSION: u32 = 1;
 const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
@@ -44,7 +44,7 @@ pub struct InodeId(i64);
 
 impl InodeId {
     /// Root inode shared by every mounted workspace.
-    pub const ROOT: Self = Self(1);
+    pub const ROOT: Self = Self(ROOT_INODE_ID);
 
     /// Validates a raw inode supplied by an external adapter.
     pub fn new(value: u64) -> Result<Self, SessionError> {
@@ -176,6 +176,15 @@ pub enum LocalRead {
     NeedsDownload { digest: Digest },
 }
 
+impl fmt::Display for LocalRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Ready(..) => "ready",
+            Self::NeedsDownload { .. } => "needs download",
+        })
+    }
+}
+
 /// Durable session lifecycle stored in SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -213,19 +222,6 @@ pub struct SessionInfo {
     pub log_path: PathBuf,
 }
 
-/// Durable fields used by fallback status and mountpoint validation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RetainedSession {
-    /// Process identifier recorded in durable metadata.
-    pub daemon_pid: u32,
-    /// Durable lifecycle observed during inspection.
-    pub state: SessionLifecycle,
-    /// Immutable mounted root digest.
-    pub root_digest: Digest,
-    /// Canonical mountpoint recorded at creation.
-    pub mountpoint: PathBuf,
-}
-
 /// Failures owned by the local session hierarchy.
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -235,11 +231,11 @@ pub enum SessionError {
     /// Another process holds the stable advisory lock.
     #[error("another RemoteFS session owns `{path}`{owner}")]
     ActiveSession { path: PathBuf, owner: String },
-    /// Retained durable state is malformed, partial, or unsupported.
+    /// Session state does not exist or is malformed.
     #[error(
-        "stale or malformed session state at `{path}`; delete `RFS_HOME` and start again: {reason}"
+        "missing or malformed session state at `{path}`; delete the session directory (if it exists) and start again: {reason}"
     )]
-    StaleSession { path: PathBuf, reason: String },
+    InvalidSession { path: PathBuf, reason: String },
     /// A named local filesystem operation failed.
     #[error("filesystem operation on `{path}` failed: {source}")]
     Filesystem {
@@ -320,18 +316,21 @@ impl Session {
         root_digest: Digest,
         mountpoint: impl AsRef<Path>,
     ) -> Result<Self, SessionError> {
+        tracing::info!(
+            "Session::open(home={}, root_digest={}, mountpoint={}",
+            config.rfs_home.display(),
+            root_digest,
+            mountpoint.as_ref().display()
+        );
         let mountpoint = canonicalize_mountpoint(mountpoint.as_ref()).with_context(|| {
             format!(
                 "unable to canonizalize session mountpoint {}",
                 mountpoint.as_ref().display()
             )
         })?;
-        let home = writable_home(&config)
-            .with_context(|| format!("unable to set up the session writable home directory"))?;
-        validate_top_level(&home).with_context(|| {
-            format!("while validating session home directory {}", home.display())
-        })?;
-        let layout = SessionLayout::new(&home);
+        ensure_writable_home(&config)
+            .with_context(|| "unable to set up the session writable home directory".to_string())?;
+        let layout = SessionLayout::new(&config.rfs_home);
         let cache = BlobCache::open(layout.cache.clone()).with_context(|| {
             format!(
                 "while initializing the blob cache in {}",
@@ -369,24 +368,24 @@ impl Session {
             mountpoint: self.mountpoint.clone(),
             daemon_pid: std::process::id(),
             control_endpoint: self.layout.control_endpoint.clone(),
-            log_path: self.layout.session_logs.clone(),
+            log_path: self.active.layout.log_path.clone(),
         }
     }
 
     /// Derives the fixed control endpoint without opening SQLite or mutating state.
     pub fn control_endpoint(config: &Config) -> Result<PathBuf, SessionError> {
-        let home = reader_home(config)
-            .with_context(|| format!("unable to open home directory for inspection"))?;
-        let layout = SessionLayout::new(&home);
+        ensure_reader_home(config)
+            .with_context(|| "unable to open home directory for inspection".to_string())?;
+        let layout = SessionLayout::new(&config.rfs_home);
         Ok(layout.control_endpoint.clone())
     }
 
     /// Performs one-shot read-only retained-session inspection.
-    pub fn inspect(config: &Config) -> Result<Option<RetainedSession>, SessionError> {
-        let home = reader_home(config)
-            .with_context(|| format!("unable to open home directory for inspection"))?;
-        let layout = SessionLayout::new(&home);
-        ActiveSession::inspect(&layout.session, &layout.session_lock)
+    pub fn inspect(config: &Config) -> Result<Option<SessionInfo>, SessionError> {
+        ensure_reader_home(config)
+            .with_context(|| "unable to open home directory for inspection".to_string())?;
+        let layout = SessionLayout::new(&config.rfs_home);
+        ActiveSession::inspect(&layout.session)
     }
 
     /// Returns one visible inode from authoritative SQLite state.
@@ -416,6 +415,11 @@ impl Session {
         })
     }
 
+    /// Checks if the given digest exists in the local blob cache.
+    pub fn exists(&self, digest: &Digest) -> bool {
+        self.cache.exists(digest)
+    }
+
     /// Reads a complete admitted object, returning `None` on a cache miss.
     pub fn read_blob(&self, digest: &Digest) -> Result<Option<Bytes>, SessionError> {
         self.cache.read_blob(digest)
@@ -428,7 +432,10 @@ impl Session {
         offset: u64,
         size: usize,
     ) -> Result<LocalRead, SessionError> {
-        match self.active.with_store(|store| store.read_source(inode))? {
+        match self
+            .active
+            .with_store(|store| store.get_file_source(inode))?
+        {
             ReadSource::Remote(digest) => match self.cache.read_range(&digest, offset, size)? {
                 Some(bytes) => Ok(LocalRead::Ready(bytes)),
                 None => Ok(LocalRead::NeedsDownload { digest }),
@@ -441,7 +448,7 @@ impl Session {
     }
 
     /// Rechecks cache presence and creates an opaque streaming writer on a miss.
-    pub fn start_blob_download(&self, digest: &Digest) -> Result<BlobDownloader, SessionError> {
+    pub fn start_blob_download(&self, digest: &Digest) -> Result<BlobWriter, SessionError> {
         self.cache.start_download(digest)
     }
 
@@ -479,7 +486,24 @@ pub fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, SessionError> {
     Ok(canonical)
 }
 
+struct ActiveSessionLayout {
+    log_path: PathBuf,
+    db_path: PathBuf,
+    overlay_dir: PathBuf,
+}
+
+impl ActiveSessionLayout {
+    fn new(session_dir: PathBuf) -> Self {
+        Self {
+            log_path: session_dir.join("session.log"),
+            db_path: session_dir.join("session.db"),
+            overlay_dir: session_dir.join("overlay"),
+        }
+    }
+}
+
 struct ActiveSession {
+    layout: ActiveSessionLayout,
     resources: Mutex<Option<ActiveResources>>,
 }
 
@@ -491,17 +515,26 @@ struct ActiveResources {
 
 impl ActiveSession {
     fn open(
-        root: PathBuf,
+        session_dir: PathBuf,
         lock_path: PathBuf,
         root_digest: Digest,
         mountpoint: PathBuf,
     ) -> Result<Self, SessionError> {
         let session_id = Uuid::new_v4().to_string();
-        let mut lock = SessionLock::acquire(&lock_path)?;
-        if root.exists() {
-            validate_closed_session(&root, &lock_path)?;
-            remove_if_present(&root)?;
-        }
+        tracing::info!(
+            "ActiveSession(session_dir={}, lock_path={}, root_digest={}, mountpoint={}), session_id={}",
+            session_dir.display(),
+            lock_path.display(),
+            root_digest,
+            mountpoint.display(),
+            session_id
+        );
+        let mut lock = SessionLock::acquire(&lock_path).with_context(|| {
+            format!(
+                "unable to acquire lock {} when creating a new active session",
+                lock_path.display()
+            )
+        })?;
         lock.write_record(
             &lock_path,
             &LockRecord {
@@ -510,20 +543,30 @@ impl ActiveSession {
                 pid: std::process::id(),
             },
         )?;
-        create_dir_private(&root)?;
-        let log = root.join("rfsd.log");
-        let database = root.join("session.db");
-        create_file_private(&log)?;
-        create_file_private(&database)?;
-        let overlay = OverlayStore::open(root.join("overlay"))?;
+
+        tracing::info!("Creating new session directory: {}", session_dir.display());
+        remove_if_present(&session_dir)
+            .with_context(|| "removing old session directory".to_string())?;
+        create_dir_if_absent(&session_dir)
+            .with_context(|| "creating session directory".to_string())?;
+
+        let layout = ActiveSessionLayout::new(session_dir);
+        tracing::info!("Creating logs file: {}", layout.log_path.display());
+        create_empty_file(&layout.log_path)
+            .with_context(|| "creating file for daemon session logs".to_string())?;
+        tracing::info!("Creating session db: {}", layout.db_path.display());
+        create_empty_file(&layout.db_path)
+            .with_context(|| "creating file for session db".to_string())?;
+        let overlay = OverlayStore::open(layout.overlay_dir.clone())?;
         let store = SessionStore::create(
-            database,
+            layout.db_path.clone(),
             session_id,
             std::process::id(),
             root_digest,
             mountpoint,
         )?;
         Ok(Self {
+            layout,
             resources: Mutex::new(Some(ActiveResources {
                 store,
                 overlay,
@@ -532,14 +575,20 @@ impl ActiveSession {
         })
     }
 
-    fn inspect(root: &Path, lock_path: &Path) -> Result<Option<RetainedSession>, SessionError> {
+    fn inspect(root: &Path) -> Result<Option<SessionInfo>, SessionError> {
         if !root.exists() {
             return Ok(None);
         }
-        validate_closed_layout(root)?;
-        let stored = SessionStore::inspect(&root.join("session.db"))?;
-        validate_closed_identity(lock_path, &stored)?;
-        Ok(Some(stored.metadata.into()))
+        let layout = ActiveSessionLayout::new(root.to_path_buf());
+        let stored = SessionStore::inspect(&layout.db_path)
+            .with_context(|| "inspecting session status from session db".to_string())?;
+        Ok(Some(SessionInfo {
+            root_digest: stored.root_digest,
+            mountpoint: stored.mountpoint,
+            daemon_pid: stored.daemon_pid,
+            control_endpoint: PathBuf::from(""),
+            log_path: layout.log_path,
+        }))
     }
 
     fn with_store<T>(
@@ -591,17 +640,6 @@ impl ActiveSession {
     }
 }
 
-impl From<SessionMetadata> for RetainedSession {
-    fn from(value: SessionMetadata) -> Self {
-        Self {
-            daemon_pid: value.daemon_pid,
-            state: value.state,
-            root_digest: value.root_digest,
-            mountpoint: value.mountpoint,
-        }
-    }
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct LockRecord {
     record_version: u32,
@@ -625,6 +663,8 @@ impl SessionLock {
             .map_err(|source| fs_error("open session lock", path, source))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|source| fs_error("secure session lock", path, source))?;
+        // TODO: Use the native file like API provided by the standard fs crate instead of doing
+        // usafe calls.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let owner = fs::read_to_string(path)
                 .ok()
@@ -666,74 +706,22 @@ impl Drop for SessionLock {
     }
 }
 
-fn validate_closed_session(root: &Path, lock_path: &Path) -> Result<(), SessionError> {
-    validate_closed_layout(root)?;
-    let stored = SessionStore::inspect(&root.join("session.db"))?;
-    validate_closed_identity(lock_path, &stored)
-}
-
-fn validate_closed_identity(
-    lock_path: &Path,
-    stored: &store::StoredSession,
-) -> Result<(), SessionError> {
-    let record: LockRecord = fs::read_to_string(lock_path)
-        .ok()
-        .and_then(|value| serde_json::from_str(&value).ok())
-        .ok_or_else(|| stale_path(lock_path, "invalid lock record".into()))?;
-    if record.record_version != LOCK_RECORD_VERSION {
-        return Err(stale_path(
-            lock_path,
-            "unsupported lock record version".into(),
-        ));
-    }
-    if stored.session_id != record.session_id || stored.metadata.daemon_pid != record.pid {
-        return Err(stale_path(
-            lock_path,
-            "lock and database session identity do not match".into(),
-        ));
-    }
-    if stored.metadata.state != SessionLifecycle::Closed
-        || stored.closed_at_seconds.is_none()
-        || stored.closed_at_nanos.is_none()
-    {
-        return Err(stale_path(
-            lock_path,
-            "session was not closed cleanly".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_closed_layout(root: &Path) -> Result<(), SessionError> {
-    validate_directory_entries(
-        root,
-        &[
-            ("session.db", false),
-            ("rfsd.log", false),
-            ("overlay", true),
-        ],
-    )
-    .map_err(|error| stale_path(root, error.to_string()))?;
-    validate_directory_entries(&root.join("overlay"), &[("data", true), ("tmp", true)])
-        .map_err(|error| stale_path(root, error.to_string()))
-}
-
-fn writable_home(config: &Config) -> Result<PathBuf, SessionError> {
+fn ensure_writable_home(config: &Config) -> Result<(), SessionError> {
     if !config.rfs_home.exists() {
         fs::create_dir_all(&config.rfs_home)
             .map_err(|source| fs_error("create state root", &config.rfs_home, source))?;
         fs::set_permissions(&config.rfs_home, fs::Permissions::from_mode(0o700))
             .map_err(|source| fs_error("secure state root", &config.rfs_home, source))?;
     }
-    canonical_private_home(&config.rfs_home)
+    Ok(())
 }
 
-fn reader_home(config: &Config) -> Result<PathBuf, SessionError> {
+fn ensure_reader_home(config: &Config) -> Result<(), SessionError> {
     if config.rfs_home.exists() {
-        return canonical_private_home(&config.rfs_home);
+        return Ok(());
     }
 
-    Err(SessionError::StaleSession {
+    Err(SessionError::InvalidSession {
         path: config.rfs_home.clone(),
         reason: format!(
             "unable to query session status because session home directory {} does not exist",
@@ -742,142 +730,22 @@ fn reader_home(config: &Config) -> Result<PathBuf, SessionError> {
     })
 }
 
-fn canonical_private_home(path: &Path) -> Result<PathBuf, SessionError> {
-    let home = fs::canonicalize(path)
-        .map_err(|source| fs_error("canonicalize state root", path, source))?;
-    let metadata = fs::symlink_metadata(&home)
-        .map_err(|source| fs_error("inspect state root", &home, source))?;
-    if !metadata.file_type().is_dir() {
-        return Err(SessionError::UnsafePath {
-            path: home,
-            reason: "RFS_HOME is not a directory".into(),
-        });
-    }
-    validate_existing_permissions(&home, &metadata)?;
-    Ok(home)
-}
-
-fn validate_top_level(home: &Path) -> Result<(), SessionError> {
-    for entry in fs::read_dir(home).map_err(|source| fs_error("read state root", home, source))? {
-        let entry = entry.map_err(|source| fs_error("read state-root entry", home, source))?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|source| fs_error("inspect state-root entry", &path, source))?;
-        let valid = match entry.file_name().to_str() {
-            Some("active.lock") => metadata.file_type().is_file(),
-            Some("cache" | "active") => metadata.file_type().is_dir(),
-            _ => false,
-        };
-        if !valid {
-            return Err(SessionError::UnsafePath {
-                path,
-                reason: "unknown entry, symlink, or wrong entry type; inspect it manually".into(),
-            });
-        }
-        validate_existing_permissions(&path, &metadata)?;
-    }
-    Ok(())
-}
-
-pub(super) fn create_dir_private(path: &Path) -> Result<(), SessionError> {
+// Wraps the filesystem directory creation method to return a SessionError.
+fn create_dir_if_absent(path: &Path) -> Result<(), SessionError> {
     match fs::create_dir(path) {
-        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .map_err(|source| fs_error("secure session directory", path, source)),
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|source| fs_error("inspect session directory", path, source))?;
-            if !metadata.file_type().is_dir() {
-                return Err(SessionError::UnsafePath {
-                    path: path.to_path_buf(),
-                    reason: "expected a directory and will not follow a symlink".into(),
-                });
-            }
-            validate_existing_permissions(path, &metadata)
-        }
-        Err(source) => Err(fs_error("create session directory", path, source)),
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(fs_error("create directory", path, source)),
     }
 }
 
-fn create_file_private(path: &Path) -> Result<(), SessionError> {
+// Wraps the filesystem file creation method to return a SessionError.
+fn create_empty_file(path: &Path) -> Result<(), SessionError> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
         .open(path)
-        .map_err(|source| fs_error("create session file", path, source))?;
-    Ok(())
-}
-
-pub(super) fn validate_existing_permissions(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), SessionError> {
-    if metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(SessionError::UnsafePath {
-            path: path.to_path_buf(),
-            reason: "entry is not owned by the effective user".into(),
-        });
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(SessionError::UnsafePath {
-            path: path.to_path_buf(),
-            reason: "entry is accessible by group or other users".into(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_directory_entries(
-    directory: &Path,
-    expected: &[(&str, bool)],
-) -> Result<(), SessionError> {
-    let mut found = Vec::new();
-    for entry in fs::read_dir(directory)
-        .map_err(|source| fs_error("read session directory", directory, source))?
-    {
-        let entry =
-            entry.map_err(|source| fs_error("read session-directory entry", directory, source))?;
-        let path = entry.path();
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| SessionError::UnsafePath {
-                path: path.clone(),
-                reason: "entry name is not UTF-8".into(),
-            })?;
-        let Some((_, should_be_directory)) =
-            expected.iter().find(|(candidate, _)| *candidate == name)
-        else {
-            return Err(SessionError::UnsafePath {
-                path,
-                reason: "unknown entry; inspect it manually".into(),
-            });
-        };
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|source| fs_error("inspect session-directory entry", &path, source))?;
-        let correct_type = if *should_be_directory {
-            metadata.file_type().is_dir()
-        } else {
-            metadata.file_type().is_file()
-        };
-        if !correct_type {
-            return Err(SessionError::UnsafePath {
-                path,
-                reason: "entry has the wrong type".into(),
-            });
-        }
-        validate_existing_permissions(&entry.path(), &metadata)?;
-        found.push(name);
-    }
-    if let Some((missing, _)) = expected
-        .iter()
-        .find(|(name, _)| !found.iter().any(|item| item == name))
-    {
-        return Err(SessionError::UnsafePath {
-            path: directory.join(missing),
-            reason: "required entry is missing".into(),
-        });
-    }
+        .map_err(|source| fs_error("create file", path, source))?;
     Ok(())
 }
 
@@ -885,11 +753,11 @@ fn remove_if_present(path: &Path) -> Result<(), SessionError> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(fs_error("remove closed session", path, source)),
+        Err(source) => Err(fs_error("local state cleanup", path, source)),
     }
 }
 
-pub(super) fn now_parts() -> Result<(i64, i64), SessionError> {
+fn now_parts() -> Result<(i64, i64), SessionError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| SessionError::InvalidSystemTime)?;
@@ -899,34 +767,18 @@ pub(super) fn now_parts() -> Result<(i64, i64), SessionError> {
     ))
 }
 
-pub(super) fn stale_path(path: &Path, reason: String) -> SessionError {
-    SessionError::StaleSession {
+fn stale_path(path: &Path, reason: String) -> SessionError {
+    SessionError::InvalidSession {
         path: path.to_path_buf(),
         reason,
     }
 }
 
-pub(super) fn fs_error(
-    operation: &'static str,
-    path: &Path,
-    source: std::io::Error,
-) -> SessionError {
+fn fs_error(operation: &'static str, path: &Path, source: std::io::Error) -> SessionError {
     let kind = source.kind();
     SessionError::Filesystem {
         path: path.to_path_buf(),
         source: std::io::Error::new(kind, format!("{operation} failed: {source}")),
-    }
-}
-
-pub(super) fn db_error(
-    operation: &'static str,
-    path: &Path,
-    source: rusqlite::Error,
-) -> SessionError {
-    SessionError::Database {
-        operation,
-        path: path.to_path_buf(),
-        source,
     }
 }
 
@@ -942,20 +794,17 @@ struct SessionLayout {
     session_lock: PathBuf,
     /// The UDS socket serving the daemon's control endpoint.
     control_endpoint: PathBuf,
-    /// File containing daemon logs for the session.
-    session_logs: PathBuf,
 }
 
 impl SessionLayout {
     // Initialize a new session layout under the given rfsd home directory.
-    fn new(home: &PathBuf) -> Self {
+    fn new(home: &Path) -> Self {
         let session = home.join("session");
         Self {
             cache: home.join("cache"),
             session: session.clone(),
             session_lock: home.join("session.lock"),
             control_endpoint: session.join("control.sock"),
-            session_logs: session.join("session.log"),
         }
     }
 }

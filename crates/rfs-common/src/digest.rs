@@ -1,9 +1,12 @@
 use serde::Serialize;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 use thiserror::Error;
 
 use crate::reapi::remote_execution;
+
+pub static EMPTY_DIGEST: LazyLock<Digest> = LazyLock::new(|| Digest::for_bytes(&[]));
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Digest {

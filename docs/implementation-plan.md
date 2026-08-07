@@ -40,7 +40,16 @@ The intended implementation order is:
   `rfs_common::session`.
 - Generated Rust proto code is produced during build from checked-in pinned proto sources under `third_party/remote-apis/`.
 - Process exit codes are simple: `0` for success and `1` for any error.
-- Strong crash recovery, automatic local cache eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke tests are outside the first MVP implementation sequence. Unrecoverable state is left untouched with guidance to delete `RFS_HOME` manually; there is no cleanup command in the MVP.
+- Strong crash recovery, session reuse or repair, automatic local cache
+  eviction, TLS, auth, writable mmap, block-level COW, and Buildbarn smoke
+  tests are outside the first MVP implementation sequence. Every mount starts
+  with a fresh session tree after acquiring the stable lock; retained session
+  state is available only for best-effort read-only inspection between mounts.
+- Treat `RFS_HOME` as exclusively RemoteFS-managed state. Supported operation
+  assumes its contents were created through the daemon lifecycle and were not
+  manually doctored or concurrently modified outside the ownership-lock
+  protocol. Existing fixed children are trusted rather than hardened as
+  hostile filesystem inputs.
 
 ## Phase 0: Boilerplate and Workflow
 
@@ -405,10 +414,18 @@ Definition of done:
 
 ### Step 4.1: Local State and SQLite Session Store (Complete)
 
+The conservative stale-state and cleanup policy recorded in this historical
+step was superseded by step 5.4. The settled policy is that every new mount
+removes the previous session tree after acquiring the stable lock; the shared
+cache and stable lock remain across mounts.
+
 The original public store, cleanup command, and stale-state recovery contract in
-this historical step are superseded by the capability API and conservative
-manual-deletion policy in step 4.3. Its direct SQLite implementation is
-superseded by the `rusqlite` storage refactor in step 5.3.
+this historical step are superseded by the capability API in step 4.3 and the
+fresh-session policy in step 5.4. Its direct SQLite implementation is
+superseded by the `rusqlite` storage refactor in step 5.3. Its canonicalization,
+private-layout validation, ownership, permission, wrong-type, and symlink
+hardening requirements are also superseded by the managed-home trust boundary
+in step 5.4; they are retained below only as historical requirements.
 
 Deliverables:
 
@@ -441,7 +458,7 @@ Task targets:
 
 ```sh
 task test:unit
-task test:integration:state
+task test:integration:session
 ```
 
 Tests:
@@ -524,8 +541,8 @@ Deliverables:
   tonic clients, or daemon types.
 - Make unmount completion-based by closing durable daemon state before returning
   success.
-- Remove `rfs cleanup`. Replace unsafe/corrupt-state repair with conservative
-  manual deletion guidance while leaving questionable state untouched.
+- Remove `rfs cleanup`. A new mount removes the previous session tree after it
+  acquires the stable lock; it does not inspect, reuse, or repair that state.
 - Initialize shared tracing-based CLI stderr and daemon session-file logging with
   error, warn, info, and debug levels and text/JSON Lines formats. Keep command
   output separate and log operation summaries rather than per-entry activity.
@@ -536,7 +553,8 @@ Tests:
   internal dependency edges.
 - Read-only state tests for no creation, unchanged database content, and no daemon
   lock ownership.
-- State lifecycle tests for closed-session replacement and preserved stale state.
+- State lifecycle tests for unconditional previous-session replacement and
+  shared-cache retention.
 - Daemon integration tests for status, exclusive ownership, completion-based
   unmount, retained closed status, and lifecycle log events.
 - Existing unit and CLI suites plus CAS/upload integration workflows.
@@ -633,6 +651,11 @@ Definition of done:
 
 ### Step 5.3: `rusqlite` State Persistence Refactor (Complete)
 
+The lifecycle-preservation language in this historical persistence step was
+superseded by step 5.4's fresh-session-on-mount policy. Its read-only inspection
+requirements remain current. Its fixed-path permission guarantees are
+superseded by step 5.4's managed-home trust boundary.
+
 Deliverables:
 
 - Use direct `rusqlite` access in the private state storage layer.
@@ -656,8 +679,7 @@ Deliverables:
   create a database, initialize the schema, acquire the daemon lock, or mutate
   state.
 - Preserve rollback-journal mode, foreign-key enforcement, transaction
-  boundaries, error identifiers, file permissions, lifecycle behavior, and the
-  conservative stale-state policy.
+  boundaries, error identifiers, and read-only retained inspection behavior.
 - Remove SeaORM and `sea-orm-migration` after all state reads, writes, and tests
   use the private `rusqlite` repository.
 
@@ -665,7 +687,7 @@ Task targets:
 
 ```sh
 task test:unit
-task test:integration:state
+task test:integration:session
 task test:integration:readonly
 task test:e2e:readonly
 ```
@@ -699,7 +721,7 @@ Definition of done:
 This step supersedes the internal trait/worker/cache architecture left by the
 completed historical steps without changing the read-only command surface. Its
 settled architecture is incorporated here and in `docs/technical-design.md`;
-the temporary design-handoff document has been removed.
+`docs/refactor-review.md` retains the review findings and their resolution.
 
 Deliverables:
 
@@ -715,8 +737,10 @@ Deliverables:
   objects, and forwarding stores with one mutex-protected
   `rusqlite::Connection` and focused transactionally complete store methods.
 - Introduce the agreed boundary types: `InodeId`, shared `NodeKind`, `NodeTime`,
-  `Node`, `RemoteChild`, `RemoteContent`, lazy lookup/read outcomes,
-  `BlobDownloader`, and the opaque write-only `BlobWriter`.
+  `Node`, `RemoteChild`, `RemoteContent`, lazy lookup/read outcomes, and the
+  opaque write-only `BlobWriter`. `FilesystemService` owns the digest-locked
+  cache check and remote stream; `Session::start_blob_download` creates the
+  writer after that check.
 - Make SQLite authoritative for visible nodes. Remove daemon inode and decoded
   directory maps; lazily materialize complete remote child sets atomically and
   idempotently through `Session`.
@@ -730,9 +754,25 @@ Deliverables:
   `RFS_HOME/session/session.log`. Do not expose cache or session roots through
   `SessionInfo`; it contains only the root digest, mountpoint, daemon PID,
   control endpoint, and log path needed by daemon startup.
-- Keep every `Session` and `FilesystemService` operation synchronous.
-  `FilesystemService` remains in `rfsd`, owns the CAS and REAPI orchestration,
-  and uses a keyed map only to deduplicate in-progress remote downloads.
+- Treat `RFS_HOME` as an exclusively RemoteFS-managed root. Create and maintain
+  its contents through the daemon lifecycle, but do not inventory or harden an
+  existing home against out-of-band substitutions of fixed entries, including
+  symlinks, wrong entry types, ownership, or permissions. Provide no safety,
+  integrity, compatibility, or recovery guarantees after manual doctoring or
+  concurrent modification outside the ownership-lock protocol.
+- Treat the session tree as per-mount scratch state. After acquiring the stable
+  lock, remove any previous session tree and create a fresh one without trying
+  to validate, reuse, migrate, or repair it. Preserve the shared cache. Keep
+  retained inspection best-effort and read-only, and never use its result to
+  gate a later mount.
+- Keep every `Session` and `FilesystemService` operation synchronous. Construct
+  exactly one `FilesystemService` for the lifetime of each `rfsd` mount and
+  route every FUSE filesystem operation through it. `FilesystemService` remains
+  in `rfsd` as the synchronization layer around `Session`, owns the CAS and
+  REAPI orchestration, and uses a keyed map to serialize each digest's cache
+  check, remote download, verification, and admission. Multiple filesystem
+  services sharing one session or cache are outside the daemon concurrency
+  model.
 - Add `BlobStore::stream_blob`; implement `download_blob` as a collecting
   convenience over it. Stream large downloads into a shard-local
   `BlobWriter`, then verify, sync, and atomically admit them through
@@ -752,7 +792,7 @@ Task targets:
 
 ```sh
 task test:unit
-task test:integration:state
+task test:integration:session
 task test:integration:readonly
 task test:e2e:readonly
 ```
@@ -772,9 +812,10 @@ Tests:
   inode-based range reads and `NeedsDownload` retry flow.
 - Integration: unified cache entries are reused by both directory decoding and
   file reads across sequential fresh sessions.
-- Integration: retained inspection remains read-only, clean close remains
-  idempotent and completion-based, stale state remains untouched, and missing
-  `RFS_HOME` is distinguished from an existing home with no retained session.
+- Integration: retained inspection remains best-effort and read-only, clean
+  close remains idempotent and completion-based, every new mount replaces the
+  previous session tree while retaining the cache, and missing `RFS_HOME` is
+  distinguished from an existing home with no retained session.
 - E2E: the completed read-only mount workflow and status output have no
   cache-path or session-path fields.
 
@@ -1013,7 +1054,9 @@ Deliverables:
   - Remote errors.
   - Digest verification failures.
 - Implement `rfs status` and `rfs status --output-format json`.
-- Status output covers live, cleanly closed, stale, and clean no-session states.
+- Status output covers live (`active`), readable retained (`inactive`), and
+  clean no-session (`none`) states. Malformed, corrupt, or unsupported retained
+  state may produce an inspection error.
 - Implement stable JSON command summaries for `status`, `upload`, and `snapshot`:
   - Include `schema_version: 1`, `command`, `ok`, `warnings`, `error`, and command-specific `data`.
   - Use `error: null` on success and `error: { code, message, details }` on failure.
@@ -1028,8 +1071,8 @@ Deliverables:
 - Store effective daemon log level and format in the SQLite
   `session_metadata` table for `rfs status`.
 - Preserve the session log file with `RFS_HOME/session` until the next mount
-  replaces a clean session or the user manually removes `RFS_HOME`; no log
-  rotation in the MVP.
+  replaces the session tree or the user manually removes it; no log rotation
+  in the MVP.
 - Include timestamp, level, target/module, session id, operation, path/digest where relevant, and message in daemon log events.
 
 Task targets:
@@ -1053,7 +1096,9 @@ Tests:
   session roots.
 - Integration: spawned daemon writes `RFS_HOME/session/session.log` and status
   reports log level/format.
-- Integration: status reports cleanly closed session metadata after clean unmount and distinguishes it from stale state.
+- Integration: status reports readable retained session metadata as `inactive`
+  after clean unmount, performs inspection without mutation, and reports
+  malformed retained state as an inspection error.
 - E2E: read a file through mount and observe counter changes.
 
 Definition of done:

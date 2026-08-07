@@ -10,33 +10,28 @@ use crate::digest::Digest;
 
 use super::{
     InodeId, Lookup, Node, NodeKind, NodeTime, RemoteChild, RemoteContent, SessionError,
-    SessionLifecycle, db_error, now_parts, stale_path,
+    SessionLifecycle, now_parts, stale_path,
 };
 
+// Inode ID of the root directory.
+pub const ROOT_INODE_ID: i64 = 1;
 const SCHEMA_VERSION: i64 = 1;
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
-pub(super) struct SessionStore {
+pub struct SessionStore {
     database_path: PathBuf,
     connection: Mutex<Connection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SessionMetadata {
-    pub(super) daemon_pid: u32,
-    pub(super) state: SessionLifecycle,
-    pub(super) root_digest: Digest,
-    pub(super) mountpoint: PathBuf,
+pub struct StoredSession {
+    pub daemon_pid: u32,
+    pub state: SessionLifecycle,
+    pub root_digest: Digest,
+    pub mountpoint: PathBuf,
 }
 
-pub(super) struct StoredSession {
-    pub(super) session_id: String,
-    pub(super) metadata: SessionMetadata,
-    pub(super) closed_at_seconds: Option<i64>,
-    pub(super) closed_at_nanos: Option<i64>,
-}
-
-pub(super) enum ReadSource {
+pub enum ReadSource {
     Remote(Digest),
     Overlay(PathBuf),
 }
@@ -84,13 +79,21 @@ struct RawSession {
 }
 
 impl SessionStore {
-    pub(super) fn create(
+    pub fn create(
         database_path: PathBuf,
         session_id: String,
         daemon_pid: u32,
         root_digest: Digest,
         mountpoint: PathBuf,
     ) -> Result<Self, SessionError> {
+        tracing::info!(
+            "SessionStore::create(db_path={}, session_id={}, daemon_pid={}, root_digest={}, mountpoint={})",
+            database_path.display(),
+            session_id,
+            daemon_pid,
+            root_digest,
+            mountpoint.display()
+        );
         let mut connection = open_database(&database_path, false)?;
         initialize_database(
             &mut connection,
@@ -106,13 +109,13 @@ impl SessionStore {
         })
     }
 
-    pub(super) fn inspect(path: &Path) -> Result<StoredSession, SessionError> {
+    pub fn inspect(path: &Path) -> Result<StoredSession, SessionError> {
         let connection = open_database(path, true)?;
         validate_schema_version(&connection, path)?;
         read_stored_session(&connection, path)
     }
 
-    pub(super) fn node(&self, inode: InodeId) -> Result<Node, SessionError> {
+    pub fn node(&self, inode: InodeId) -> Result<Node, SessionError> {
         let connection = self.connection("read visible inode")?;
         let stored = read_inode_by_id(&connection, &self.database_path, inode)?
             .filter(|node| !node.tombstone)
@@ -120,7 +123,7 @@ impl SessionStore {
         Ok(stored.node)
     }
 
-    pub(super) fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Node>, SessionError> {
+    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Node>, SessionError> {
         validate_child_name(&self.database_path, name)?;
         let connection = self.connection("look up visible child")?;
         let parent_node = required_directory(&connection, &self.database_path, parent)?;
@@ -140,7 +143,7 @@ impl SessionStore {
         }
     }
 
-    pub(super) fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Node>>, SessionError> {
+    pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Node>>, SessionError> {
         let connection = self.connection("list visible directory")?;
         let directory = required_directory(&connection, &self.database_path, inode)?;
         if materialized_digest(&connection, &self.database_path, inode)?.is_none() {
@@ -155,7 +158,7 @@ impl SessionStore {
         )?))
     }
 
-    pub(super) fn materialize_directory(
+    pub fn materialize_directory(
         &self,
         parent: InodeId,
         digest: &Digest,
@@ -212,7 +215,7 @@ impl SessionStore {
         Ok(visible)
     }
 
-    pub(super) fn read_source(&self, inode: InodeId) -> Result<ReadSource, SessionError> {
+    pub fn get_file_source(&self, inode: InodeId) -> Result<ReadSource, SessionError> {
         let connection = self.connection("resolve inode read source")?;
         let stored = read_inode_by_id(&connection, &self.database_path, inode)?
             .filter(|node| !node.tombstone)
@@ -235,20 +238,17 @@ impl SessionStore {
         })
     }
 
-    pub(super) fn close(&self) -> Result<(), SessionError> {
+    pub fn close(&self) -> Result<(), SessionError> {
         let (seconds, nanos) = now_parts()?;
         let mut connection = self.connection("close session")?;
         let transaction = connection
             .transaction()
             .map_err(|source| db_error("begin clean close", &self.database_path, source))?;
         let stored = read_stored_session(&transaction, &self.database_path)?;
-        if stored.metadata.state != SessionLifecycle::Active {
+        if stored.state != SessionLifecycle::Active {
             return Err(stale_path(
                 &self.database_path,
-                format!(
-                    "cannot close session while lifecycle is {}",
-                    stored.metadata.state
-                ),
+                format!("cannot close session while lifecycle is {}", stored.state),
             ));
         }
         transaction
@@ -315,8 +315,8 @@ fn initialize_database(
                 inode, parent_inode, name, kind, remote_digest, symlink_target,
                 overlay_file, mode, mtime_seconds, mtime_nanos, tombstone,
                 content_dirty, tree_dirty
-             ) VALUES (1, NULL, '', 'directory', ?1, NULL, NULL, NULL, NULL, NULL, 0, 0, 0)",
-            [root_digest.to_string()],
+             ) VALUES (?1, NULL, '', 'directory', ?2, NULL, NULL, NULL, NULL, NULL, 0, 0, 0)",
+            params![ROOT_INODE_ID, root_digest.to_string()],
         )
         .map_err(|source| db_error("insert root inode", path, source))?;
     transaction
@@ -731,12 +731,12 @@ fn validate_child_name(path: &Path, name: &str) -> Result<(), SessionError> {
 
 fn ensure_active(connection: &Connection, path: &Path) -> Result<(), SessionError> {
     let stored = read_stored_session(connection, path)?;
-    if stored.metadata.state != SessionLifecycle::Active {
+    if stored.state != SessionLifecycle::Active {
         return Err(stale_path(
             path,
             format!(
                 "cannot materialize inodes while session is {}",
-                stored.metadata.state
+                stored.state
             ),
         ));
     }
@@ -829,15 +829,10 @@ fn validate_session_row(path: &Path, row: RawSession) -> Result<StoredSession, S
         ));
     }
     Ok(StoredSession {
-        session_id: row.session_id,
-        metadata: SessionMetadata {
-            daemon_pid,
-            state,
-            root_digest,
-            mountpoint,
-        },
-        closed_at_seconds: row.closed_at_seconds,
-        closed_at_nanos: row.closed_at_nanos,
+        daemon_pid,
+        state,
+        root_digest,
+        mountpoint,
     })
 }
 
@@ -958,6 +953,14 @@ fn validate_timestamp(
         return Err(stale_path(path, format!("{field} is invalid")));
     }
     Ok(())
+}
+
+fn db_error(operation: &'static str, path: &Path, source: rusqlite::Error) -> SessionError {
+    SessionError::Database {
+        operation,
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 #[cfg(test)]

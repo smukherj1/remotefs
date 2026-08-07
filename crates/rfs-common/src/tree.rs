@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::path::PathBuf;
 
 use bytes::Bytes;
@@ -37,6 +38,16 @@ pub struct NodeMetadata {
     pub mode: Option<u32>,
     pub mtime: Option<Timestamp>,
     pub kind: NodeKind,
+}
+
+impl fmt::Display for NodeKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NodeKind::File => write!(f, "File"),
+            NodeKind::Directory => write!(f, "Directory"),
+            NodeKind::Symlink => write!(f, "Symlink"),
+        }
+    }
 }
 
 impl NodeMetadata {

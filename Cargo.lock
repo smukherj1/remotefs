@@ -492,6 +492,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "googletest"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b5e2f2b556b7b90297a5a35c8267dd43a537923d2b329beefdba2b4ec19d94"
+dependencies = [
+ "googletest_macro",
+ "num-traits",
+ "regex",
+ "rustversion",
+]
+
+[[package]]
+name = "googletest_macro"
+version = "0.14.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ae6abc96141edd26bf5aeec0f119c129c44de3ced09e5073711a02cb74725d0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1104,6 +1127,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "googletest",
  "predicates",
  "rfs-common",
  "serde",
@@ -1123,6 +1147,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "googletest",
  "hex",
  "libc",
  "prost",
@@ -1154,6 +1179,7 @@ dependencies = [
  "bytes",
  "clap",
  "fuser",
+ "googletest",
  "libc",
  "predicates",
  "prost-types",

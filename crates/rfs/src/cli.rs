@@ -13,7 +13,7 @@ use crate::daemon_client::{ControlEndpoint, DaemonClient, SessionStatus};
 use rfs_common::config::{Config, ConfigError};
 use rfs_common::digest::{Digest, DigestError};
 use rfs_common::logging::{self, LogFormat};
-use rfs_common::session::{RetainedSession, Session, SessionError, canonicalize_mountpoint};
+use rfs_common::session::{Session, SessionError, SessionInfo, canonicalize_mountpoint};
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -459,16 +459,17 @@ fn render_active_status(status: SessionStatus, json: bool) {
     }
 }
 
-fn render_retained_status(session: RetainedSession, json: bool) {
+fn render_retained_status(session: SessionInfo, json: bool) {
+    let state = "inactive";
     if json {
         println!(
             "{}",
-            serde_json::json!({"schema_version":1,"command":"status","ok":true,"data":{"state":session.state,"mountpoint":session.mountpoint,"root_digest":session.root_digest,"daemon_pid":session.daemon_pid}})
+            serde_json::json!({"schema_version":1,"command":"status","ok":true,"data":{"state":state,"mountpoint":session.mountpoint,"root_digest":session.root_digest,"daemon_pid":session.daemon_pid}})
         );
     } else {
         println!(
             "{} session: mountpoint={} root_digest={} daemon_pid={}",
-            session.state,
+            state,
             session.mountpoint.display(),
             session.root_digest,
             session.daemon_pid
@@ -605,7 +606,7 @@ fn state_error(error: SessionError) -> CliError {
     CliError::CommandFailed {
         category: match error {
             SessionError::ActiveSession { .. } => "active_session",
-            SessionError::StaleSession { .. } => "stale_session",
+            SessionError::InvalidSession { .. } => "stale_session",
             SessionError::UnsafePath { .. } => "unsafe_state",
             _ => "state",
         },

@@ -3,7 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, Once};
 
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
@@ -72,6 +72,24 @@ pub fn init_daemon(path: &Path, level: &str, format: LogFormat) -> Result<(), Lo
         LogFormat::Json => install_file_subscriber(file, filter, true)?,
     }
     Ok(())
+}
+
+/// Initializes capture-aware text logging once for the current test executable.
+///
+/// The `RUST_LOG` environment variable overrides the default `info` filter.
+/// Cargo builds each unit or integration test target as a separate executable,
+/// so each target that needs logs must call this helper.
+pub fn init_test() {
+    static INIT: Once = Once::new();
+
+    INIT.call_once(|| {
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .with_target(false)
+            .try_init();
+    });
 }
 
 fn install_file_subscriber(
