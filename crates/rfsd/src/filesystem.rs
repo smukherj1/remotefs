@@ -84,9 +84,6 @@ pub enum FilesystemError {
     /// An inode has an invalid state.
     #[error("inode {inode} has an invalid state: {reason}")]
     InvalidInode { inode: InodeId, reason: String },
-    /// The mutex serializing the CAS client was poisoned.
-    #[error("CAS client lock is poisoned while downloading {digest}")]
-    CasLock { digest: Digest },
     /// A per-digest download-coordination mutex was poisoned.
     #[error("download lock is poisoned for {digest}: {details}")]
     DownloadLock { digest: Digest, details: String },
@@ -110,15 +107,19 @@ impl ResultContextError for FilesystemError {
 
 /// Remote-aware synchronous filesystem service.
 pub struct FilesystemService<S> {
-    // TODO: Remove mutex. Clone client before using.
-    store: Mutex<S>,
+    // A handle to a remote blob storage (CAS Server in prod) this
+    // file system will fetch blobs from.
+    // Must be cheaply clonable because in production we expect we're dealing
+    // with a GRPC/RPC client whose methods take mutable references. We clone the
+    // client to fetch multiple blobs concurrently.
+    store: S,
     session: Arc<Session>,
     runtime: Handle,
     download_locks: Mutex<HashMap<Digest, Arc<Mutex<()>>>>,
     counters: AtomicCounters,
 }
 
-impl<S: BlobStore + Send> FilesystemService<S> {
+impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
     /// Validates the root directory while leaving descendants and file data lazy.
     ///
     /// The caller must run construction on a blocking thread. Async CAS
@@ -132,7 +133,7 @@ impl<S: BlobStore + Send> FilesystemService<S> {
             .cached_blob_count()
             .map_err(|source| session_error(InodeId::ROOT, source))?;
         let filesystem = Self {
-            store: Mutex::new(store),
+            store,
             session,
             runtime,
             download_locks: Mutex::new(HashMap::new()),
@@ -360,9 +361,10 @@ impl<S: BlobStore + Send> FilesystemService<S> {
                     digest
                 )
             })?;
-        let mut store = self.store.lock().map_err(|_| FilesystemError::CasLock {
-            digest: digest.clone(),
-        })?;
+        // Blob-store clones are independent request handles to the same logical
+        // store. Keeping mutation local allows unrelated digests to download in
+        // parallel while the digest-specific lock still coalesces duplicates.
+        let mut store = self.store.clone();
         self.runtime
             .block_on(store.stream_blob(digest, &mut writer))
             .map_err(|source| FilesystemError::Cas {
@@ -490,6 +492,7 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone)]
     struct FakeStore {
         blobs: HashMap<Digest, Bytes>,
         downloads: Arc<AtomicUsize>,
@@ -614,6 +617,72 @@ mod tests {
             "one root directory plus one coalesced file stream"
         );
         assert_eq!(filesystem.counters().blob_downloads, 1);
+        drop(filesystem);
+        session.close().unwrap();
+    }
+
+    #[test]
+    fn concurrent_distinct_reads_succeed() {
+        let left_bytes = Bytes::from_static(b"left");
+        let right_bytes = Bytes::from_static(b"right");
+        let left_digest = Digest::for_bytes(&left_bytes);
+        let right_digest = Digest::for_bytes(&right_bytes);
+        let mut root = DirectoryBuilder::new();
+        root.add_file(FileEntry {
+            name: "left.txt".into(),
+            digest: left_digest.clone(),
+            metadata: NodeMetadata::new(TreeNodeKind::File, Some(0o640), None),
+        })
+        .unwrap();
+        root.add_file(FileEntry {
+            name: "right.txt".into(),
+            digest: right_digest.clone(),
+            metadata: NodeMetadata::new(TreeNodeKind::File, Some(0o640), None),
+        })
+        .unwrap();
+        let root = root.encode().unwrap();
+        let blobs = HashMap::from([
+            (root.digest.clone(), root.bytes),
+            (left_digest.clone(), left_bytes.clone()),
+            (right_digest.clone(), right_bytes.clone()),
+        ]);
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let session = session(&temp, &root.digest);
+        let filesystem = Arc::new(
+            FilesystemService::mount(
+                FakeStore {
+                    blobs,
+                    downloads: Arc::new(AtomicUsize::new(0)),
+                },
+                Arc::clone(&session),
+                runtime.handle().clone(),
+            )
+            .unwrap(),
+        );
+        let left = filesystem.lookup(InodeId::ROOT, "left.txt").unwrap();
+        let right = filesystem.lookup(InodeId::ROOT, "right.txt").unwrap();
+        let start = Arc::new(Barrier::new(3));
+        let left_read = {
+            let filesystem = Arc::clone(&filesystem);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                filesystem.read(left.inode, 0, usize::MAX)
+            })
+        };
+        let right_read = {
+            let filesystem = Arc::clone(&filesystem);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                filesystem.read(right.inode, 0, usize::MAX)
+            })
+        };
+        start.wait();
+        assert_eq!(left_read.join().unwrap().unwrap(), left_bytes);
+        assert_eq!(right_read.join().unwrap().unwrap(), right_bytes);
+        assert_eq!(filesystem.counters().blob_downloads, 2);
         drop(filesystem);
         session.close().unwrap();
     }

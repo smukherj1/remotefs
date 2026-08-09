@@ -32,7 +32,7 @@ impl FuseMount {
         mountpoint: &Path,
     ) -> io::Result<Self>
     where
-        S: BlobStore + Send + 'static,
+        S: BlobStore + Clone + Send + Sync + 'static,
     {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let adapter = FuseAdapter {
@@ -77,7 +77,7 @@ struct FuseAdapter<S> {
     ready: Option<SyncSender<()>>,
 }
 
-impl<S: BlobStore + Send + 'static> FuseAdapter<S> {
+impl<S: BlobStore + Clone + Send + Sync + 'static> FuseAdapter<S> {
     fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<Node, i32> {
         let name = name.to_str().ok_or(ENOENT)?;
         let parent = InodeId::new(parent).map_err(|_| EINVAL)?;
@@ -92,7 +92,7 @@ impl<S: BlobStore + Send + 'static> FuseAdapter<S> {
     }
 }
 
-impl<S: BlobStore + Send + 'static> Filesystem for FuseAdapter<S> {
+impl<S: BlobStore + Clone + Send + Sync + 'static> Filesystem for FuseAdapter<S> {
     fn init(&mut self, _request: &Request<'_>, _config: &mut KernelConfig) -> Result<(), i32> {
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(());
@@ -439,7 +439,6 @@ fn errno_for_error(error: FilesystemError) -> i32 {
         | FilesystemError::Cas { .. }
         | FilesystemError::Directory { .. }
         | FilesystemError::Session { .. }
-        | FilesystemError::CasLock { .. }
         | FilesystemError::InvalidInode { .. }
         | FilesystemError::DownloadLock { .. }
         | FilesystemError::Context { .. } => EIO,
