@@ -1,3 +1,9 @@
+//! SQLite repository for session lifecycle and the merged inode namespace.
+//!
+//! [`SessionStore`] serializes access to one writable connection. The embedded
+//! schema defines relational shape, while this module validates domain values
+//! and converts database rows into session types.
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -9,40 +15,63 @@ use uuid::Uuid;
 use crate::digest::Digest;
 
 use super::{
-    InodeId, Lookup, Node, NodeKind, NodeTime, RemoteChild, RemoteContent, SessionError,
+    Inode, InodeId, Lookup, NodeKind, NodeTime, RemoteChild, RemoteContent, SessionError,
     SessionLifecycle, now_parts, stale_path,
 };
 
-// Inode ID of the root directory.
+/// Fixed inode ID of the root directory in every session database.
 pub const ROOT_INODE_ID: i64 = 1;
+/// Schema version supported by this repository implementation.
 const SCHEMA_VERSION: i64 = 1;
+/// Idempotent baseline schema embedded in the `rfs-common` binary.
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
+/// Repository owning the durable state for one active mount session.
+///
+/// All operations lock the single SQLite connection, so callers observe
+/// transactionally complete namespace changes in call order.
 pub struct SessionStore {
+    /// Stable path included in validation and SQLite error diagnostics.
     database_path: PathBuf,
+    /// Writable connection serialized across synchronous session operations.
     connection: Mutex<Connection>,
 }
 
+/// Validated session metadata returned by live and retained-state inspection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSession {
+    /// Positive process ID recorded for the daemon that created the session.
     pub daemon_pid: u32,
+    /// Current durable lifecycle state.
     pub state: SessionLifecycle,
+    /// Immutable root directory digest mounted by the session.
     pub root_digest: Digest,
+    /// Canonical absolute path of the mounted workspace.
     pub mountpoint: PathBuf,
 }
 
+/// Backing location from which a regular file's bytes can be read.
 pub enum ReadSource {
+    /// Immutable content in the shared cache or remote CAS, identified by digest.
     Remote(Digest),
+    /// Session-local content identified by a relative overlay-data path.
     Overlay(PathBuf),
 }
 
+/// Validated inode row plus persistence details hidden from session callers.
 #[derive(Debug, Clone)]
 struct StoredNode {
-    node: Node,
+    /// Effective visible metadata, including defaults for absent mode and mtime.
+    node: Inode,
+    /// Original file-content or directory-message digest, when remote-backed.
     remote_digest: Option<Digest>,
+    /// Relative overlay-data path, when file content is local.
     overlay_file: Option<PathBuf>,
+    /// Persisted mode before applying a node-kind-specific default.
     stored_mode: Option<u32>,
+    /// Persisted mtime before applying the Unix epoch default.
     stored_mtime: Option<NodeTime>,
+    /// Whether this row hides its name from the merged namespace.
     tombstone: bool,
 }
 
@@ -62,23 +91,43 @@ type InodeTuple = (
     i64,
 );
 
+/// Unvalidated `session_metadata` row decoded directly from SQLite.
 struct RawSession {
+    /// Singleton primary key, required to equal one.
     singleton: i64,
+    /// UUID string uniquely identifying this mount session.
     session_id: String,
+    /// Daemon process ID in SQLite's signed integer representation.
     daemon_pid: i64,
+    /// Text representation of [`SessionLifecycle`].
     lifecycle: String,
+    /// SHA-256 hash component of the immutable root digest.
     root_digest_hash: String,
+    /// Byte-size component of the immutable root digest.
     root_digest_size: i64,
+    /// UTF-8 absolute path of the mounted workspace.
     mountpoint: String,
+    /// Whole seconds of the creation time relative to the Unix epoch.
     created_at_seconds: i64,
+    /// Normalized nanosecond fraction of the creation time.
     created_at_nanos: i64,
+    /// Whole seconds of the clean-close time, present only when closed.
     closed_at_seconds: Option<i64>,
+    /// Nanosecond fraction of the clean-close time, present only when closed.
     closed_at_nanos: Option<i64>,
+    /// Effective daemon logging level recorded for status reporting.
     log_level: String,
+    /// Effective daemon log encoding, either `text` or `json`.
     log_format: String,
 }
 
 impl SessionStore {
+    /// Opens writable state and atomically initializes one active session.
+    ///
+    /// The database file must already be openable for writing. This installs the
+    /// supported schema, records session metadata, and creates root inode `1`.
+    /// SQLite, timestamp, path-encoding, and existing-row failures are returned
+    /// as [`SessionError`].
     pub fn create(
         database_path: PathBuf,
         session_id: String,
@@ -109,13 +158,21 @@ impl SessionStore {
         })
     }
 
+    /// Reads and validates retained session metadata without modifying the file.
+    ///
+    /// The database is opened read-only and must have exactly the supported
+    /// schema version and one valid singleton metadata row.
     pub fn inspect(path: &Path) -> Result<StoredSession, SessionError> {
         let connection = open_database(path, true)?;
         validate_schema_version(&connection, path)?;
         read_stored_session(&connection, path)
     }
 
-    pub fn node(&self, inode: InodeId) -> Result<Node, SessionError> {
+    /// Returns one visible inode's effective metadata.
+    ///
+    /// Missing and tombstoned rows return [`SessionError::UnknownInode`];
+    /// malformed persisted fields return an invalid-session error.
+    pub fn node(&self, inode: InodeId) -> Result<Inode, SessionError> {
         let connection = self.connection("read visible inode")?;
         let stored = read_inode_by_id(&connection, &self.database_path, inode)?
             .filter(|node| !node.tombstone)
@@ -123,7 +180,14 @@ impl SessionStore {
         Ok(stored.node)
     }
 
-    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Node>, SessionError> {
+    /// Looks up a visible child by UTF-8 basename.
+    ///
+    /// Returns the child when already known, the parent's remote directory
+    /// digest when its complete child set still needs materialization, or
+    /// [`SessionError::NotFound`] after materialization proves absence. The
+    /// parent must be a visible remote-backed directory and `name` must be a
+    /// single non-special path component.
+    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Inode>, SessionError> {
         validate_child_name(&self.database_path, name)?;
         let connection = self.connection("look up visible child")?;
         let parent_node = required_directory(&connection, &self.database_path, parent)?;
@@ -143,7 +207,12 @@ impl SessionStore {
         }
     }
 
-    pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Node>>, SessionError> {
+    /// Lists a directory's visible children in ascending basename order.
+    ///
+    /// Returns the remote directory digest instead when the complete child set
+    /// has not been materialized. The inode must identify a visible,
+    /// remote-backed directory.
+    pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Inode>>, SessionError> {
         let connection = self.connection("list visible directory")?;
         let directory = required_directory(&connection, &self.database_path, inode)?;
         if materialized_digest(&connection, &self.database_path, inode)?.is_none() {
@@ -158,12 +227,20 @@ impl SessionStore {
         )?))
     }
 
+    /// Atomically records and returns the complete visible child set of a directory.
+    ///
+    /// `children` must have valid unique basenames and must describe `digest`,
+    /// the immutable remote identity currently stored for `parent`. Repeating
+    /// the same materialization is allowed; conflicting remote identity or child
+    /// sets are rejected. Existing tombstones and overlay-backed children take
+    /// precedence. The session must be active, and no partial inserts are
+    /// committed on failure.
     pub fn materialize_directory(
         &self,
         parent: InodeId,
         digest: &Digest,
         children: &[RemoteChild],
-    ) -> Result<Vec<Node>, SessionError> {
+    ) -> Result<Vec<Inode>, SessionError> {
         validate_remote_children(&self.database_path, children)?;
         let mut connection = self.connection("materialize remote directory")?;
         let transaction = connection.transaction().map_err(|source| {
@@ -215,6 +292,10 @@ impl SessionStore {
         Ok(visible)
     }
 
+    /// Resolves the byte backing for a visible regular file.
+    ///
+    /// Overlay content takes precedence over a remote digest. Missing,
+    /// tombstoned, wrong-kind, and unbacked file rows return [`SessionError`].
     pub fn get_file_source(&self, inode: InodeId) -> Result<ReadSource, SessionError> {
         let connection = self.connection("resolve inode read source")?;
         let stored = read_inode_by_id(&connection, &self.database_path, inode)?
@@ -238,6 +319,11 @@ impl SessionStore {
         })
     }
 
+    /// Atomically marks an active session as cleanly closed at the current time.
+    ///
+    /// This store-level transition requires the current lifecycle to be
+    /// [`SessionLifecycle::Active`]; repeated close calls are rejected. The
+    /// session facade provides the externally visible idempotent close behavior.
     pub fn close(&self) -> Result<(), SessionError> {
         let (seconds, nanos) = now_parts()?;
         let mut connection = self.connection("close session")?;
@@ -264,6 +350,7 @@ impl SessionStore {
             .map_err(|source| db_error("commit clean close", &self.database_path, source))
     }
 
+    /// Locks the session-owned connection for one synchronous repository operation.
     fn connection(
         &self,
         operation: &'static str,
@@ -532,7 +619,7 @@ fn read_visible_children(
     connection: &Connection,
     path: &Path,
     parent: InodeId,
-) -> Result<Vec<Node>, SessionError> {
+) -> Result<Vec<Inode>, SessionError> {
     Ok(read_children(connection, path, parent)?
         .into_iter()
         .filter(|stored| !stored.tombstone)
@@ -687,7 +774,7 @@ fn validate_inode_row(path: &Path, row: InodeTuple) -> Result<StoredNode, Sessio
         NodeKind::Symlink => 0o777,
     });
     Ok(StoredNode {
-        node: Node {
+        node: Inode {
             inode,
             parent,
             name,

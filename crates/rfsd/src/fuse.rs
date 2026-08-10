@@ -14,7 +14,7 @@ use fuser::{
 };
 use libc::{EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, EROFS};
 use rfs_common::cas::BlobStore;
-use rfs_common::session::{InodeId, Node, NodeKind, SessionError};
+use rfs_common::session::{InodeId, Inode, NodeKind, SessionError};
 
 use crate::filesystem::{FilesystemError, FilesystemService};
 
@@ -78,7 +78,7 @@ struct FuseAdapter<S> {
 }
 
 impl<S: BlobStore + Clone + Send + Sync + 'static> FuseAdapter<S> {
-    fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<Node, i32> {
+    fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<Inode, i32> {
         let name = name.to_str().ok_or(ENOENT)?;
         let parent = InodeId::new(parent).map_err(|_| EINVAL)?;
         self.filesystem
@@ -86,7 +86,7 @@ impl<S: BlobStore + Clone + Send + Sync + 'static> FuseAdapter<S> {
             .map_err(errno_for_error)
     }
 
-    fn node(&self, inode: u64) -> Result<Node, i32> {
+    fn node(&self, inode: u64) -> Result<Inode, i32> {
         let inode = InodeId::new(inode).map_err(|_| EINVAL)?;
         self.filesystem.getattr(inode).map_err(errno_for_error)
     }
@@ -350,7 +350,7 @@ impl<S: BlobStore + Clone + Send + Sync + 'static> Filesystem for FuseAdapter<S>
     }
 }
 
-fn file_attr(node: &Node) -> FileAttr {
+fn file_attr(node: &Inode) -> FileAttr {
     let size = node.size;
     let mtime = timestamp_to_system_time(node.mtime);
     FileAttr {
@@ -377,7 +377,7 @@ fn file_attr(node: &Node) -> FileAttr {
     }
 }
 
-fn permission_bits(node: &Node) -> u16 {
+fn permission_bits(node: &Inode) -> u16 {
     u16::try_from(node.mode & 0o7777).unwrap_or(0)
 }
 
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn converts_remote_metadata_to_read_only_attributes() {
-        let node = Node {
+        let node = Inode {
             inode: InodeId::new(9).unwrap(),
             parent: InodeId::ROOT,
             name: "tool".to_owned(),

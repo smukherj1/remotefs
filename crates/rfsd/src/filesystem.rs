@@ -14,7 +14,7 @@ use rfs_common::digest::{Digest, DigestError, EMPTY_DIGEST};
 use rfs_common::error_context::{ResultContext, ResultContextError};
 use rfs_common::reapi::remote_execution::{Directory, NodeProperties};
 use rfs_common::session::{
-    InodeId, Lookup, Node, NodeKind, NodeTime, RemoteChild, RemoteContent, Session, SessionError,
+    InodeId, Lookup, Inode, NodeKind, NodeTime, RemoteChild, RemoteContent, Session, SessionError,
 };
 use rfs_common::tree::{TreeError, decode_directory};
 use thiserror::Error;
@@ -150,7 +150,7 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
         &self,
         dir_inode: InodeId,
         child_name: &str,
-    ) -> Result<Node, FilesystemError> {
+    ) -> Result<Inode, FilesystemError> {
         let mut materialized = false;
         let mut last_digest = EMPTY_DIGEST.clone();
 
@@ -187,12 +187,12 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
     }
 
     /// Lists one directory in stable namespace order.
-    pub fn readdir(&self, inode: InodeId) -> Result<Vec<Node>, FilesystemError> {
+    pub fn readdir(&self, inode: InodeId) -> Result<Vec<Inode>, FilesystemError> {
         self.ensure_directory(inode)
     }
 
     /// Returns current visible metadata for one inode.
-    pub fn getattr(&self, inode: InodeId) -> Result<Node, FilesystemError> {
+    pub fn getattr(&self, inode: InodeId) -> Result<Inode, FilesystemError> {
         self.session
             .node(inode)
             .map_err(|source| session_error(inode, source))
@@ -249,7 +249,7 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
         self.counters.cached_blobs.load(Ordering::Relaxed)
     }
 
-    fn ensure_directory(&self, inode: InodeId) -> Result<Vec<Node>, FilesystemError> {
+    fn ensure_directory(&self, inode: InodeId) -> Result<Vec<Inode>, FilesystemError> {
         // TODO: wth is this loop.
         loop {
             match self

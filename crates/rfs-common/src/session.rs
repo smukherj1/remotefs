@@ -115,7 +115,7 @@ impl NodeTime {
 
 /// Visible, validated inode metadata exposed by the session facade.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Node {
+pub struct Inode {
     /// Session-stable inode identity.
     pub inode: InodeId,
     /// Parent identity; root refers to itself.
@@ -374,17 +374,17 @@ impl Session {
     }
 
     /// Returns one visible inode from authoritative SQLite state.
-    pub fn node(&self, inode: InodeId) -> Result<Node, SessionError> {
+    pub fn node(&self, inode: InodeId) -> Result<Inode, SessionError> {
         self.active.with_store(|store| store.node(inode))
     }
 
     /// Looks up a child or reports the remote directory that still needs loading.
-    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Node>, SessionError> {
+    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Inode>, SessionError> {
         self.active.with_store(|store| store.lookup(parent, name))
     }
 
     /// Lists a directory or reports the remote directory that still needs loading.
-    pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Node>>, SessionError> {
+    pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Inode>>, SessionError> {
         self.active.with_store(|store| store.list_directory(inode))
     }
 
@@ -394,7 +394,7 @@ impl Session {
         parent: InodeId,
         remote_digest: &Digest,
         remote_children: Vec<RemoteChild>,
-    ) -> Result<Vec<Node>, SessionError> {
+    ) -> Result<Vec<Inode>, SessionError> {
         self.active.with_store(|store| {
             store.materialize_directory(parent, remote_digest, &remote_children)
         })
