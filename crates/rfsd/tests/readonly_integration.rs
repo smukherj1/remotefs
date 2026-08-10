@@ -51,8 +51,8 @@ async fn uploaded_fixture_is_read_lazily_through_verified_cache() -> Result<()> 
     let workflow_session = std::sync::Arc::clone(&session);
     let counters = tokio::task::spawn_blocking(move || -> Result<_> {
         let filesystem = FilesystemService::mount(reader, workflow_session, runtime)?;
-        let nested = filesystem.lookup(InodeId::ROOT, "nested")?;
-        let child = filesystem.lookup(nested.inode, "child.txt")?;
+        let nested = filesystem.lookup_dir_child(InodeId::ROOT, "nested")?;
+        let child = filesystem.lookup_dir_child(nested.inode, "child.txt")?;
         assert_eq!(
             filesystem.read(child.inode, 0, 64)?.as_ref(),
             b"child contents"

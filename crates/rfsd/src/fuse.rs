@@ -82,7 +82,7 @@ impl<S: BlobStore + Clone + Send + Sync + 'static> FuseAdapter<S> {
         let name = name.to_str().ok_or(ENOENT)?;
         let parent = InodeId::new(parent).map_err(|_| EINVAL)?;
         self.filesystem
-            .lookup(parent, name)
+            .lookup_dir_child(parent, name)
             .map_err(errno_for_error)
     }
 

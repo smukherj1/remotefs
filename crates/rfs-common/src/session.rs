@@ -167,24 +167,6 @@ pub enum Lookup<T> {
     NeedsMaterialization { digest: Digest },
 }
 
-/// Result of an inode-based immutable range read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalRead {
-    /// The requested range was served from admitted local content.
-    Ready(Bytes),
-    /// The caller must fetch this immutable object and retry by inode.
-    NeedsDownload { digest: Digest },
-}
-
-impl fmt::Display for LocalRead {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Ready(..) => "ready",
-            Self::NeedsDownload { .. } => "needs download",
-        })
-    }
-}
-
 /// Durable session lifecycle stored in SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -276,6 +258,9 @@ pub enum SessionError {
     /// Completed pending bytes do not match the expected digest.
     #[error("blob verification failed: expected {expected}, got {actual}")]
     BlobIntegrity { expected: Digest, actual: Digest },
+    /// A remote-backed file was read before its blob was admitted to the cache.
+    #[error("blob {digest} is missing from the local cache")]
+    MissingBlob { digest: Digest },
     /// Current wall-clock time cannot be stored safely.
     #[error("system time is outside the supported timestamp range")]
     InvalidSystemTime,
@@ -425,25 +410,39 @@ impl Session {
         self.cache.read_blob(digest)
     }
 
-    /// Resolves current inode backing and serves a range or requests a remote fill.
+    /// Returns the immutable digest for a remote-backed file.
+    ///
+    /// Overlay-backed files return `None`. The inode must identify a visible
+    /// regular file.
+    pub fn remote_file_digest(&self, inode: InodeId) -> Result<Option<Digest>, SessionError> {
+        match self
+            .active
+            .with_store(|store| store.get_file_source(inode))?
+        {
+            ReadSource::Remote(digest) => Ok(Some(digest)),
+            ReadSource::Overlay(_) => Ok(None),
+        }
+    }
+
+    /// Resolves current inode backing and serves a range from local storage.
+    ///
+    /// A remote-backed file's verified blob must already be admitted to the
+    /// cache. Overlay-backed files are read directly from the active session.
     pub fn read_range(
         &self,
         inode: InodeId,
         offset: u64,
         size: usize,
-    ) -> Result<LocalRead, SessionError> {
+    ) -> Result<Bytes, SessionError> {
         match self
             .active
             .with_store(|store| store.get_file_source(inode))?
         {
-            ReadSource::Remote(digest) => match self.cache.read_range(&digest, offset, size)? {
-                Some(bytes) => Ok(LocalRead::Ready(bytes)),
-                None => Ok(LocalRead::NeedsDownload { digest }),
-            },
-            ReadSource::Overlay(path) => self
-                .active
-                .read_overlay_range(&path, offset, size)
-                .map(LocalRead::Ready),
+            ReadSource::Remote(digest) => self
+                .cache
+                .read_range(&digest, offset, size)?
+                .ok_or(SessionError::MissingBlob { digest }),
+            ReadSource::Overlay(path) => self.active.read_overlay_range(&path, offset, size),
         }
     }
 

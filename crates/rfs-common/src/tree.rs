@@ -391,10 +391,13 @@ impl Default for DirectoryBuilder {
 /// The raw bytes must hash to `expected`. The decoded directory must use
 /// canonical per-kind ordering, must not contain duplicate names across files,
 /// directories, and symlinks, and must contain valid digests and metadata.
-pub fn decode_directory(expected: Digest, bytes: Bytes) -> Result<Directory, TreeError> {
+pub fn decode_directory(expected: &Digest, bytes: Bytes) -> Result<Directory, TreeError> {
     let actual = Digest::for_bytes(bytes.as_ref());
-    if actual != expected {
-        return Err(TreeError::DigestMismatch { expected, actual });
+    if actual != *expected {
+        return Err(TreeError::DigestMismatch {
+            expected: expected.clone(),
+            actual,
+        });
     }
 
     let directory = Directory::decode(bytes.as_ref()).map_err(|source| TreeError::Decode {
@@ -736,7 +739,7 @@ mod tests {
             .unwrap();
 
         let encoded = builder.encode().unwrap();
-        let decoded = decode_directory(encoded.digest, encoded.bytes).unwrap();
+        let decoded = decode_directory(&encoded.digest, encoded.bytes).unwrap();
         let file = &decoded.files[0];
         assert!(file.is_executable);
         let properties = file.node_properties.as_ref().unwrap();
@@ -831,7 +834,7 @@ mod tests {
         let wrong = Digest::for_bytes(b"wrong");
 
         assert!(matches!(
-            decode_directory(wrong, encoded.bytes),
+            decode_directory(&wrong, encoded.bytes),
             Err(TreeError::DigestMismatch { .. })
         ));
     }
@@ -850,7 +853,7 @@ mod tests {
         let bytes = Bytes::from(directory.encode_to_vec());
         let digest = Digest::for_bytes(bytes.as_ref());
 
-        let error = decode_directory(digest.clone(), bytes).unwrap_err();
+        let error = decode_directory(&digest, bytes).unwrap_err();
         let rendered = rendered_chain(error);
         assert!(rendered.contains(&format!("validate decoded REAPI Directory {digest}")));
         assert!(rendered.contains("validate sorted file node names"));
@@ -876,7 +879,7 @@ mod tests {
         let bytes = Bytes::from(directory.encode_to_vec());
         let digest = Digest::for_bytes(bytes.as_ref());
 
-        let error = decode_directory(digest.clone(), bytes).unwrap_err();
+        let error = decode_directory(&digest, bytes).unwrap_err();
         let rendered = rendered_chain(error);
         assert!(rendered.contains(&format!("validate decoded REAPI Directory {digest}")));
         assert!(rendered.contains("Invalid digest in directory entry `bad`"));

@@ -14,8 +14,7 @@ use rfs_common::digest::{Digest, DigestError, EMPTY_DIGEST};
 use rfs_common::error_context::{ResultContext, ResultContextError};
 use rfs_common::reapi::remote_execution::{Directory, NodeProperties};
 use rfs_common::session::{
-    InodeId, LocalRead, Lookup, Node, NodeKind, NodeTime, RemoteChild, RemoteContent, Session,
-    SessionError,
+    InodeId, Lookup, Node, NodeKind, NodeTime, RemoteChild, RemoteContent, Session, SessionError,
 };
 use rfs_common::tree::{TreeError, decode_directory};
 use thiserror::Error;
@@ -146,34 +145,40 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
         Ok(filesystem)
     }
 
-    /// Looks up one direct child without fetching child directory metadata.
-    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Node, FilesystemError> {
+    /// Looks up one direct child by name in a directory inode.
+    pub fn lookup_dir_child(
+        &self,
+        dir_inode: InodeId,
+        child_name: &str,
+    ) -> Result<Node, FilesystemError> {
         let mut materialized = false;
         let mut last_digest = EMPTY_DIGEST.clone();
+
+        // TODO: Can this be simplified by calling ensure_directory on dir inode?
 
         loop {
             match self
                 .session
-                .lookup(parent, name)
-                .map_err(|source| session_error(parent, source))?
+                .lookup(dir_inode, child_name)
+                .map_err(|source| session_error(dir_inode, source))?
             {
                 Lookup::Ready(node) => return Ok(node),
                 Lookup::NeedsMaterialization { digest } if !materialized => {
                     tracing::info!(
                         "Materializing directory inode {} with digest {}",
-                        parent,
+                        dir_inode,
                         digest
                     );
-                    self.materialize_remote_directory(parent, &digest).with_context(|| format!("failed to materialize node named {} with digest {} in parent inode {}", name, digest, parent))?;
+                    self.materialize_remote_directory(dir_inode, &digest).with_context(|| format!("failed to materialize node named {} with digest {} in parent inode {}", child_name, digest, dir_inode))?;
                     materialized = true;
                     last_digest = digest;
                 }
                 Lookup::NeedsMaterialization { digest } => {
                     return Err(FilesystemError::InvalidInode {
-                        inode: parent,
+                        inode: dir_inode,
                         reason: format!(
                             "child node {} in inode {} needs materialization as digest {} despite just being materialized as digest {}",
-                            name, parent, digest, last_digest
+                            child_name, dir_inode, digest, last_digest
                         ),
                     });
                 }
@@ -215,48 +220,18 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
 
     /// Reads a byte range after ensuring complete immutable content is admitted.
     pub fn read(&self, inode: InodeId, offset: u64, size: usize) -> Result<Bytes, FilesystemError> {
-        let read_result = self
+        let remote_digest = self
             .session
-            .read_range(inode, offset, size)
+            .remote_file_digest(inode)
             .map_err(|source| session_error(inode, source))?;
-        if let LocalRead::Ready(bytes) = read_result {
-            self.counters
-                .blob_cache_hits
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(bytes);
+        if let Some(digest) = remote_digest {
+            let downloaded = self.ensure_blob(&digest, "file blob")?;
+            self.record_blob_fetch(downloaded);
         }
-        let LocalRead::NeedsDownload { digest } = read_result else {
-            return Err(FilesystemError::InvalidInode {
-                inode,
-                reason: format!(
-                    "inode read returned unhandled local result: {}",
-                    read_result
-                ),
-            });
-        };
-        if self.ensure_blob(&digest, "file blob")? {
-            self.counters.blob_downloads.fetch_add(1, Ordering::Relaxed);
-            self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.counters
-                .blob_cache_hits
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        let LocalRead::Ready(bytes) = self
-            .session
+
+        self.session
             .read_range(inode, offset, size)
             .map_err(|source| session_error(inode, source))
-            .with_context(|| format!("reading blob {} after downloading", digest))?
-        else {
-            return Err(FilesystemError::InvalidInode {
-                inode,
-                reason: format!(
-                    "inode backed by blob {} failed to register in blob cache despite downloading it",
-                    digest
-                ),
-            });
-        };
-        Ok(bytes)
     }
 
     /// Returns a point-in-time snapshot of read-only fetch counters.
@@ -295,43 +270,22 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
         inode: InodeId,
         digest: &Digest,
     ) -> Result<(), FilesystemError> {
-        let bytes = match self
+        let downloaded = self.ensure_blob(digest, "directory")?;
+        self.record_directory_fetch(downloaded);
+
+        let bytes = self
             .session
             .read_blob(digest)
             .map_err(|source| session_error(inode, source))?
-        {
-            Some(bytes) => {
-                self.counters
-                    .directory_cache_hits
-                    .fetch_add(1, Ordering::Relaxed);
-                bytes
-            }
-            None => {
-                if self.ensure_blob(digest, "directory")? {
-                    self.counters
-                        .directory_downloads
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.counters
-                        .directory_cache_hits
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                self.session
-                    .read_blob(digest)
-                    .map_err(|source| session_error(inode, source))?
-                    .ok_or_else(|| FilesystemError::InvalidInode {
-                        inode,
-                        reason: format!("directory node {digest} remained missing after admission"),
-                    })?
-            }
-        };
-        let directory = decode_directory(digest.clone(), bytes).map_err(|source| {
-            FilesystemError::Directory {
+            .ok_or_else(|| FilesystemError::InvalidInode {
+                inode,
+                reason: format!("directory node {digest} remained missing after admission"),
+            })?;
+        let directory =
+            decode_directory(&digest, bytes).map_err(|source| FilesystemError::Directory {
                 digest: digest.clone(),
                 source,
-            }
-        })?;
+            })?;
         let children = remote_children(&directory)?;
         self.session
             .materialize_directory(inode, digest, children)
@@ -339,10 +293,15 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
         Ok(())
     }
 
-    // TODO: Ensure blob should first check if blob exists in cache before locking and return
-    // cache hit (i.e. false) if it does. Otherwise, it should acquire lock and download blob.
-    // Then callers don't need to do the unlocked check.
+    /// Ensures `digest` is admitted to the verified local cache.
+    ///
+    /// Returns `true` only when this call downloaded and admitted the blob. A
+    /// cache hit returns before acquiring the digest-specific download lock.
     fn ensure_blob(&self, digest: &Digest, object: &'static str) -> Result<bool, FilesystemError> {
+        if self.session.exists(digest) {
+            return Ok(false);
+        }
+
         let lock = self.download_lock(digest)?;
         let _guard = lock.lock().map_err(|_| FilesystemError::DownloadLock {
             digest: digest.clone(),
@@ -351,6 +310,7 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
         if self.session.exists(digest) {
             return Ok(false);
         }
+
         let mut writer = self
             .session
             .start_blob_download(digest)
@@ -378,6 +338,30 @@ impl<S: BlobStore + Clone + Send + Sync> FilesystemService<S> {
             .map_err(|source| session_error(InodeId::ROOT, source))
             .with_context(|| format!("finalizing downloaded blob {}", digest))?;
         Ok(true)
+    }
+
+    fn record_blob_fetch(&self, downloaded: bool) {
+        if !downloaded {
+            self.counters
+                .blob_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.counters.blob_downloads.fetch_add(1, Ordering::Relaxed);
+        self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_directory_fetch(&self, downloaded: bool) {
+        if !downloaded {
+            self.counters
+                .directory_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.counters
+            .directory_downloads
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters.cached_blobs.fetch_add(1, Ordering::Relaxed);
     }
 
     fn download_lock(&self, digest: &Digest) -> Result<Arc<Mutex<()>>, FilesystemError> {
@@ -590,7 +574,9 @@ mod tests {
             )
             .unwrap(),
         );
-        let file = filesystem.lookup(InodeId::ROOT, "hello.txt").unwrap();
+        let file = filesystem
+            .lookup_dir_child(InodeId::ROOT, "hello.txt")
+            .unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let left = {
             let filesystem = Arc::clone(&filesystem);
@@ -660,8 +646,12 @@ mod tests {
             )
             .unwrap(),
         );
-        let left = filesystem.lookup(InodeId::ROOT, "left.txt").unwrap();
-        let right = filesystem.lookup(InodeId::ROOT, "right.txt").unwrap();
+        let left = filesystem
+            .lookup_dir_child(InodeId::ROOT, "left.txt")
+            .unwrap();
+        let right = filesystem
+            .lookup_dir_child(InodeId::ROOT, "right.txt")
+            .unwrap();
         let start = Arc::new(Barrier::new(3));
         let left_read = {
             let filesystem = Arc::clone(&filesystem);
@@ -704,7 +694,7 @@ mod tests {
             runtime.handle().clone(),
         )
         .unwrap();
-        let file = first.lookup(InodeId::ROOT, "hello.txt").unwrap();
+        let file = first.lookup_dir_child(InodeId::ROOT, "hello.txt").unwrap();
         assert_eq!(
             first.read(file.inode, 0, usize::MAX).unwrap(),
             Bytes::from_static(b"hello from remote")
@@ -724,7 +714,7 @@ mod tests {
             runtime.handle().clone(),
         )
         .unwrap();
-        let file = second.lookup(InodeId::ROOT, "hello.txt").unwrap();
+        let file = second.lookup_dir_child(InodeId::ROOT, "hello.txt").unwrap();
         assert_eq!(
             second.read(file.inode, 0, usize::MAX).unwrap(),
             Bytes::from_static(b"hello from remote")
@@ -755,7 +745,9 @@ mod tests {
             runtime.handle().clone(),
         )
         .unwrap();
-        let file = filesystem.lookup(InodeId::ROOT, "hello.txt").unwrap();
+        let file = filesystem
+            .lookup_dir_child(InodeId::ROOT, "hello.txt")
+            .unwrap();
         let Err(read_err) = filesystem.read(file.inode, 0, 1) else {
             panic!("Lookup of corrupted blob succeeded, expected error.");
         };
