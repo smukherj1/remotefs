@@ -58,7 +58,7 @@ pub enum ReadSource {
     Overlay(PathBuf),
 }
 
-/// Validated inode row plus persistence details hidden from session callers.
+/// Represents an Inode persisted to the db.
 #[derive(Debug, Clone)]
 struct StoredNode {
     /// Effective visible metadata, including defaults for absent mode and mtime.
@@ -351,6 +351,13 @@ impl SessionStore {
     }
 
     /// Locks the session-owned connection for one synchronous repository operation.
+    ///
+    /// `operation` identifies the caller in synchronization diagnostics and must
+    /// describe the operation that will use the returned guard. The caller must
+    /// not already hold this store's non-reentrant mutex. Returns exclusive
+    /// access to the writable connection until the guard is dropped. Returns
+    /// [`SessionError::Synchronization`] if another thread poisoned the mutex;
+    /// acquiring the guard otherwise has no database side effects.
     fn connection(
         &self,
         operation: &'static str,
@@ -361,6 +368,15 @@ impl SessionStore {
     }
 }
 
+/// Installs the schema and creates the singleton metadata and root-inode rows.
+///
+/// `connection` is the writable connection for `path`; `session_id`,
+/// `daemon_pid`, `root_digest`, and `mountpoint` become the immutable identity of
+/// the new session. The database must not already contain session metadata or a
+/// root inode, `mountpoint` must be UTF-8, and the supplied connection must allow
+/// schema and row writes. Returns `()` after both rows commit atomically. Returns
+/// [`SessionError`] for schema/version, path-encoding, clock, SQLite, or
+/// constraint failures; a failed transaction commits neither initialization row.
 fn initialize_database(
     connection: &mut Connection,
     path: &Path,
@@ -411,6 +427,17 @@ fn initialize_database(
         .map_err(|source| db_error("commit session initialization", path, source))
 }
 
+/// Merges one authoritative remote child set into a materialized directory.
+///
+/// `transaction` supplies the atomic write boundary, `path` identifies its
+/// database in errors, `parent` is the directory inode, and `children` is the
+/// already-validated remote child set. The parent must exist and each child name
+/// must be unique and valid. Existing tombstones and overlay-backed rows win over
+/// remote data; equivalent remote rows are retained and missing rows are
+/// inserted. Returns `()` when the stored remote identities exactly reconcile.
+/// Returns [`SessionError`] on reads, inserts, malformed stored rows, or any
+/// conflicting/stale remote identity. The caller decides whether to commit or
+/// roll back changes made before an error.
 fn reconcile_children(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -447,6 +474,15 @@ fn reconcile_children(
     Ok(())
 }
 
+/// Inserts a single immutable remote child as a clean inode row.
+///
+/// `transaction` is the caller-owned materialization transaction, `path`
+/// identifies the database in errors, `parent` is the owning directory, and
+/// `child` provides the validated name, content identity, mode, and mtime. The
+/// parent row must exist, and no row with the same `(parent, name)` may exist.
+/// Returns `()` after the insert is staged in the transaction. Returns
+/// [`SessionError`] if SQLite rejects the row; the insert remains uncommitted
+/// until the caller commits the transaction.
 fn insert_remote_child(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -484,6 +520,13 @@ fn insert_remote_child(
     Ok(())
 }
 
+/// Tests whether a stored inode has exactly the remote identity and metadata supplied by a child.
+///
+/// `stored` is a validated database row and `child` is a validated remote entry.
+/// No additional preconditions apply. Returns `true` only when kind, content
+/// digest or symlink target, optional mode, and optional mtime all match; overlay
+/// and tombstone precedence is handled by the caller. This pure comparison does
+/// not fail and has no side effects.
 fn remote_identity_matches(stored: &StoredNode, child: &RemoteChild) -> bool {
     let content_matches = match &child.content {
         RemoteContent::File(digest) => {
@@ -505,6 +548,14 @@ fn remote_identity_matches(stored: &StoredNode, child: &RemoteChild) -> bool {
     content_matches && stored.stored_mode == child.mode && stored.stored_mtime == child.mtime
 }
 
+/// Loads a visible inode and requires it to be a directory.
+///
+/// `connection` is any connection containing the session schema, `path`
+/// identifies that database in diagnostics, and `inode` is the requested ID.
+/// Returns the validated stored row, including its persistence-only fields.
+/// Returns [`SessionError::UnknownInode`] for a missing or tombstoned row,
+/// [`SessionError::WrongKind`] for another node kind, or [`SessionError`] for
+/// SQLite and persisted-row validation failures. The database is not modified.
 fn required_directory(
     connection: &Connection,
     path: &Path,
@@ -523,6 +574,13 @@ fn required_directory(
     Ok(node)
 }
 
+/// Extracts the remote digest required to materialize a directory row.
+///
+/// `path` identifies the database in corruption diagnostics and `node` is a
+/// validated stored row that the caller must already have established is a
+/// directory. Returns a clone of its remote digest. Returns [`SessionError`] if
+/// the directory has no remote backing, which indicates stale or malformed
+/// persisted state. The row and database are unchanged.
 fn required_remote_digest(path: &Path, node: &StoredNode) -> Result<Digest, SessionError> {
     node.remote_digest.clone().ok_or_else(|| {
         stale_path(
@@ -532,6 +590,14 @@ fn required_remote_digest(path: &Path, node: &StoredNode) -> Result<Digest, Sess
     })
 }
 
+/// Reads the remote digest previously recorded for a directory materialization.
+///
+/// `connection` is a session database connection, `path` identifies it in
+/// diagnostics, and `inode` is the directory whose marker is queried. The caller
+/// need not first prove that the inode exists. Returns `None` when no marker is
+/// present or `Some(digest)` after parsing the stored value. Returns
+/// [`SessionError`] for SQLite failures or an invalid persisted digest. This is a
+/// read-only operation.
 fn materialized_digest(
     connection: &Connection,
     path: &Path,
@@ -557,6 +623,13 @@ fn materialized_digest(
         .transpose()
 }
 
+/// Looks up and validates one inode by its durable ID.
+///
+/// `connection` is a session database connection, `path` identifies it in
+/// diagnostics, and `inode` is the exact primary key to query. The session schema
+/// must be present. Returns `None` when no row exists or `Some(StoredNode)` for a
+/// valid row, including tombstones. Returns [`SessionError`] for SQLite decoding
+/// or domain-validation failures. The database is not modified.
 fn read_inode_by_id(
     connection: &Connection,
     path: &Path,
@@ -574,6 +647,14 @@ fn read_inode_by_id(
     )
 }
 
+/// Looks up and validates one child by its parent inode and basename.
+///
+/// `connection` is a session database connection, `path` identifies it in
+/// diagnostics, `parent` is the parent inode ID, and `name` is the exact stored
+/// basename. Callers that accept untrusted names must validate `name` first.
+/// Returns `None` when the pair has no row or `Some(StoredNode)` for a valid row,
+/// including tombstones. Returns [`SessionError`] for SQLite decoding or
+/// domain-validation failures. The database is not modified.
 fn read_child(
     connection: &Connection,
     path: &Path,
@@ -592,6 +673,13 @@ fn read_child(
     )
 }
 
+/// Reads and validates every stored child of a parent in basename order.
+///
+/// `connection` is a session database connection, `path` identifies it in
+/// diagnostics, and `parent` selects the rows; the parent need not itself exist
+/// for this query. Returns all matching rows, including tombstones, sorted by
+/// `name`. Returns [`SessionError`] if statement preparation, querying, row
+/// decoding, or domain validation fails. No database state changes.
 fn read_children(
     connection: &Connection,
     path: &Path,
@@ -615,6 +703,13 @@ fn read_children(
     .collect()
 }
 
+/// Reads a parent's visible children in basename order.
+///
+/// `connection`, `path`, and `parent` have the same requirements as
+/// [`read_children`]. Returns the effective [`Inode`] value for each non-
+/// tombstoned row and omits persistence-only fields. Returns [`SessionError`] for
+/// any query, decoding, or validation failure inherited from `read_children`.
+/// This operation is read-only.
 fn read_visible_children(
     connection: &Connection,
     path: &Path,
@@ -627,6 +722,16 @@ fn read_visible_children(
         .collect())
 }
 
+/// Executes a single-row inode query and validates its optional result.
+///
+/// `connection` is a session database connection, `path` identifies it in
+/// diagnostics, `operation` names the query for SQLite errors, `sql` must select
+/// the thirteen inode columns in [`InodeTuple`] order, and `parameters` must bind
+/// that statement. Returns `None` for no row or a validated `StoredNode` for one
+/// row. Returns [`SessionError`] for SQLite, column-decoding, or inode-invariant
+/// failures. The SQL must identify at most one logical row because SQLite's
+/// single-row API does not check for additional results. The supplied SQL is
+/// expected to be read-only and this helper adds no writes.
 fn query_inode(
     connection: &Connection,
     path: &Path,
@@ -641,6 +746,13 @@ fn query_inode(
     row.map(|row| validate_inode_row(path, row)).transpose()
 }
 
+/// Decodes the current SQLite row into the repository's raw inode tuple.
+///
+/// `row` must contain exactly the selected inode fields in the order represented
+/// by [`InodeTuple`], with SQLite types compatible with that alias. Returns the
+/// unvalidated tuple. Returns [`rusqlite::Error`] when any column is absent or
+/// cannot be converted; domain validation is intentionally deferred to
+/// [`validate_inode_row`]. Reading the row has no side effects.
 fn inode_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<InodeTuple> {
     Ok((
         row.get(0)?,
@@ -659,6 +771,15 @@ fn inode_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<InodeTuple> {
     ))
 }
 
+/// Validates and converts a raw inode tuple into stored and effective metadata.
+///
+/// `path` identifies the database in corruption diagnostics and `row` must have
+/// been decoded in [`InodeTuple`] column order. The function validates inode and
+/// parent shape, node kind, booleans, mode, mtime, content backing, overlay path,
+/// and kind-specific fields. Returns a `StoredNode`, applying default mode and
+/// Unix-epoch mtime and deriving visible size. Returns [`SessionError`] for any
+/// malformed persisted value or violated inode invariant. It performs no I/O and
+/// does not modify the tuple or database.
 fn validate_inode_row(path: &Path, row: InodeTuple) -> Result<StoredNode, SessionError> {
     let (
         inode,
@@ -792,6 +913,13 @@ fn validate_inode_row(path: &Path, row: InodeTuple) -> Result<StoredNode, Sessio
     })
 }
 
+/// Validates the names and uniqueness of a complete remote child set.
+///
+/// `path` identifies the session database in validation errors and `children`
+/// contains the entries proposed for one directory. No database access is
+/// required. Returns `()` when every basename is valid and appears exactly once.
+/// Returns [`SessionError`] for an empty, special, slash-containing, or duplicate
+/// name. The slice is not modified and validation has no side effects.
 fn validate_remote_children(path: &Path, children: &[RemoteChild]) -> Result<(), SessionError> {
     let mut names = HashSet::with_capacity(children.len());
     for child in children {
@@ -806,6 +934,12 @@ fn validate_remote_children(path: &Path, children: &[RemoteChild]) -> Result<(),
     Ok(())
 }
 
+/// Validates one basename accepted by the merged inode namespace.
+///
+/// `path` identifies the session database in diagnostics and `name` is the
+/// candidate UTF-8 child name. Returns `()` when `name` is non-empty, contains no
+/// slash, and is neither `.` nor `..`. Returns [`SessionError`] otherwise. The
+/// function performs no I/O and does not normalize or mutate the name.
 fn validate_child_name(path: &Path, name: &str) -> Result<(), SessionError> {
     if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
         return Err(stale_path(
@@ -816,6 +950,14 @@ fn validate_child_name(path: &Path, name: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Requires the singleton session metadata row to have the active lifecycle.
+///
+/// `connection` must contain a readable session schema and `path` identifies the
+/// database in diagnostics. Returns `()` for an active session. Returns
+/// [`SessionError`] when metadata cannot be read or validated, or when the
+/// lifecycle is not active. The check is read-only; callers must perform it
+/// inside the same transaction as any guarded mutation to preserve the
+/// precondition through commit.
 fn ensure_active(connection: &Connection, path: &Path) -> Result<(), SessionError> {
     let stored = read_stored_session(connection, path)?;
     if stored.state != SessionLifecycle::Active {
@@ -830,6 +972,13 @@ fn ensure_active(connection: &Connection, path: &Path) -> Result<(), SessionErro
     Ok(())
 }
 
+/// Reads and validates the singleton row used for session inspection.
+///
+/// `connection` must contain the supported `session_metadata` table and `path`
+/// identifies its database in diagnostics. Returns validated daemon PID,
+/// lifecycle, root digest, and mountpoint metadata. Returns [`SessionError`] when
+/// the row is missing, SQLite decoding fails, or any stored session invariant is
+/// invalid. The database is not modified.
 fn read_stored_session(
     connection: &Connection,
     path: &Path,
@@ -866,6 +1015,15 @@ fn read_stored_session(
     validate_session_row(path, row)
 }
 
+/// Converts raw session metadata into the externally useful validated subset.
+///
+/// `path` identifies the database in corruption diagnostics and `row` is the
+/// untrusted SQLite representation of the singleton metadata. The row must
+/// describe a UUID session, positive daemon PID, supported lifecycle, coherent
+/// timestamps, valid digest, absolute mountpoint, and supported logging values.
+/// Returns `StoredSession` when all invariants hold. Returns [`SessionError`] at
+/// the first invalid field or cross-field condition. This pure validation does
+/// not modify the database.
 fn validate_session_row(path: &Path, row: RawSession) -> Result<StoredSession, SessionError> {
     if row.singleton != 1 {
         return Err(stale_path(path, "session singleton is not 1".into()));
@@ -923,6 +1081,15 @@ fn validate_session_row(path: &Path, row: RawSession) -> Result<StoredSession, S
     })
 }
 
+/// Opens and configures an existing SQLite session database.
+///
+/// `path` is the exact database file and `read_only` selects read-only inspection
+/// or writable daemon access. The file must already exist and be accessible with
+/// the requested mode. Returns a connection with a two-second busy timeout; a
+/// writable connection also uses rollback-journal mode and enables foreign keys.
+/// Returns [`SessionError`] if opening or any pragma configuration fails. The
+/// writable path may update SQLite's journal-mode metadata, while read-only mode
+/// does not intentionally mutate the file.
 fn open_database(path: &Path, read_only: bool) -> Result<Connection, SessionError> {
     let flags = if read_only {
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -945,6 +1112,15 @@ fn open_database(path: &Path, read_only: bool) -> Result<Connection, SessionErro
     Ok(connection)
 }
 
+/// Creates the baseline schema or verifies compatibility before reapplying it.
+///
+/// `connection` must be writable and refer to `path`. A zero `user_version`
+/// denotes an unversioned database eligible for initialization; any nonzero
+/// version must equal [`SCHEMA_VERSION`]. Returns `()` after idempotently applying
+/// [`SCHEMA_SQL`] and recording the supported version for a new database. Returns
+/// [`SessionError`] for version mismatches or SQLite failures. SQLite may retain
+/// statements completed before a later error because this helper does not create
+/// an explicit transaction.
 fn prepare_schema(connection: &Connection, path: &Path) -> Result<(), SessionError> {
     let version = schema_version(connection, path)?;
     if version != 0 {
@@ -961,12 +1137,24 @@ fn prepare_schema(connection: &Connection, path: &Path) -> Result<(), SessionErr
     Ok(())
 }
 
+/// Reads SQLite's `user_version` value for a session database.
+///
+/// `connection` is the database to query and `path` identifies it in errors. The
+/// connection must support pragma reads. Returns the signed schema-version value
+/// exactly as stored. Returns [`SessionError`] if SQLite cannot read or decode
+/// the pragma. The database is not modified.
 fn schema_version(connection: &Connection, path: &Path) -> Result<i64, SessionError> {
     connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|source| db_error("read schema version", path, source))
 }
 
+/// Requires a database's schema version to match this repository implementation.
+///
+/// `connection` is the database to inspect and `path` identifies it in errors.
+/// Returns `()` only when `user_version` equals [`SCHEMA_VERSION`]. Returns
+/// [`SessionError`] when the pragma cannot be read or the version is unsupported.
+/// The check is read-only and performs no migration or repair.
 fn validate_schema_version(connection: &Connection, path: &Path) -> Result<(), SessionError> {
     let version = schema_version(connection, path)?;
     if version != SCHEMA_VERSION {
@@ -978,6 +1166,13 @@ fn validate_schema_version(connection: &Connection, path: &Path) -> Result<(), S
     Ok(())
 }
 
+/// Parses the persisted text representation of a session lifecycle.
+///
+/// `path` identifies the database in validation diagnostics and `value` is the
+/// exact SQLite text to decode. Returns the matching [`SessionLifecycle`] for
+/// `initializing`, `active`, or `closed`. Returns [`SessionError`] for any other
+/// spelling. Parsing is case-sensitive, allocates only on error, and has no side
+/// effects.
 fn parse_lifecycle(path: &Path, value: &str) -> Result<SessionLifecycle, SessionError> {
     match value {
         "initializing" => Ok(SessionLifecycle::Initializing),
@@ -990,6 +1185,12 @@ fn parse_lifecycle(path: &Path, value: &str) -> Result<SessionLifecycle, Session
     }
 }
 
+/// Parses the persisted text representation of an inode kind.
+///
+/// `path` identifies the database in validation diagnostics and `value` is the
+/// exact SQLite text to decode. Returns the matching [`NodeKind`] for `file`,
+/// `directory`, or `symlink`. Returns [`SessionError`] for any other spelling.
+/// Parsing is case-sensitive, allocates only on error, and has no side effects.
 fn parse_node_kind(path: &Path, value: &str) -> Result<NodeKind, SessionError> {
     match value {
         "file" => Ok(NodeKind::File),
@@ -1002,6 +1203,11 @@ fn parse_node_kind(path: &Path, value: &str) -> Result<NodeKind, SessionError> {
     }
 }
 
+/// Returns the canonical SQLite text representation of an inode kind.
+///
+/// `kind` is any [`NodeKind`] value; there are no additional preconditions.
+/// Returns one of the static strings `file`, `directory`, or `symlink`. This
+/// total conversion cannot fail, allocate, or modify state.
 fn node_kind_text(kind: NodeKind) -> &'static str {
     match kind {
         NodeKind::File => "file",
@@ -1010,6 +1216,12 @@ fn node_kind_text(kind: NodeKind) -> &'static str {
     }
 }
 
+/// Decodes a SQLite integer constrained to the repository's boolean encoding.
+///
+/// `path` identifies the database, while `inode` and `field` identify the owning
+/// value in diagnostics; `value` is the raw integer. Returns `false` for zero and
+/// `true` for one. Returns [`SessionError`] for every other integer. This pure
+/// validation does not modify database state.
 fn parse_boolean(
     path: &Path,
     inode: InodeId,
@@ -1026,6 +1238,14 @@ fn parse_boolean(
     }
 }
 
+/// Validates a persisted seconds-and-nanoseconds timestamp pair.
+///
+/// `path` identifies the database, `field` names the timestamp in diagnostics,
+/// and `seconds`/`nanos` are the raw SQLite values. Returns `()` when the pair can
+/// construct a [`NodeTime`], including a nanosecond fraction in its valid range.
+/// Returns [`SessionError`] when seconds fall outside the supported REAPI range
+/// or nanoseconds are negative, overflow `u32`, or are not normalized. No state
+/// is changed.
 fn validate_timestamp(
     path: &Path,
     field: &str,
@@ -1042,6 +1262,13 @@ fn validate_timestamp(
     Ok(())
 }
 
+/// Wraps a SQLite failure with its repository operation and database identity.
+///
+/// `operation` names the failed database action, `path` is the exact database
+/// path, and `source` is the original [`rusqlite::Error`]. Callers should provide
+/// stable, action-specific operation text. Returns [`SessionError::Database`]
+/// while preserving `source`; this conversion cannot itself fail and has no side
+/// effects beyond cloning the path into the error.
 fn db_error(operation: &'static str, path: &Path, source: rusqlite::Error) -> SessionError {
     SessionError::Database {
         operation,
@@ -1055,6 +1282,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Verifies that the embedded schema can be applied twice and creates each required table once.
+    ///
+    /// This test takes no arguments and requires only an in-memory SQLite
+    /// connection. It returns `()` after checking the schema and panics if schema
+    /// execution fails, a required relation is absent or duplicated, or SQL
+    /// domain checks have been introduced. All database effects remain confined
+    /// to the temporary in-memory connection.
     #[test]
     fn embedded_schema_is_idempotent_and_has_expected_relations() {
         let connection = Connection::open_in_memory().unwrap();
