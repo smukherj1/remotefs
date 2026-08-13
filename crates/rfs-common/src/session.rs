@@ -32,11 +32,10 @@ pub use cache::BlobWriter;
 
 use cache::BlobCache;
 use overlay::OverlayStore;
-use store::{ROOT_INODE_ID, ReadSource, SessionStore};
-
-const LOCK_RECORD_VERSION: u32 = 1;
-const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
-const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+use store::{
+    Inode as StoreInode, Lookup as StoreLookup, ROOT_INODE_ID, ReadSource, SessionStore,
+    StoreNodeKind,
+};
 
 /// Session-stable inode identity that is positive and representable by SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -64,12 +63,11 @@ impl InodeId {
         self.0
     }
 
-    pub(super) fn from_sqlite(value: i64, path: &Path) -> Result<Self, SessionError> {
+    pub(super) fn from_sqlite(value: i64) -> Result<Self, SessionError> {
         if value <= 0 {
-            return Err(stale_path(
-                path,
-                format!("stored inode {value} is not positive"),
-            ));
+            return Err(SessionError::InvalidStoredInode {
+                reason: format!("stored inode {value} is not positive"),
+            });
         }
         Ok(Self(value))
     }
@@ -242,6 +240,9 @@ pub enum SessionError {
     /// A raw inode is zero or exceeds SQLite's signed range.
     #[error("inode value {value} is outside the supported range")]
     InvalidInode { value: u64 },
+    /// A stored inode row violates the session namespace invariants.
+    #[error("invalid stored inode: {reason}")]
+    InvalidStoredInode { reason: String },
     /// No visible row exists for an inode.
     #[error("inode {inode} is not visible")]
     UnknownInode { inode: InodeId },
@@ -375,17 +376,20 @@ impl Session {
 
     /// Returns one visible inode from authoritative SQLite state.
     pub fn node(&self, inode: InodeId) -> Result<Inode, SessionError> {
-        self.active.with_store(|store| store.node(inode))
+        self.active
+            .with_store(|store| store_inode_to_session(store.node(inode)?))
     }
 
     /// Looks up a child or reports the remote directory that still needs loading.
     pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Inode>, SessionError> {
-        self.active.with_store(|store| store.lookup(parent, name))
+        self.active
+            .with_store(|store| store_lookup_to_session(store.lookup(parent, name)?))
     }
 
     /// Lists a directory or reports the remote directory that still needs loading.
     pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Inode>>, SessionError> {
-        self.active.with_store(|store| store.list_directory(inode))
+        self.active
+            .with_store(|store| store_list_to_session(store.list_directory(inode)?))
     }
 
     /// Atomically records a complete decoded remote child set.
@@ -396,7 +400,13 @@ impl Session {
         remote_children: Vec<RemoteChild>,
     ) -> Result<Vec<Inode>, SessionError> {
         self.active.with_store(|store| {
-            store.materialize_directory(parent, remote_digest, &remote_children)
+            let children = remote_children
+                .into_iter()
+                .map(|child| remote_child_store_insert(parent, child))
+                .collect::<Vec<_>>();
+            let inodes =
+                store.materialize_directory(parent, &remote_digest.to_string(), &children)?;
+            translate_store_inodes(inodes)
         })
     }
 
@@ -419,8 +429,11 @@ impl Session {
             .active
             .with_store(|store| store.get_file_source(inode))?
         {
-            ReadSource::Remote(digest) => Ok(Some(digest)),
-            ReadSource::Overlay(_) => Ok(None),
+            ReadSource::Remote(digest) => parse_stored_digest(inode, &digest).map(Some),
+            ReadSource::Overlay(path) => {
+                validate_overlay_path(inode, path)?;
+                Ok(None)
+            }
         }
     }
 
@@ -438,11 +451,16 @@ impl Session {
             .active
             .with_store(|store| store.get_file_source(inode))?
         {
-            ReadSource::Remote(digest) => self
-                .cache
-                .read_range(&digest, offset, size)?
-                .ok_or(SessionError::MissingBlob { digest }),
-            ReadSource::Overlay(path) => self.active.read_overlay_range(&path, offset, size),
+            ReadSource::Remote(digest) => {
+                let digest = parse_stored_digest(inode, &digest)?;
+                self.cache
+                    .read_range(&digest, offset, size)?
+                    .ok_or(SessionError::MissingBlob { digest })
+            }
+            ReadSource::Overlay(path) => {
+                let path = validate_overlay_path(inode, path)?;
+                self.active.read_overlay_range(&path, offset, size)
+            }
         }
     }
 
@@ -483,6 +501,287 @@ pub fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, SessionError> {
         });
     }
     Ok(canonical)
+}
+
+const LOCK_RECORD_VERSION: u32 = 1;
+const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
+const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
+
+fn store_lookup_to_session(lookup: StoreLookup<StoreInode>) -> Result<Lookup<Inode>, SessionError> {
+    match lookup {
+        StoreLookup::Ready(inode) => store_inode_to_session(inode).map(Lookup::Ready),
+        StoreLookup::NeedsMaterialization { digest } => {
+            let digest = digest.parse().map_err(|error| {
+                invalid_stored_inode(format!("invalid directory materialization digest: {error}"))
+            })?;
+            Ok(Lookup::NeedsMaterialization { digest })
+        }
+    }
+}
+
+fn store_list_to_session(
+    lookup: StoreLookup<Vec<StoreInode>>,
+) -> Result<Lookup<Vec<Inode>>, SessionError> {
+    match lookup {
+        StoreLookup::Ready(inodes) => translate_store_inodes(inodes).map(Lookup::Ready),
+        StoreLookup::NeedsMaterialization { digest } => {
+            let digest = digest.parse().map_err(|error| {
+                invalid_stored_inode(format!("invalid directory materialization digest: {error}"))
+            })?;
+            Ok(Lookup::NeedsMaterialization { digest })
+        }
+    }
+}
+
+fn translate_store_inodes(inodes: Vec<StoreInode>) -> Result<Vec<Inode>, SessionError> {
+    inodes.into_iter().map(store_inode_to_session).collect()
+}
+
+/// Validates one complete SQLite-shaped record and projects its visible fields.
+///
+/// Persistence-only backing, tombstone, and dirty fields are deliberately not
+/// exposed. Nullable mode and mtime receive effective defaults only here.
+fn store_inode_to_session(stored: StoreInode) -> Result<Inode, SessionError> {
+    let (inode, parent) = validate_store_inode_identity(&stored)?;
+    if stored.tombstone {
+        return Err(invalid_stored_inode(format!(
+            "inode {inode} is unexpectedly tombstoned"
+        )));
+    }
+    let kind = session_node_kind(stored.kind);
+    if inode == InodeId::ROOT && kind != NodeKind::Directory {
+        return Err(invalid_stored_inode("root inode is not a directory".into()));
+    }
+    let remote_digest = stored
+        .remote_digest
+        .as_ref()
+        .map(|value| parse_stored_digest(inode, value))
+        .transpose()?;
+    let overlay_file = stored
+        .overlay_file
+        .as_ref()
+        .map(|path| validate_overlay_path(inode, path.clone()))
+        .transpose()?;
+    let mode = validate_stored_mode(inode, stored.mode)?;
+    let mtime = validate_stored_mtime(inode, stored.mtime_seconds, stored.mtime_nanos)?;
+    validate_store_inode_shape(
+        inode,
+        &stored,
+        kind,
+        remote_digest.as_ref(),
+        overlay_file.as_deref(),
+    )?;
+    let size = visible_inode_size(
+        kind,
+        remote_digest.as_ref(),
+        stored.symlink_target.as_deref(),
+    );
+    Ok(Inode {
+        inode,
+        parent,
+        name: stored.name,
+        kind,
+        size,
+        mode: mode.unwrap_or_else(|| default_mode(kind)),
+        mtime: mtime.unwrap_or(NodeTime::UNIX_EPOCH),
+        symlink_target: stored.symlink_target,
+    })
+}
+
+fn validate_store_inode_identity(stored: &StoreInode) -> Result<(InodeId, InodeId), SessionError> {
+    let inode = match stored.inode {
+        Some(value) => InodeId::from_sqlite(value)?,
+        None => {
+            return Err(invalid_stored_inode(
+                "inode row is missing its identity".into(),
+            ));
+        }
+    };
+    let parent = match (inode, stored.parent_inode) {
+        (InodeId::ROOT, None) if stored.name.is_empty() => InodeId::ROOT,
+        (InodeId::ROOT, Some(_)) => {
+            return Err(invalid_stored_inode(
+                "root inode has a parent, which is unexpected".into(),
+            ));
+        }
+        (InodeId::ROOT, None) => {
+            return Err(invalid_stored_inode(
+                "root inode has a non-empty name".into(),
+            ));
+        }
+        (_, Some(parent)) => {
+            validate_stored_name(inode, &stored.name)?;
+            InodeId::from_sqlite(parent)?
+        }
+        (_, None) => {
+            return Err(invalid_stored_inode(format!(
+                "inode {inode} has no parent but is not the root inode"
+            )));
+        }
+    };
+    Ok((inode, parent))
+}
+
+fn session_node_kind(kind: StoreNodeKind) -> NodeKind {
+    match kind {
+        StoreNodeKind::File => NodeKind::File,
+        StoreNodeKind::Directory => NodeKind::Directory,
+        StoreNodeKind::Symlink => NodeKind::Symlink,
+    }
+}
+
+fn parse_stored_digest(inode: InodeId, value: &str) -> Result<Digest, SessionError> {
+    value.parse().map_err(|error| {
+        invalid_stored_inode(format!(
+            "inode {inode} has an invalid remote digest: {error}"
+        ))
+    })
+}
+
+fn validate_stored_mode(inode: InodeId, mode: Option<i64>) -> Result<Option<u32>, SessionError> {
+    mode.map(|value| {
+        u32::try_from(value)
+            .map_err(|_| invalid_stored_inode(format!("inode {inode} has an invalid mode")))
+    })
+    .transpose()
+}
+
+fn validate_stored_mtime(
+    inode: InodeId,
+    seconds: Option<i64>,
+    nanos: Option<i64>,
+) -> Result<Option<NodeTime>, SessionError> {
+    match (seconds, nanos) {
+        (None, None) => Ok(None),
+        (Some(seconds), Some(nanos)) => u32::try_from(nanos)
+            .ok()
+            .and_then(|nanos| NodeTime::new(seconds, nanos))
+            .map(Some)
+            .ok_or_else(|| {
+                invalid_stored_inode(format!("inode {inode} has an invalid modification time"))
+            }),
+        _ => Err(invalid_stored_inode(format!(
+            "inode {inode} has a partial modification time"
+        ))),
+    }
+}
+
+fn validate_store_inode_shape(
+    inode: InodeId,
+    stored: &StoreInode,
+    kind: NodeKind,
+    remote_digest: Option<&Digest>,
+    overlay_file: Option<&Path>,
+) -> Result<(), SessionError> {
+    let valid_shape = match kind {
+        NodeKind::File => stored.symlink_target.is_none(),
+        NodeKind::Directory => stored.symlink_target.is_none() && overlay_file.is_none(),
+        NodeKind::Symlink => {
+            stored.symlink_target.is_some() && remote_digest.is_none() && overlay_file.is_none()
+        }
+    };
+    if valid_shape {
+        Ok(())
+    } else {
+        Err(invalid_stored_inode(format!(
+            "inode {inode} fields do not match its kind"
+        )))
+    }
+}
+
+fn visible_inode_size(
+    kind: NodeKind,
+    remote_digest: Option<&Digest>,
+    symlink_target: Option<&str>,
+) -> u64 {
+    match kind {
+        NodeKind::File => remote_digest
+            .map(|digest| u64::try_from(digest.size_bytes()).expect("digest size is non-negative"))
+            .unwrap_or(0),
+        NodeKind::Directory => 0,
+        NodeKind::Symlink => symlink_target.map_or(0, |target| {
+            u64::try_from(target.len()).expect("string length fits u64")
+        }),
+    }
+}
+
+fn default_mode(kind: NodeKind) -> u32 {
+    match kind {
+        NodeKind::File => 0o444,
+        NodeKind::Directory => 0o555,
+        NodeKind::Symlink => 0o777,
+    }
+}
+
+fn validate_stored_name(inode: InodeId, name: &str) -> Result<(), SessionError> {
+    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
+        return Err(invalid_stored_inode(format!(
+            "inode {inode} has invalid name `{name}`"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_overlay_path(inode: InodeId, value: String) -> Result<PathBuf, SessionError> {
+    let path = PathBuf::from(value);
+    let mut components = path.components();
+    let is_filename = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !is_filename {
+        return Err(invalid_stored_inode(format!(
+            "inode {inode} has an invalid overlay file"
+        )));
+    }
+    Ok(path)
+}
+
+/// Builds the exact clean, remote-backed root row for a fresh session.
+fn root_store_insert(root_digest: &Digest) -> StoreInode {
+    StoreInode {
+        inode: Some(ROOT_INODE_ID),
+        parent_inode: None,
+        name: String::new(),
+        kind: StoreNodeKind::Directory,
+        remote_digest: Some(root_digest.to_string()),
+        symlink_target: None,
+        overlay_file: None,
+        mode: None,
+        mtime_seconds: None,
+        mtime_nanos: None,
+        tombstone: false,
+        content_dirty: false,
+        tree_dirty: false,
+    }
+}
+
+/// Builds one clean remote child row while retaining nullable remote metadata.
+fn remote_child_store_insert(parent: InodeId, child: RemoteChild) -> StoreInode {
+    let (kind, remote_digest, symlink_target) = match child.content {
+        RemoteContent::File(digest) => (StoreNodeKind::File, Some(digest.to_string()), None),
+        RemoteContent::Directory(digest) => {
+            (StoreNodeKind::Directory, Some(digest.to_string()), None)
+        }
+        RemoteContent::Symlink(target) => (StoreNodeKind::Symlink, None, Some(target)),
+    };
+    let (mtime_seconds, mtime_nanos) = child
+        .mtime
+        .map(|time| (Some(time.seconds()), Some(i64::from(time.nanos()))))
+        .unwrap_or((None, None));
+    StoreInode {
+        inode: None,
+        parent_inode: Some(parent.sqlite()),
+        name: child.name,
+        kind,
+        remote_digest,
+        symlink_target,
+        overlay_file: None,
+        mode: child.mode.map(i64::from),
+        mtime_seconds,
+        mtime_nanos,
+        tombstone: false,
+        content_dirty: false,
+        tree_dirty: false,
+    }
 }
 
 struct ActiveSessionLayout {
@@ -557,12 +856,14 @@ impl ActiveSession {
         create_empty_file(&layout.db_path)
             .with_context(|| "creating file for session db".to_string())?;
         let overlay = OverlayStore::open(layout.overlay_dir.clone())?;
+        let root_inode = root_store_insert(&root_digest);
         let store = SessionStore::create(
             layout.db_path.clone(),
             session_id,
             std::process::id(),
             root_digest,
             mountpoint,
+            root_inode,
         )?;
         Ok(Self {
             layout,
@@ -771,6 +1072,10 @@ fn stale_path(path: &Path, reason: String) -> SessionError {
         path: path.to_path_buf(),
         reason,
     }
+}
+
+fn invalid_stored_inode(reason: String) -> SessionError {
+    SessionError::InvalidStoredInode { reason }
 }
 
 fn fs_error(operation: &'static str, path: &Path, source: std::io::Error) -> SessionError {

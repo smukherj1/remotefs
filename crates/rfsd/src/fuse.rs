@@ -14,7 +14,7 @@ use fuser::{
 };
 use libc::{EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, EROFS};
 use rfs_common::cas::BlobStore;
-use rfs_common::session::{InodeId, Inode, NodeKind, SessionError};
+use rfs_common::session::{Inode, InodeId, NodeKind, SessionError};
 
 use crate::filesystem::{FilesystemError, FilesystemService};
 

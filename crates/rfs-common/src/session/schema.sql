@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS inodes (
     FOREIGN KEY (parent_inode) REFERENCES inodes(inode) ON DELETE RESTRICT
 );
 
+-- TODO: Why do we need this?
 -- Remote directories whose complete immutable child set is present in inodes.
 CREATE TABLE IF NOT EXISTS directory_materializations (
     -- Materialized directory inode and primary key owned by the inodes table.

@@ -14,7 +14,7 @@ use rfs_common::digest::{Digest, DigestError, EMPTY_DIGEST};
 use rfs_common::error_context::{ResultContext, ResultContextError};
 use rfs_common::reapi::remote_execution::{Directory, NodeProperties};
 use rfs_common::session::{
-    InodeId, Lookup, Inode, NodeKind, NodeTime, RemoteChild, RemoteContent, Session, SessionError,
+    Inode, InodeId, Lookup, NodeKind, NodeTime, RemoteChild, RemoteContent, Session, SessionError,
 };
 use rfs_common::tree::{TreeError, decode_directory};
 use thiserror::Error;

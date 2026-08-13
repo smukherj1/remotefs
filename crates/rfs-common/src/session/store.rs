@@ -14,17 +14,10 @@ use uuid::Uuid;
 
 use crate::digest::Digest;
 
-use super::{
-    Inode, InodeId, Lookup, NodeKind, NodeTime, RemoteChild, RemoteContent, SessionError,
-    SessionLifecycle, now_parts, stale_path,
-};
+use super::{InodeId, NodeTime, SessionError, SessionLifecycle, now_parts, stale_path};
 
 /// Fixed inode ID of the root directory in every session database.
 pub const ROOT_INODE_ID: i64 = 1;
-/// Schema version supported by this repository implementation.
-const SCHEMA_VERSION: i64 = 1;
-/// Idempotent baseline schema embedded in the `rfs-common` binary.
-const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Repository owning the durable state for one active mount session.
 ///
@@ -51,45 +44,70 @@ pub struct StoredSession {
 }
 
 /// Backing location from which a regular file's bytes can be read.
-pub enum ReadSource {
+pub(super) enum ReadSource {
     /// Immutable content in the shared cache or remote CAS, identified by digest.
-    Remote(Digest),
+    Remote(String),
     /// Session-local content identified by a relative overlay-data path.
-    Overlay(PathBuf),
+    Overlay(String),
 }
 
-/// Represents an Inode persisted to the db.
-#[derive(Debug, Clone)]
-struct StoredNode {
-    /// Effective visible metadata, including defaults for absent mode and mtime.
-    node: Inode,
-    /// Original file-content or directory-message digest, when remote-backed.
-    remote_digest: Option<Digest>,
-    /// Relative overlay-data path, when file content is local.
-    overlay_file: Option<PathBuf>,
-    /// Persisted mode before applying a node-kind-specific default.
-    stored_mode: Option<u32>,
-    /// Persisted mtime before applying the Unix epoch default.
-    stored_mtime: Option<NodeTime>,
-    /// Whether this row hides its name from the merged namespace.
-    tombstone: bool,
+/// Closed set of node kinds accepted from SQLite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StoreNodeKind {
+    /// Persisted regular file.
+    File,
+    /// Persisted directory.
+    Directory,
+    /// Persisted symbolic link.
+    Symlink,
 }
 
-type InodeTuple = (
-    i64,
-    Option<i64>,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    i64,
-    i64,
-    i64,
-);
+/// Faithful representation of one row in the `inodes` table.
+///
+/// Decoded rows always carry an `inode`; insert rows leave it `None` to request
+/// SQLite's `AUTOINCREMENT` allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Inode {
+    /// Raw SQLite primary key; `None` only when building an auto-allocated row.
+    pub inode: Option<i64>,
+    /// Raw nullable parent key; only root has no parent.
+    pub parent_inode: Option<i64>,
+    /// Persisted UTF-8 basename.
+    pub name: String,
+    /// Decoded persisted kind.
+    pub kind: StoreNodeKind,
+    /// Canonical digest text when the inode has remote backing.
+    pub remote_digest: Option<String>,
+    /// Exact persisted symlink target.
+    pub symlink_target: Option<String>,
+    /// Relative overlay-data filename when the inode has local backing.
+    pub overlay_file: Option<String>,
+    /// Raw nullable Unix mode.
+    pub mode: Option<i64>,
+    /// Raw nullable mtime seconds.
+    pub mtime_seconds: Option<i64>,
+    /// Raw nullable mtime nanoseconds paired with `mtime_seconds`.
+    pub mtime_nanos: Option<i64>,
+    /// Decoded namespace-visibility flag.
+    pub tombstone: bool,
+    /// Decoded content-dirty flag.
+    pub content_dirty: bool,
+    /// Decoded tree-dirty flag.
+    pub tree_dirty: bool,
+}
+
+/// Store-native lazy lookup result.
+pub(super) enum Lookup<T> {
+    /// SQLite has a definitive result.
+    Ready(T),
+    /// The named remote directory still needs materialization.
+    NeedsMaterialization { digest: String },
+}
+
+/// Schema version supported by this repository implementation.
+const SCHEMA_VERSION: i64 = 1;
+/// Idempotent baseline schema embedded in the `rfs-common` binary.
+const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 /// Unvalidated `session_metadata` row decoded directly from SQLite.
 struct RawSession {
@@ -134,6 +152,7 @@ impl SessionStore {
         daemon_pid: u32,
         root_digest: Digest,
         mountpoint: PathBuf,
+        root_inode: Inode,
     ) -> Result<Self, SessionError> {
         tracing::info!(
             "SessionStore::create(db_path={}, session_id={}, daemon_pid={}, root_digest={}, mountpoint={})",
@@ -151,6 +170,7 @@ impl SessionStore {
             daemon_pid,
             &root_digest,
             &mountpoint,
+            &root_inode,
         )?;
         Ok(Self {
             database_path,
@@ -168,7 +188,7 @@ impl SessionStore {
         read_stored_session(&connection, path)
     }
 
-    /// Returns one visible inode's effective metadata.
+    /// Returns one visible inode's stored row.
     ///
     /// Missing and tombstoned rows return [`SessionError::UnknownInode`];
     /// malformed persisted fields return an invalid-session error.
@@ -177,7 +197,7 @@ impl SessionStore {
         let stored = read_inode_by_id(&connection, &self.database_path, inode)?
             .filter(|node| !node.tombstone)
             .ok_or(SessionError::UnknownInode { inode })?;
-        Ok(stored.node)
+        Ok(stored)
     }
 
     /// Looks up a visible child by UTF-8 basename.
@@ -194,7 +214,7 @@ impl SessionStore {
         if let Some(child) = read_child(&connection, &self.database_path, parent, name)?
             && !child.tombstone
         {
-            return Ok(Lookup::Ready(child.node));
+            return Ok(Lookup::Ready(child));
         }
         match materialized_digest(&connection, &self.database_path, parent)? {
             Some(_) => Err(SessionError::NotFound {
@@ -202,7 +222,7 @@ impl SessionStore {
                 name: name.to_owned(),
             }),
             None => Ok(Lookup::NeedsMaterialization {
-                digest: required_remote_digest(&self.database_path, &parent_node)?,
+                digest: required_remote_digest(&self.database_path, &parent_node)?.to_owned(),
             }),
         }
     }
@@ -217,7 +237,7 @@ impl SessionStore {
         let directory = required_directory(&connection, &self.database_path, inode)?;
         if materialized_digest(&connection, &self.database_path, inode)?.is_none() {
             return Ok(Lookup::NeedsMaterialization {
-                digest: required_remote_digest(&self.database_path, &directory)?,
+                digest: required_remote_digest(&self.database_path, &directory)?.to_owned(),
             });
         }
         Ok(Lookup::Ready(read_visible_children(
@@ -238,8 +258,8 @@ impl SessionStore {
     pub fn materialize_directory(
         &self,
         parent: InodeId,
-        digest: &Digest,
-        children: &[RemoteChild],
+        digest: &str,
+        children: &[Inode],
     ) -> Result<Vec<Inode>, SessionError> {
         validate_remote_children(&self.database_path, children)?;
         let mut connection = self.connection("materialize remote directory")?;
@@ -252,14 +272,14 @@ impl SessionStore {
         })?;
         ensure_active(&transaction, &self.database_path)?;
         let parent_node = required_directory(&transaction, &self.database_path, parent)?;
-        if required_remote_digest(&self.database_path, &parent_node)? != *digest {
+        if required_remote_digest(&self.database_path, &parent_node)? != digest {
             return Err(stale_path(
                 &self.database_path,
                 format!("inode {parent} is not remote directory {digest}"),
             ));
         }
         let prior = materialized_digest(&transaction, &self.database_path, parent)?;
-        if prior.as_ref().is_some_and(|prior| prior != digest) {
+        if prior.as_deref().is_some_and(|prior| prior != digest) {
             return Err(stale_path(
                 &self.database_path,
                 format!("directory inode {parent} was materialized with another digest"),
@@ -271,7 +291,7 @@ impl SessionStore {
                 .execute(
                     "INSERT INTO directory_materializations (inode, directory_digest)
                      VALUES (?1, ?2)",
-                    params![parent.sqlite(), digest.to_string()],
+                    params![parent.sqlite(), digest],
                 )
                 .map_err(|source| {
                     db_error(
@@ -301,11 +321,11 @@ impl SessionStore {
         let stored = read_inode_by_id(&connection, &self.database_path, inode)?
             .filter(|node| !node.tombstone)
             .ok_or(SessionError::UnknownInode { inode })?;
-        if stored.node.kind != NodeKind::File {
+        if stored.kind != StoreNodeKind::File {
             return Err(SessionError::WrongKind {
                 inode,
-                expected: NodeKind::File,
-                actual: stored.node.kind,
+                expected: super::NodeKind::File,
+                actual: session_node_kind(stored.kind),
             });
         }
         if let Some(path) = stored.overlay_file {
@@ -384,6 +404,7 @@ fn initialize_database(
     daemon_pid: u32,
     root_digest: &Digest,
     mountpoint: &Path,
+    root_inode: &Inode,
 ) -> Result<(), SessionError> {
     prepare_schema(connection, path)?;
     let mountpoint = mountpoint
@@ -412,16 +433,7 @@ fn initialize_database(
             ],
         )
         .map_err(|source| db_error("insert session metadata", path, source))?;
-    transaction
-        .execute(
-            "INSERT INTO inodes (
-                inode, parent_inode, name, kind, remote_digest, symlink_target,
-                overlay_file, mode, mtime_seconds, mtime_nanos, tombstone,
-                content_dirty, tree_dirty
-             ) VALUES (?1, NULL, '', 'directory', ?2, NULL, NULL, NULL, NULL, NULL, 0, 0, 0)",
-            params![ROOT_INODE_ID, root_digest.to_string()],
-        )
-        .map_err(|source| db_error("insert root inode", path, source))?;
+    insert_inode(&transaction, path, "insert root inode", root_inode)?;
     transaction
         .commit()
         .map_err(|source| db_error("commit session initialization", path, source))
@@ -442,7 +454,7 @@ fn reconcile_children(
     transaction: &Transaction<'_>,
     path: &Path,
     parent: InodeId,
-    children: &[RemoteChild],
+    children: &[Inode],
 ) -> Result<(), SessionError> {
     let mut remote_names = HashSet::with_capacity(children.len());
     for child in children {
@@ -460,10 +472,10 @@ fn reconcile_children(
         }
     }
     for stored in read_children(transaction, path, parent)? {
-        if (stored.remote_digest.is_some() || stored.node.kind == NodeKind::Symlink)
+        if (stored.remote_digest.is_some() || stored.kind == StoreNodeKind::Symlink)
             && stored.overlay_file.is_none()
             && !stored.tombstone
-            && !remote_names.contains(stored.node.name.as_str())
+            && !remote_names.contains(stored.name.as_str())
         {
             return Err(stale_path(
                 path,
@@ -487,36 +499,42 @@ fn insert_remote_child(
     transaction: &Transaction<'_>,
     path: &Path,
     parent: InodeId,
-    child: &RemoteChild,
+    child: &Inode,
 ) -> Result<(), SessionError> {
-    let (kind, remote_digest, symlink_target) = match &child.content {
-        RemoteContent::File(digest) => (NodeKind::File, Some(digest.to_string()), None),
-        RemoteContent::Directory(digest) => (NodeKind::Directory, Some(digest.to_string()), None),
-        RemoteContent::Symlink(target) => (NodeKind::Symlink, None, Some(target.clone())),
-    };
-    let (mtime_seconds, mtime_nanos) = child
-        .mtime
-        .map(|time| (Some(time.seconds()), Some(i64::from(time.nanos()))))
-        .unwrap_or((None, None));
+    debug_assert_eq!(child.parent_inode, Some(parent.sqlite()));
+    insert_inode(transaction, path, "insert materialized child", child)
+}
+
+fn insert_inode(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    operation: &'static str,
+    inode: &Inode,
+) -> Result<(), SessionError> {
     transaction
         .execute(
             "INSERT INTO inodes (
-                parent_inode, name, kind, remote_digest, symlink_target,
+                inode, parent_inode, name, kind, remote_digest, symlink_target,
                 overlay_file, mode, mtime_seconds, mtime_nanos, tombstone,
                 content_dirty, tree_dirty
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, 0, 0, 0)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
-                parent.sqlite(),
-                child.name,
-                node_kind_text(kind),
-                remote_digest,
-                symlink_target,
-                child.mode.map(i64::from),
-                mtime_seconds,
-                mtime_nanos,
+                inode.inode,
+                inode.parent_inode,
+                inode.name,
+                node_kind_text(inode.kind),
+                inode.remote_digest,
+                inode.symlink_target,
+                inode.overlay_file,
+                inode.mode,
+                inode.mtime_seconds,
+                inode.mtime_nanos,
+                i64::from(inode.tombstone),
+                i64::from(inode.content_dirty),
+                i64::from(inode.tree_dirty),
             ],
         )
-        .map_err(|source| db_error("insert materialized child", path, source))?;
+        .map_err(|source| db_error(operation, path, source))?;
     Ok(())
 }
 
@@ -527,25 +545,13 @@ fn insert_remote_child(
 /// digest or symlink target, optional mode, and optional mtime all match; overlay
 /// and tombstone precedence is handled by the caller. This pure comparison does
 /// not fail and has no side effects.
-fn remote_identity_matches(stored: &StoredNode, child: &RemoteChild) -> bool {
-    let content_matches = match &child.content {
-        RemoteContent::File(digest) => {
-            stored.node.kind == NodeKind::File
-                && stored.remote_digest.as_ref() == Some(digest)
-                && stored.node.symlink_target.is_none()
-        }
-        RemoteContent::Directory(digest) => {
-            stored.node.kind == NodeKind::Directory
-                && stored.remote_digest.as_ref() == Some(digest)
-                && stored.node.symlink_target.is_none()
-        }
-        RemoteContent::Symlink(target) => {
-            stored.node.kind == NodeKind::Symlink
-                && stored.remote_digest.is_none()
-                && stored.node.symlink_target.as_ref() == Some(target)
-        }
-    };
-    content_matches && stored.stored_mode == child.mode && stored.stored_mtime == child.mtime
+fn remote_identity_matches(stored: &Inode, child: &Inode) -> bool {
+    stored.kind == child.kind
+        && stored.remote_digest == child.remote_digest
+        && stored.symlink_target == child.symlink_target
+        && stored.mode == child.mode
+        && stored.mtime_seconds == child.mtime_seconds
+        && stored.mtime_nanos == child.mtime_nanos
 }
 
 /// Loads a visible inode and requires it to be a directory.
@@ -560,15 +566,15 @@ fn required_directory(
     connection: &Connection,
     path: &Path,
     inode: InodeId,
-) -> Result<StoredNode, SessionError> {
+) -> Result<Inode, SessionError> {
     let node = read_inode_by_id(connection, path, inode)?
         .filter(|node| !node.tombstone)
         .ok_or(SessionError::UnknownInode { inode })?;
-    if node.node.kind != NodeKind::Directory {
+    if node.kind != StoreNodeKind::Directory {
         return Err(SessionError::WrongKind {
             inode,
-            expected: NodeKind::Directory,
-            actual: node.node.kind,
+            expected: super::NodeKind::Directory,
+            actual: session_node_kind(node.kind),
         });
     }
     Ok(node)
@@ -581,11 +587,14 @@ fn required_directory(
 /// directory. Returns a clone of its remote digest. Returns [`SessionError`] if
 /// the directory has no remote backing, which indicates stale or malformed
 /// persisted state. The row and database are unchanged.
-fn required_remote_digest(path: &Path, node: &StoredNode) -> Result<Digest, SessionError> {
-    node.remote_digest.clone().ok_or_else(|| {
+fn required_remote_digest<'a>(path: &Path, node: &'a Inode) -> Result<&'a str, SessionError> {
+    node.remote_digest.as_deref().ok_or_else(|| {
+        let inode = node
+            .inode
+            .expect("store inode rows always carry a decoded identity");
         stale_path(
             path,
-            format!("directory inode {} has no remote digest", node.node.inode),
+            format!("directory inode {inode} has no remote digest"),
         )
     })
 }
@@ -602,7 +611,7 @@ fn materialized_digest(
     connection: &Connection,
     path: &Path,
     inode: InodeId,
-) -> Result<Option<Digest>, SessionError> {
+) -> Result<Option<String>, SessionError> {
     let value: Option<String> = connection
         .query_row(
             "SELECT directory_digest FROM directory_materializations WHERE inode = ?1",
@@ -611,30 +620,21 @@ fn materialized_digest(
         )
         .optional()
         .map_err(|source| db_error("read directory materialization", path, source))?;
-    value
-        .map(|value| {
-            value.parse().map_err(|error| {
-                stale_path(
-                    path,
-                    format!("invalid directory materialization digest: {error}"),
-                )
-            })
-        })
-        .transpose()
+    Ok(value)
 }
 
 /// Looks up and validates one inode by its durable ID.
 ///
 /// `connection` is a session database connection, `path` identifies it in
 /// diagnostics, and `inode` is the exact primary key to query. The session schema
-/// must be present. Returns `None` when no row exists or `Some(StoredNode)` for a
-/// valid row, including tombstones. Returns [`SessionError`] for SQLite decoding
-/// or domain-validation failures. The database is not modified.
+/// must be present. Returns `None` when no row exists or `Some(Inode)` for a
+/// decoded row, including tombstones. Returns [`SessionError`] for SQLite or
+/// store-representation failures. The database is not modified.
 fn read_inode_by_id(
     connection: &Connection,
     path: &Path,
     inode: InodeId,
-) -> Result<Option<StoredNode>, SessionError> {
+) -> Result<Option<Inode>, SessionError> {
     query_inode(
         connection,
         path,
@@ -652,15 +652,15 @@ fn read_inode_by_id(
 /// `connection` is a session database connection, `path` identifies it in
 /// diagnostics, `parent` is the parent inode ID, and `name` is the exact stored
 /// basename. Callers that accept untrusted names must validate `name` first.
-/// Returns `None` when the pair has no row or `Some(StoredNode)` for a valid row,
-/// including tombstones. Returns [`SessionError`] for SQLite decoding or
-/// domain-validation failures. The database is not modified.
+/// Returns `None` when the pair has no row or `Some(Inode)` for a decoded row,
+/// including tombstones. Returns [`SessionError`] for SQLite or
+/// store-representation failures. The database is not modified.
 fn read_child(
     connection: &Connection,
     path: &Path,
     parent: InodeId,
     name: &str,
-) -> Result<Option<StoredNode>, SessionError> {
+) -> Result<Option<Inode>, SessionError> {
     query_inode(
         connection,
         path,
@@ -684,7 +684,7 @@ fn read_children(
     connection: &Connection,
     path: &Path,
     parent: InodeId,
-) -> Result<Vec<StoredNode>, SessionError> {
+) -> Result<Vec<Inode>, SessionError> {
     let mut statement = connection
         .prepare(
             "SELECT inode, parent_inode, name, kind, remote_digest, symlink_target,
@@ -693,22 +693,24 @@ fn read_children(
              FROM inodes WHERE parent_inode = ?1 ORDER BY name",
         )
         .map_err(|source| db_error("prepare child listing", path, source))?;
-    let rows = statement
-        .query_map([parent.sqlite()], inode_tuple)
+    let mut rows = statement
+        .query([parent.sqlite()])
         .map_err(|source| db_error("list children", path, source))?;
-    rows.map(|row| {
-        row.map_err(|source| db_error("decode child row", path, source))
-            .and_then(|row| validate_inode_row(path, row))
-    })
-    .collect()
+    let mut children = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|source| db_error("read child row", path, source))?
+    {
+        children.push(decode_inode_row(path, row)?);
+    }
+    Ok(children)
 }
 
 /// Reads a parent's visible children in basename order.
 ///
 /// `connection`, `path`, and `parent` have the same requirements as
-/// [`read_children`]. Returns the effective [`Inode`] value for each non-
-/// tombstoned row and omits persistence-only fields. Returns [`SessionError`] for
-/// any query, decoding, or validation failure inherited from `read_children`.
+/// [`read_children`]. Returns each complete store [`Inode`] for non-tombstoned
+/// rows. Returns [`SessionError`] for failures inherited from `read_children`.
 /// This operation is read-only.
 fn read_visible_children(
     connection: &Connection,
@@ -718,7 +720,6 @@ fn read_visible_children(
     Ok(read_children(connection, path, parent)?
         .into_iter()
         .filter(|stored| !stored.tombstone)
-        .map(|stored| stored.node)
         .collect())
 }
 
@@ -726,11 +727,10 @@ fn read_visible_children(
 ///
 /// `connection` is a session database connection, `path` identifies it in
 /// diagnostics, `operation` names the query for SQLite errors, `sql` must select
-/// the thirteen inode columns in [`InodeTuple`] order, and `parameters` must bind
-/// that statement. Returns `None` for no row or a validated `StoredNode` for one
-/// row. Returns [`SessionError`] for SQLite, column-decoding, or inode-invariant
-/// failures. The SQL must identify at most one logical row because SQLite's
-/// single-row API does not check for additional results. The supplied SQL is
+/// the thirteen inode columns in schema order, and `parameters` must bind that
+/// statement. Returns `None` for no row or a decoded [`Inode`] for one row.
+/// Returns [`SessionError`] for SQLite, column-decoding, or store-representation
+/// failures. The SQL must identify at most one logical row. The supplied SQL is
 /// expected to be read-only and this helper adds no writes.
 fn query_inode(
     connection: &Connection,
@@ -738,178 +738,87 @@ fn query_inode(
     operation: &'static str,
     sql: &str,
     parameters: impl rusqlite::Params,
-) -> Result<Option<StoredNode>, SessionError> {
-    let row = connection
-        .query_row(sql, parameters, inode_tuple)
-        .optional()
+) -> Result<Option<Inode>, SessionError> {
+    let mut statement = connection
+        .prepare(sql)
         .map_err(|source| db_error(operation, path, source))?;
-    row.map(|row| validate_inode_row(path, row)).transpose()
+    let mut rows = statement
+        .query(parameters)
+        .map_err(|source| db_error(operation, path, source))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|source| db_error(operation, path, source))?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_inode_row(path, row)?))
 }
 
-/// Decodes the current SQLite row into the repository's raw inode tuple.
-///
-/// `row` must contain exactly the selected inode fields in the order represented
-/// by [`InodeTuple`], with SQLite types compatible with that alias. Returns the
-/// unvalidated tuple. Returns [`rusqlite::Error`] when any column is absent or
-/// cannot be converted; domain validation is intentionally deferred to
-/// [`validate_inode_row`]. Reading the row has no side effects.
-fn inode_tuple(row: &rusqlite::Row<'_>) -> rusqlite::Result<InodeTuple> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-        row.get(8)?,
-        row.get(9)?,
-        row.get(10)?,
-        row.get(11)?,
-        row.get(12)?,
-    ))
-}
-
-/// Validates and converts a raw inode tuple into stored and effective metadata.
-///
-/// `path` identifies the database in corruption diagnostics and `row` must have
-/// been decoded in [`InodeTuple`] column order. The function validates inode and
-/// parent shape, node kind, booleans, mode, mtime, content backing, overlay path,
-/// and kind-specific fields. Returns a `StoredNode`, applying default mode and
-/// Unix-epoch mtime and deriving visible size. Returns [`SessionError`] for any
-/// malformed persisted value or violated inode invariant. It performs no I/O and
-/// does not modify the tuple or database.
-fn validate_inode_row(path: &Path, row: InodeTuple) -> Result<StoredNode, SessionError> {
-    let (
-        inode,
-        parent_inode,
-        name,
-        kind,
-        remote_digest,
-        symlink_target,
-        overlay_file,
-        mode,
-        mtime_seconds,
-        mtime_nanos,
-        tombstone,
-        content_dirty,
-        tree_dirty,
-    ) = row;
-    let inode = InodeId::from_sqlite(inode, path)?;
-    let parent = match (inode, parent_inode) {
-        (InodeId::ROOT, None) if name.is_empty() => InodeId::ROOT,
-        (InodeId::ROOT, _) => {
-            return Err(stale_path(
-                path,
-                "root inode has an invalid identity".into(),
-            ));
-        }
-        (_, Some(parent)) if !name.is_empty() && !name.contains('/') => {
-            InodeId::from_sqlite(parent, path)?
-        }
-        _ => {
-            return Err(stale_path(
-                path,
-                format!("inode {inode} has an invalid identity"),
-            ));
-        }
-    };
-    let kind = parse_node_kind(path, &kind)?;
-    let tombstone = parse_boolean(path, inode, "tombstone", tombstone)?;
-    parse_boolean(path, inode, "content_dirty", content_dirty)?;
-    parse_boolean(path, inode, "tree_dirty", tree_dirty)?;
-    let stored_mode = mode
-        .map(|value| {
-            u32::try_from(value)
-                .map_err(|_| stale_path(path, format!("inode {inode} has an invalid mode")))
-        })
-        .transpose()?;
-    let stored_mtime = match (mtime_seconds, mtime_nanos) {
-        (None, None) => None,
-        (Some(seconds), Some(nanos)) => {
-            let nanos = u32::try_from(nanos).ok();
-            nanos
-                .and_then(|nanos| NodeTime::new(seconds, nanos))
-                .map(Some)
-                .ok_or_else(|| {
-                    stale_path(
-                        path,
-                        format!("inode {inode} has an invalid modification time"),
-                    )
-                })?
-        }
-        _ => {
-            return Err(stale_path(
-                path,
-                format!("inode {inode} has a partial modification time"),
-            ));
-        }
-    };
-    let remote_digest: Option<Digest> = remote_digest
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|error| stale_path(path, format!("invalid inode remote digest: {error}")))
-        })
-        .transpose()?;
-    let overlay_file = overlay_file
-        .map(PathBuf::from)
-        .map(|value| {
-            if value.as_os_str().is_empty() || value.is_absolute() {
-                Err(stale_path(
-                    path,
-                    format!("inode {inode} has an invalid overlay file"),
-                ))
-            } else {
-                Ok(value)
-            }
-        })
-        .transpose()?;
-    let valid_shape = match kind {
-        NodeKind::File => symlink_target.is_none(),
-        NodeKind::Directory => symlink_target.is_none() && overlay_file.is_none(),
-        NodeKind::Symlink => {
-            symlink_target.is_some() && remote_digest.is_none() && overlay_file.is_none()
-        }
-    };
-    if !valid_shape {
+/// Decodes all inode columns without applying facade defaults or projections.
+fn decode_inode_row(path: &Path, row: &rusqlite::Row<'_>) -> Result<Inode, SessionError> {
+    let inode = row
+        .get(0)
+        .map_err(|source| db_error("decode inode identity", path, source))?;
+    let kind: String = row
+        .get(3)
+        .map_err(|source| db_error("decode inode kind", path, source))?;
+    let kind = parse_node_kind(path, inode, &kind)?;
+    let mtime_seconds: Option<i64> = row
+        .get(8)
+        .map_err(|source| db_error("decode inode mtime seconds", path, source))?;
+    let mtime_nanos: Option<i64> = row
+        .get(9)
+        .map_err(|source| db_error("decode inode mtime nanos", path, source))?;
+    if mtime_seconds.is_some() != mtime_nanos.is_some() {
         return Err(stale_path(
             path,
-            format!("inode {inode} fields do not match its kind"),
+            format!("inode {inode} has a partial modification time"),
         ));
     }
-    let size = match kind {
-        NodeKind::File => remote_digest
-            .as_ref()
-            .map(|digest| u64::try_from(digest.size_bytes()).expect("digest size is non-negative"))
-            .unwrap_or(0),
-        NodeKind::Directory => 0,
-        NodeKind::Symlink => symlink_target.as_ref().map_or(0, |target| {
-            u64::try_from(target.len()).expect("string length fits u64")
-        }),
-    };
-    let effective_mode = stored_mode.unwrap_or(match kind {
-        NodeKind::File => 0o444,
-        NodeKind::Directory => 0o555,
-        NodeKind::Symlink => 0o777,
-    });
-    Ok(StoredNode {
-        node: Inode {
+    Ok(Inode {
+        inode: Some(inode),
+        parent_inode: row
+            .get(1)
+            .map_err(|source| db_error("decode inode parent", path, source))?,
+        name: row
+            .get(2)
+            .map_err(|source| db_error("decode inode name", path, source))?,
+        kind,
+        remote_digest: row
+            .get(4)
+            .map_err(|source| db_error("decode inode remote digest", path, source))?,
+        symlink_target: row
+            .get(5)
+            .map_err(|source| db_error("decode inode symlink target", path, source))?,
+        overlay_file: row
+            .get(6)
+            .map_err(|source| db_error("decode inode overlay file", path, source))?,
+        mode: row
+            .get(7)
+            .map_err(|source| db_error("decode inode mode", path, source))?,
+        mtime_seconds,
+        mtime_nanos,
+        tombstone: parse_boolean(
+            path,
             inode,
-            parent,
-            name,
-            kind,
-            size,
-            mode: effective_mode,
-            mtime: stored_mtime.unwrap_or(NodeTime::UNIX_EPOCH),
-            symlink_target,
-        },
-        remote_digest,
-        overlay_file,
-        stored_mode,
-        stored_mtime,
-        tombstone,
+            "tombstone",
+            row.get(10)
+                .map_err(|source| db_error("decode inode tombstone", path, source))?,
+        )?,
+        content_dirty: parse_boolean(
+            path,
+            inode,
+            "content_dirty",
+            row.get(11)
+                .map_err(|source| db_error("decode inode content dirty", path, source))?,
+        )?,
+        tree_dirty: parse_boolean(
+            path,
+            inode,
+            "tree_dirty",
+            row.get(12)
+                .map_err(|source| db_error("decode inode tree dirty", path, source))?,
+        )?,
     })
 }
 
@@ -920,7 +829,7 @@ fn validate_inode_row(path: &Path, row: InodeTuple) -> Result<StoredNode, Sessio
 /// required. Returns `()` when every basename is valid and appears exactly once.
 /// Returns [`SessionError`] for an empty, special, slash-containing, or duplicate
 /// name. The slice is not modified and validation has no side effects.
-fn validate_remote_children(path: &Path, children: &[RemoteChild]) -> Result<(), SessionError> {
+fn validate_remote_children(path: &Path, children: &[Inode]) -> Result<(), SessionError> {
     let mut names = HashSet::with_capacity(children.len());
     for child in children {
         validate_child_name(path, &child.name)?;
@@ -1191,14 +1100,14 @@ fn parse_lifecycle(path: &Path, value: &str) -> Result<SessionLifecycle, Session
 /// exact SQLite text to decode. Returns the matching [`NodeKind`] for `file`,
 /// `directory`, or `symlink`. Returns [`SessionError`] for any other spelling.
 /// Parsing is case-sensitive, allocates only on error, and has no side effects.
-fn parse_node_kind(path: &Path, value: &str) -> Result<NodeKind, SessionError> {
+fn parse_node_kind(path: &Path, inode: i64, value: &str) -> Result<StoreNodeKind, SessionError> {
     match value {
-        "file" => Ok(NodeKind::File),
-        "directory" => Ok(NodeKind::Directory),
-        "symlink" => Ok(NodeKind::Symlink),
+        "file" => Ok(StoreNodeKind::File),
+        "directory" => Ok(StoreNodeKind::Directory),
+        "symlink" => Ok(StoreNodeKind::Symlink),
         _ => Err(stale_path(
             path,
-            format!("unsupported inode kind `{value}`"),
+            format!("inode {inode} has unsupported kind `{value}`"),
         )),
     }
 }
@@ -1208,11 +1117,19 @@ fn parse_node_kind(path: &Path, value: &str) -> Result<NodeKind, SessionError> {
 /// `kind` is any [`NodeKind`] value; there are no additional preconditions.
 /// Returns one of the static strings `file`, `directory`, or `symlink`. This
 /// total conversion cannot fail, allocate, or modify state.
-fn node_kind_text(kind: NodeKind) -> &'static str {
+fn node_kind_text(kind: StoreNodeKind) -> &'static str {
     match kind {
-        NodeKind::File => "file",
-        NodeKind::Directory => "directory",
-        NodeKind::Symlink => "symlink",
+        StoreNodeKind::File => "file",
+        StoreNodeKind::Directory => "directory",
+        StoreNodeKind::Symlink => "symlink",
+    }
+}
+
+fn session_node_kind(kind: StoreNodeKind) -> super::NodeKind {
+    match kind {
+        StoreNodeKind::File => super::NodeKind::File,
+        StoreNodeKind::Directory => super::NodeKind::Directory,
+        StoreNodeKind::Symlink => super::NodeKind::Symlink,
     }
 }
 
@@ -1222,12 +1139,7 @@ fn node_kind_text(kind: NodeKind) -> &'static str {
 /// value in diagnostics; `value` is the raw integer. Returns `false` for zero and
 /// `true` for one. Returns [`SessionError`] for every other integer. This pure
 /// validation does not modify database state.
-fn parse_boolean(
-    path: &Path,
-    inode: InodeId,
-    field: &str,
-    value: i64,
-) -> Result<bool, SessionError> {
+fn parse_boolean(path: &Path, inode: i64, field: &str, value: i64) -> Result<bool, SessionError> {
     match value {
         0 => Ok(false),
         1 => Ok(true),
@@ -1310,5 +1222,114 @@ mod tests {
                 .collect();
         assert!(tables.values().all(|count| *count == 1));
         assert!(!SCHEMA_SQL.to_ascii_uppercase().contains("CHECK"));
+    }
+
+    /// Builds a `SessionStore` over an in-memory connection seeded with one raw inode row.
+    fn store_with_inode(row_values: &str) -> SessionStore {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_SQL).unwrap();
+        connection
+            .execute(
+                "INSERT INTO inodes (inode, parent_inode, name, kind, remote_digest, symlink_target,
+                 overlay_file, mode, mtime_seconds, mtime_nanos, tombstone, content_dirty, tree_dirty)
+                 VALUES (1, NULL, '', 'directory', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                &format!(
+                    "INSERT INTO inodes (inode, parent_inode, name, kind, remote_digest, symlink_target,
+                     overlay_file, mode, mtime_seconds, mtime_nanos, tombstone, content_dirty, tree_dirty)
+                     VALUES ({row_values})"
+                ),
+                [],
+            )
+            .unwrap();
+        SessionStore {
+            database_path: PathBuf::from("/state/session.db"),
+            connection: Mutex::new(connection),
+        }
+    }
+
+    /// `node` returns every decoded column without applying facade defaults.
+    #[test]
+    fn node_preserves_every_database_column() {
+        let store = store_with_inode(
+            "7, 1, 'entry', 'file', 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/12',
+             NULL, 'overlay-7', 292, -1, 42, 0, 1, 0",
+        );
+        let decoded = store.node(InodeId::new(7).unwrap()).unwrap();
+        assert_eq!(decoded.inode, Some(7));
+        assert_eq!(decoded.parent_inode, Some(1));
+        assert_eq!(decoded.name, "entry");
+        assert_eq!(decoded.kind, StoreNodeKind::File);
+        assert_eq!(
+            decoded.remote_digest.as_deref(),
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/12")
+        );
+        assert_eq!(decoded.symlink_target, None);
+        assert_eq!(decoded.overlay_file.as_deref(), Some("overlay-7"));
+        assert_eq!(decoded.mode, Some(0o444));
+        assert_eq!(decoded.mtime_seconds, Some(-1));
+        assert_eq!(decoded.mtime_nanos, Some(42));
+        assert!(!decoded.tombstone);
+        assert!(decoded.content_dirty);
+        assert!(!decoded.tree_dirty);
+    }
+
+    /// `node` distinguishes absent metadata from an explicit default value.
+    #[test]
+    fn node_preserves_null_and_explicit_default_metadata() {
+        let absent = store_with_inode(
+            "8, 1, 'absent', 'directory', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 1",
+        );
+        let decoded = absent.node(InodeId::new(8).unwrap()).unwrap();
+        assert_eq!(decoded.mode, None);
+        assert_eq!(decoded.mtime_seconds, None);
+        assert_eq!(decoded.mtime_nanos, None);
+        assert!(decoded.tree_dirty);
+
+        let explicit =
+            store_with_inode("9, 1, 'explicit', 'directory', NULL, NULL, NULL, 365, 0, 0, 0, 0, 0");
+        let decoded = explicit.node(InodeId::new(9).unwrap()).unwrap();
+        assert_eq!(decoded.mode, Some(0o555));
+        assert_eq!(decoded.mtime_seconds, Some(0));
+        assert_eq!(decoded.mtime_nanos, Some(0));
+    }
+
+    /// `node` rejects malformed store encodings with database and inode context.
+    #[test]
+    fn node_rejects_store_encodings_with_inode_context() {
+        for (row_values, expected) in [
+            (
+                "7, 1, 'entry', 'device', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0",
+                "inode 7 has unsupported kind",
+            ),
+            (
+                "7, 1, 'entry', 'file', NULL, NULL, NULL, NULL, NULL, NULL, 2, 0, 0",
+                "inode 7 has invalid tombstone",
+            ),
+            (
+                "7, 1, 'entry', 'file', NULL, NULL, NULL, NULL, NULL, NULL, 0, -1, 0",
+                "inode 7 has invalid content_dirty",
+            ),
+            (
+                "7, 1, 'entry', 'file', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 3",
+                "inode 7 has invalid tree_dirty",
+            ),
+            (
+                "7, 1, 'entry', 'file', NULL, NULL, NULL, NULL, 0, NULL, 0, 0, 0",
+                "inode 7 has a partial modification time",
+            ),
+        ] {
+            let store = store_with_inode(row_values);
+            let message = store
+                .node(InodeId::new(7).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains("/state/session.db"), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
     }
 }

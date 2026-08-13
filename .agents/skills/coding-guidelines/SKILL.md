@@ -19,6 +19,9 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 
 - Keep items private unless another module needs them.
 - Expose domain concepts, not transport plumbing.
+- Pass constructed resource owners across operational boundaries, not the paths,
+  connection details, or configuration used to create them. Restrict those
+  construction inputs to open/create/setup code.
 - Preserve compatibility unless the task includes migration.
 
 ## Structure
@@ -38,6 +41,8 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 ## Types, Configuration, and Data
 
 - Represent closed sets with enums or domain types, not strings.
+- Reuse an existing boundary or persistence type when its fields and semantics
+  match; introduce a second shape only for a distinct invariant or operation.
 - Name shared limits and defaults.
 - Validate configuration at construction; make invalid states unrepresentable when feasible.
 - Make lossy, truncating, overflowing, or semantic conversions explicit.
@@ -54,10 +59,13 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 - Use `anyhow::Context` only in functions returning `anyhow::Result`. Use RemoteFS context helpers for typed errors such as `TreeError`, `CasError`, `UploadError`, `DigestError`, and `ConfigError`.
 - Preserve structured errors; use `map_err` to create identifier-bearing variants.
 - Do not add context that only restates failure.
+- Describe invariant failures as the exact invalid condition, including both
+  the observed state and the state required by the invariant.
 
 ## Documentation
 
-- Document methods, types, fields, proto methods, db tables and columns, and requests: inputs, outputs, errors, preconditions, and side effects.
+- Comment _all_ methods, types, fields, proto methods, db tables and columns, and requests.
+- For functions, comments should include inputs, outputs, errors, preconditions, and side effects.
 - Introduce non-trivial modules and workflows with purpose, phase order, and guarantees.
 - Document hidden contracts: invariants, rationale, protocol constraints, edge cases, and tradeoffs.
 - Cover applicable filesystem and concurrency behavior: symlinks, unsupported nodes, mutation races, ordering, partial failure, cancellation, and retries.
@@ -66,8 +74,13 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 
 ## Tests
 
-- Test observable behavior, boundary conditions, and failure modes.
+- Test behavior through the module's or type's public API, including boundary
+  conditions and failure modes; do not couple tests to private call structure.
 - Use unit tests for parsing, validation, policy decisions, and pure transformations.
 - Use integration tests across CAS, daemon, FUSE, process, network, or filesystem boundaries.
-- Test private helpers only for policy impractical to exercise publicly.
+- Test private helpers directly only when important policy is impractical to
+  exercise through a public operation.
+- To exercise corrupt or otherwise unreachable persisted state, add the
+  narrowest test-only seeding helper at the storage boundary, name it clearly
+  with `test`, and assert the failure through the public API that reads it.
 - Control time, randomness, concurrency, and external state.
