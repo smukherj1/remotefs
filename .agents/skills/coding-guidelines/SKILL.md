@@ -1,6 +1,7 @@
 ---
 name: coding-guidelines
-description: Enforce code quality and a pre-handoff audit for implementation, refactoring, bug fixes, tests, code or PR reviews, and code-design feedback. Detect complex control flow, context-free errors, undocumented contracts, weak boundaries, wasteful data movement, and test gaps.
+description: Use when writing code. Do not activate when writing documents or running other commands. Do
+not activate when writing code snippets within documents.
 ---
 
 # Coding Guidelines
