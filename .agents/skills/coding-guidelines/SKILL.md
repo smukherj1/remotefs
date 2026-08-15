@@ -1,7 +1,8 @@
 ---
 name: coding-guidelines
-description: Use when writing code. Do not activate when writing documents or running other commands. Do
-not activate when writing code snippets within documents.
+description: |
+  Use when writing code. Do not activate when writing documents or running other commands.
+  Do not activate when writing code snippets within documents.
 ---
 
 # Coding Guidelines
@@ -44,7 +45,7 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 - Represent closed sets with enums or domain types, not strings.
 - Reuse an existing boundary or persistence type when its fields and semantics
   match; introduce a second shape only for a distinct invariant or operation.
-- Name shared limits and defaults.
+- Name shared limits and defaults as module level constants with comments documenting their purpose.
 - Validate configuration at construction; make invalid states unrepresentable when feasible.
 - Make lossy, truncating, overflowing, or semantic conversions explicit.
 - Clone only for ownership, async execution, retries, or API boundaries.
@@ -52,36 +53,31 @@ Write the simplest correct code. Expose control flow, ownership, invariants, and
 
 ## Errors
 
-- Audit every propagation site (`?`, throw, rejection). Errors must identify the operation and entity.
-- Do not propagate raw errors across operation boundaries. Permit raw `?` within the same operation when its structured error already contains both identifiers; do not add redundant context.
-- Audit each layer of compound propagation such as Rust `??`; join and domain failures need separate context.
+- Audit every propagation site (`?`, throw, rejection). Always add context on what was being attempted.
+- NEVER use raw ? to return errors without additional context. Implement the Context error enum variant
+  allowing usage of the error_context module in rfs-common to add context for errors.
 - Include stable identifiers: paths, digests, operations, instances, resources, entries, environment variables, and proto paths.
 - Construct formatted or allocated context lazily.
 - Use `anyhow::Context` only in functions returning `anyhow::Result`. Use RemoteFS context helpers for typed errors such as `TreeError`, `CasError`, `UploadError`, `DigestError`, and `ConfigError`.
 - Preserve structured errors; use `map_err` to create identifier-bearing variants.
-- Do not add context that only restates failure.
-- Describe invariant failures as the exact invalid condition, including both
-  the observed state and the state required by the invariant.
 
 ## Documentation
 
 - Comment _all_ methods, types, fields, proto methods, db tables and columns, and requests.
 - For functions, comments should include inputs, outputs, errors, preconditions, and side effects.
-- Introduce non-trivial modules and workflows with purpose, phase order, and guarantees.
-- Document hidden contracts: invariants, rationale, protocol constraints, edge cases, and tradeoffs.
-- Cover applicable filesystem and concurrency behavior: symlinks, unsupported nodes, mutation races, ordering, partial failure, cancellation, and retries.
-- Document private contracts not evident from names, types, or control flow; do not narrate evident code.
-- Resolve review notes and temporary reminders in code, tests, issues, or durable design comments.
+- Comment all edge cases and non-trivial logic like early returns in functions or if/match conditions.
+- Use plain language suitable for explaining to a junior engineer whose first
+  language is not english.
 
 ## Tests
 
 - Test behavior through the module's or type's public API, including boundary
   conditions and failure modes; do not couple tests to private call structure.
-- Use unit tests for parsing, validation, policy decisions, and pure transformations.
 - Use integration tests across CAS, daemon, FUSE, process, network, or filesystem boundaries.
-- Test private helpers directly only when important policy is impractical to
-  exercise through a public operation.
-- To exercise corrupt or otherwise unreachable persisted state, add the
-  narrowest test-only seeding helper at the storage boundary, name it clearly
-  with `test`, and assert the failure through the public API that reads it.
-- Control time, randomness, concurrency, and external state.
+- Use comments in every test to describe:
+  - The setup, i.e., what components are initialized with what date or state such as open
+    files, db connections, etc.
+  - Whether we expect to succeed or error and why.
+  - Almost _always_ avoid probing internal state in the test. Probing internal
+    state should be the exception and clearly document on why the condition
+    being test is so critical for the overall system to warrant it.

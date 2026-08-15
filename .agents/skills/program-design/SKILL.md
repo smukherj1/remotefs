@@ -1,7 +1,10 @@
 ---
 name: program-design
-description: Use when asked to write a program-design document describing a program's structure — how code is organized into modules, their interfaces, and inter-dependencies.
-Do not trigger when writing code or other technical documents. Do not trigger unless progress-design document is explicitly mentioned.
+description: |
+  Use when asked to write a program-design document describing a program's structure — how
+  code is organized into modules, their interfaces, and inter-dependencies.
+  Do not trigger when writing code or other technical documents.
+  Do not trigger unless program design document is explicitly mentioned.
 ---
 
 # Program Design Documents
@@ -107,6 +110,8 @@ where its responsibilities moved) and for components that keep their behavior
 
 Before the document is complete:
 
+- Use plain language suitable for explaining to a junior engineer whose first
+  language is not english.
 - Nothing restates the technical design; anything already decided there is a
   reference, not content.
 - Terminology matches the technical design exactly.
