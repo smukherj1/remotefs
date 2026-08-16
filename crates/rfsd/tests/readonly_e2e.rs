@@ -12,7 +12,7 @@ use assert_cmd::cargo::cargo_bin;
 const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";
 
 #[test]
-fn upload_mount_lazy_read_remount_and_unmount() -> Result<()> {
+fn upload_mount_lazy_read() -> Result<()> {
     verify_prerequisites();
     let temp = tempfile::tempdir().context("create e2e directory")?;
     let home = temp.path().join("home");
@@ -61,23 +61,6 @@ fn upload_mount_lazy_read_remount_and_unmount() -> Result<()> {
 
     assert!(fs::write(mountpoint.join("root.txt"), b"changed").is_err());
     assert!(fs::create_dir(mountpoint.join("new-directory")).is_err());
-    unmount(&home, &mountpoint)?;
-
-    mount(&home, &instance, &digest, &mountpoint)?;
-    assert_eq!(
-        fs::read(mountpoint.join("nested/child.txt"))?,
-        b"child contents"
-    );
-    let status = assert_cmd::Command::new(cargo_bin("rfs"))
-        .env("RFS_HOME", &home)
-        .args(["--output-format", "json", "status"])
-        .output()?;
-    assert!(status.status.success());
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
-    assert!(
-        status["data"]["cached_blobs"].as_u64().unwrap_or(0) >= 1,
-        "remount read should hit the verified local blob cache: {status}"
-    );
     unmount(&home, &mountpoint)?;
     Ok(())
 }

@@ -51,6 +51,29 @@ fn test_rfs_mount_invalid_digest() {
 }
 
 #[test]
+fn test_rfs_mount_missing_mountpoint_is_a_state_error() {
+    // Set up an otherwise valid mount command with a mountpoint that cannot be
+    // canonicalized; the CLI must report its own validation failure as `state`.
+    let temp = tempfile::tempdir().unwrap();
+    let missing_mountpoint = temp.path().join("missing-mountpoint");
+    let mut cmd = Command::cargo_bin("rfs").unwrap();
+    cmd.args([
+        "--cas-url",
+        "grpc://127.0.0.1:9092",
+        "--instance-name",
+        "remotefs/tests",
+        "mount",
+        "sha256:0000000000000000000000000000000000000000000000000000000000000000/0",
+    ])
+    .arg(&missing_mountpoint)
+    .assert()
+    .failure()
+    .code(1)
+    .stderr(predicate::str::contains("state"))
+    .stderr(predicate::str::contains("canonicalize mountpoint"));
+}
+
+#[test]
 fn test_rfs_json_error_diagnostic() {
     let mut cmd = Command::cargo_bin("rfs").unwrap();
     cmd.args([
@@ -93,9 +116,7 @@ fn test_rfs_status_reports_missing_session() {
         .arg("status")
         .assert()
         .failure()
-        .stderr(predicate::str::contains(
-            "missing or malformed session state",
-        ));
+        .stderr(predicate::str::contains("failed_precondition"));
 }
 
 #[test]

@@ -34,23 +34,24 @@ async fn uploaded_fixture_is_read_lazily_through_verified_cache() -> Result<()> 
 
     let instance = format!("remotefs/readonly-integration/{}", std::process::id());
     let cas_config = CasConfig::new(format!("grpc://{LOCAL_CAS_ADDR}"), instance)?;
-    let mut uploader = CasClient::connect(cas_config.clone()).await?;
-    let summary = upload_local_directory(&mut uploader, &source, UploadOptions::default()).await?;
+    let uploader = CasClient::connect(cas_config.clone()).await?;
+    let summary = upload_local_directory(&uploader, &source, UploadOptions::default()).await?;
 
     let mountpoint = temp.path().join("mount");
     fs::create_dir(&mountpoint).context("create integration mountpoint")?;
+    let reader = CasClient::connect(cas_config).await?;
     let session = std::sync::Arc::new(Session::open(
         Config {
             rfs_home: temp.path().join("rfs-home"),
         },
         summary.root_digest.clone(),
         mountpoint,
+        Box::new(reader),
+        tokio::runtime::Handle::current(),
     )?);
-    let reader = CasClient::connect(cas_config).await?;
-    let runtime = tokio::runtime::Handle::current();
     let workflow_session = std::sync::Arc::clone(&session);
     let counters = tokio::task::spawn_blocking(move || -> Result<_> {
-        let filesystem = FilesystemService::mount(reader, workflow_session, runtime)?;
+        let filesystem = FilesystemService::new(workflow_session)?;
         let nested = filesystem.lookup_dir_child(InodeId::ROOT, "nested")?;
         let child = filesystem.lookup_dir_child(nested.inode, "child.txt")?;
         assert_eq!(
@@ -61,7 +62,7 @@ async fn uploaded_fixture_is_read_lazily_through_verified_cache() -> Result<()> 
     })
     .await??;
     assert_eq!(counters.directory_downloads, 2);
-    assert_eq!(counters.blob_downloads, 1);
+    assert_eq!(counters.file_downloads, 1);
 
     session.close()?;
     Ok(())

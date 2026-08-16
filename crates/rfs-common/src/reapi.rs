@@ -91,6 +91,7 @@ mod tests {
                         .to_string(),
                     size_bytes: 0,
                 }),
+                node_properties: None,
             }],
             symlinks: Vec::new(),
             node_properties: Some(NodeProperties {

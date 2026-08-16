@@ -304,20 +304,20 @@ pub struct UploadStats {
 /// verified bytes for downloads. Transport-specific resource names and response
 /// validation remain encapsulated by the implementation.
 #[async_trait]
-pub trait BlobStore {
+pub trait BlobStore: Send + Sync {
     /// Returns the subset of `digests` missing from storage.
     ///
     /// Implementations may return transport, authorization, validation, or
     /// digest-conversion errors when the remote service cannot answer the
     /// existence check.
-    async fn find_missing_blobs(&mut self, digests: &[Digest]) -> Result<Vec<Digest>, CasError>;
+    async fn find_missing_blobs(&self, digests: &[Digest]) -> Result<Vec<Digest>, CasError>;
 
     /// Uploads the given blobs to the BlobStore.
-    async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError>;
+    async fn upload_blobs(&self, blobs: Vec<Blob>) -> Result<UploadStats, CasError>;
 
     /// Streams and verifies the blob identified by `digest` into `destination`.
     async fn stream_blob(
-        &mut self,
+        &self,
         digest: &Digest,
         destination: &mut (dyn std::io::Write + Send),
     ) -> Result<(), CasError>;
@@ -326,7 +326,7 @@ pub trait BlobStore {
     ///
     /// Returns verified bytes. A digest hash or size mismatch is reported as a
     /// verification error and is not retried as a semantic success.
-    async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
+    async fn download_blob(&self, digest: &Digest) -> Result<Bytes, CasError> {
         let mut bytes = Vec::new();
         self.stream_blob(digest, &mut bytes).await?;
         Ok(Bytes::from(bytes))
@@ -396,10 +396,7 @@ impl CasClient {
     /// Accepts digest identities to check and returns the subset reported
     /// missing by the remote CAS. Transport failures and malformed response
     /// digests are returned as `CasError`.
-    pub async fn find_missing_blobs(
-        &mut self,
-        digests: &[Digest],
-    ) -> Result<Vec<Digest>, CasError> {
+    pub async fn find_missing_blobs(&self, digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
         let request = FindMissingBlobsRequest {
             instance_name: self.config.instance_name.clone(),
             blob_digests: digests.iter().map(Digest::to_reapi).collect(),
@@ -431,7 +428,7 @@ impl CasClient {
     /// The caller owns existence checks. Small byte-backed and path-backed
     /// blobs are packed into `BatchUpdateBlobs`; larger blobs are uploaded
     /// through ByteStream, with path-backed blobs streamed from disk.
-    pub async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
+    pub async fn upload_blobs(&self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
         let uploaded_blobs = blobs.len();
         let bytes_uploaded = blobs.iter().try_fold(0u64, |total, blob| {
             let size = digest_size_u64(&blob.digest)?;
@@ -455,7 +452,7 @@ impl CasClient {
     /// Blobs at or below the configured download threshold use
     /// `BatchReadBlobs`; larger blobs use ByteStream. The returned bytes are
     /// verified against `digest`, and mismatches return `CasError::Verification`.
-    pub async fn download_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
+    pub async fn download_blob(&self, digest: &Digest) -> Result<Bytes, CasError> {
         let mut bytes = Vec::new();
         self.stream_blob(digest, &mut bytes).await?;
         Ok(Bytes::from(bytes))
@@ -463,7 +460,7 @@ impl CasClient {
 
     /// Streams a verified blob without accumulating ByteStream responses in memory.
     pub async fn stream_blob(
-        &mut self,
+        &self,
         digest: &Digest,
         destination: &mut (dyn std::io::Write + Send),
     ) -> Result<(), CasError> {
@@ -485,7 +482,7 @@ impl CasClient {
         }
     }
 
-    async fn batch_read_blob(&mut self, digest: &Digest) -> Result<Bytes, CasError> {
+    async fn batch_read_blob(&self, digest: &Digest) -> Result<Bytes, CasError> {
         let request = BatchReadBlobsRequest {
             instance_name: self.config.instance_name.clone(),
             digests: vec![digest.to_reapi()],
@@ -525,7 +522,7 @@ impl CasClient {
     // Uploads caller-selected blobs after existence checks have already
     // happened in the upload pipeline. BatchUpdateBlobs is used only for blobs
     // that fit the configured request budget; larger blobs use ByteStream.
-    async fn upload_blobs_to_cas(&mut self, blobs: Vec<Blob>) -> Result<(), CasError> {
+    async fn upload_blobs_to_cas(&self, blobs: Vec<Blob>) -> Result<(), CasError> {
         let mut batch = BatchUpdateState::new();
         for blob in blobs {
             let blob_size = digest_size_usize(&blob.digest)?;
@@ -545,7 +542,7 @@ impl CasClient {
         self.flush_batch_update(&mut batch).await
     }
 
-    async fn flush_batch_update(&mut self, batch: &mut BatchUpdateState) -> Result<(), CasError> {
+    async fn flush_batch_update(&self, batch: &mut BatchUpdateState) -> Result<(), CasError> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -556,7 +553,7 @@ impl CasClient {
             .with_context(|| format!("upload BatchUpdateBlobs batch {batch_index}"))
     }
 
-    async fn upload_oversized_blob(&mut self, blob: Blob) -> Result<(), CasError> {
+    async fn upload_oversized_blob(&self, blob: Blob) -> Result<(), CasError> {
         let digest = blob.digest.clone();
         self.bytestream_write_blob(blob)
             .await
@@ -565,7 +562,7 @@ impl CasClient {
 
     // Uploads the given batch of blobs to the CAS. Assumes the batch of blobs fits within the applicable
     // limits configured for the rfs as well as that supported by the CAS server.
-    async fn upload_batch_to_cas(&mut self, batch: Vec<Blob>) -> Result<(), CasError> {
+    async fn upload_batch_to_cas(&self, batch: Vec<Blob>) -> Result<(), CasError> {
         let request = BatchUpdateBlobsRequest {
             instance_name: self.config.instance_name.clone(),
             requests: batch
@@ -614,7 +611,7 @@ impl CasClient {
     // Uploads the given blob using ByteStream.Write. Path-backed blobs are
     // streamed from disk on each retry so large files are not copied into
     // memory; byte-backed sources are already resident and are sent directly.
-    async fn bytestream_write_blob(&mut self, blob: Blob) -> Result<(), CasError> {
+    async fn bytestream_write_blob(&self, blob: Blob) -> Result<(), CasError> {
         let data = match blob.contents {
             BlobContents::Bytes(data) => data,
             BlobContents::FilePath(path) => {
@@ -648,11 +645,7 @@ impl CasClient {
             .map(|_| ())
     }
 
-    async fn bytestream_write_file(
-        &mut self,
-        digest: Digest,
-        path: PathBuf,
-    ) -> Result<(), CasError> {
+    async fn bytestream_write_file(&self, digest: Digest, path: PathBuf) -> Result<(), CasError> {
         let resource_name = bytestream_write_resource_name(&self.config.instance_name, &digest);
 
         let write = self
@@ -675,7 +668,7 @@ impl CasClient {
     }
 
     async fn bytestream_read_into(
-        &mut self,
+        &self,
         digest: &Digest,
         destination: &mut (dyn std::io::Write + Send),
     ) -> Result<(), CasError> {
@@ -1138,16 +1131,16 @@ fn retry_backoff(attempt: usize) -> Duration {
 
 #[async_trait]
 impl BlobStore for CasClient {
-    async fn find_missing_blobs(&mut self, digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
+    async fn find_missing_blobs(&self, digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
         CasClient::find_missing_blobs(self, digests).await
     }
 
-    async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
+    async fn upload_blobs(&self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
         CasClient::upload_blobs(self, blobs).await
     }
 
     async fn stream_blob(
-        &mut self,
+        &self,
         digest: &Digest,
         destination: &mut (dyn std::io::Write + Send),
     ) -> Result<(), CasError> {

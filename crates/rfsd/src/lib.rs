@@ -86,8 +86,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         .context("connect daemon to CAS")?;
     let config = Config::new().context("load daemon state configuration")?;
     let session = std::sync::Arc::new(
-        Session::open(config, digest, &cli.mountpoint)
-            .with_context(|| format!("create daemon session for {}", cli.mountpoint.display()))?,
+        Session::open(
+            config,
+            digest,
+            &cli.mountpoint,
+            Box::new(cas),
+            tokio::runtime::Handle::current(),
+        )
+        .with_context(|| format!("create daemon session for {}", cli.mountpoint.display()))?,
     );
     let info = session.info();
     logging::init_daemon(
@@ -106,9 +112,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         "daemon session active"
     );
     let filesystem_session = std::sync::Arc::clone(&session);
-    let runtime = tokio::runtime::Handle::current();
     let filesystem = match tokio::task::spawn_blocking(move || {
-        filesystem::FilesystemService::mount(cas, filesystem_session, runtime)
+        filesystem::FilesystemService::new(filesystem_session)
     })
     .await
     .context("join root-directory validation task")?
@@ -132,7 +137,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             });
         }
     };
-    control_service::serve(session, mount, filesystem)
+    control_service::serve(session, mount)
         .await
         .context("serve active daemon control socket")?;
     tracing::info!(operation = "daemon_stop", "daemon session closed");

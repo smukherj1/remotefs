@@ -2,7 +2,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use rfs_common::cas::CasClient;
 use rfs_common::control_protocol as protocol;
 use rfs_common::session::{Session, SessionError, SessionInfo};
 use thiserror::Error;
@@ -12,7 +11,6 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
-use crate::filesystem::FilesystemService;
 use crate::fuse::FuseMount;
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -36,9 +34,7 @@ pub(crate) enum ControlError {
 #[derive(Clone)]
 struct ControlService {
     info: SessionInfo,
-    session: Arc<Session>,
     mount: Arc<Mutex<Option<FuseMount>>>,
-    filesystem: Arc<FilesystemService<CasClient>>,
     shutdown: Arc<AsyncMutex<Option<oneshot::Sender<()>>>>,
 }
 
@@ -78,7 +74,6 @@ impl protocol::control_server::Control for ControlService {
             mounted: true,
             root_digest: self.info.root_digest.to_string(),
             mountpoint: self.info.mountpoint.to_string_lossy().into_owned(),
-            cached_blobs: self.filesystem.cached_blobs(),
             dirty_files: 0,
             protocol_version: PROTOCOL_VERSION,
             daemon_pid: self.info.daemon_pid,
@@ -123,10 +118,6 @@ impl protocol::control_server::Control for ControlService {
                 tracing::error!(operation = "unmount", error = %error, "control socket removal failed");
                 Status::internal("daemon could not remove its control socket cleanly")
             })?;
-        self.session.close().map_err(|error| {
-            tracing::error!(operation = "unmount", error = %error, "clean session close failed");
-            Status::internal("daemon could not close its session cleanly")
-        })?;
         self.shutdown
             .lock()
             .await
@@ -139,11 +130,7 @@ impl protocol::control_server::Control for ControlService {
     }
 }
 
-pub(crate) async fn serve(
-    session: Arc<Session>,
-    mount: FuseMount,
-    filesystem: Arc<FilesystemService<CasClient>>,
-) -> Result<(), ControlError> {
+pub(crate) async fn serve(session: Arc<Session>, mount: FuseMount) -> Result<(), ControlError> {
     let info = session.info();
     let socket = info.control_endpoint.clone();
     let listener = match prepare_listener(&socket) {
@@ -161,9 +148,7 @@ pub(crate) async fn serve(
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let service = ControlService {
         info,
-        session: Arc::clone(&session),
         mount: Arc::clone(&mount),
-        filesystem,
         shutdown: Arc::new(AsyncMutex::new(Some(shutdown_tx))),
     };
     let shutdown = async move {

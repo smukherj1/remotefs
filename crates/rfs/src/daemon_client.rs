@@ -39,8 +39,6 @@ pub struct SessionStatus {
     pub dirty: bool,
     /// Number of dirty files in the mounted workspace.
     pub dirty_files: u64,
-    /// Number of blobs currently present in the local cache.
-    pub cached_blobs: u64,
     /// Conditions that currently prevent snapshot creation.
     pub snapshot_blockers: Vec<String>,
 }
@@ -165,7 +163,6 @@ impl DaemonClient {
             control_socket: response.control_socket.into(),
             dirty: response.dirty,
             dirty_files: response.dirty_files,
-            cached_blobs: response.cached_blobs,
             snapshot_blockers: response.snapshot_blockers,
         })
     }

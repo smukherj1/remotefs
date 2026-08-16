@@ -45,7 +45,7 @@ async fn local_bazel_remote_upload_check_download_and_reupload() {
 
     let blob = Blob::from_bytes("remotefs integration blob\n");
     let config = CasConfig::new(format!("grpc://{LOCAL_CAS_ADDR}"), "remotefs/tests").unwrap();
-    let mut client = CasClient::connect(config).await.unwrap();
+    let client = CasClient::connect(config).await.unwrap();
 
     let missing_before = client
         .find_missing_blobs(std::slice::from_ref(&blob.digest))
@@ -78,15 +78,15 @@ async fn tree_fixture_round_trips_through_local_cas() {
     copy_tree(&fixture, source.path()).unwrap();
 
     let config = CasConfig::new(format!("grpc://{LOCAL_CAS_ADDR}"), "remotefs/tests").unwrap();
-    let mut client = CasClient::connect(config).await.unwrap();
-    let summary = upload_local_directory(&mut client, source.path(), UploadOptions::default())
+    let client = CasClient::connect(config).await.unwrap();
+    let summary = upload_local_directory(&client, source.path(), UploadOptions::default())
         .await
         .unwrap();
     assert!(summary.files > 0);
     assert!(summary.directories > 0);
 
     let reconstructed = tempdir().unwrap();
-    reconstruct_directory(&mut client, &summary.root_digest, reconstructed.path()).await;
+    reconstruct_directory(&client, &summary.root_digest, reconstructed.path()).await;
     compare_trees(source.path(), reconstructed.path());
 }
 
@@ -138,7 +138,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn reconstruct_directory(client: &mut CasClient, digest: &Digest, destination: &Path) {
+async fn reconstruct_directory(client: &CasClient, digest: &Digest, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
     let bytes = client.download_blob(digest).await.unwrap();
     let directory = decode_directory(&digest, bytes).unwrap();

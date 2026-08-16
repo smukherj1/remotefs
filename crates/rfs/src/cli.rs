@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -13,7 +14,7 @@ use crate::daemon_client::{ControlEndpoint, DaemonClient, SessionStatus};
 use rfs_common::config::{Config, ConfigError};
 use rfs_common::digest::{Digest, DigestError};
 use rfs_common::logging::{self, LogFormat};
-use rfs_common::session::{Session, SessionError, SessionInfo, canonicalize_mountpoint};
+use rfs_common::session::{Session, SessionError, SessionInfo};
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -280,7 +281,7 @@ async fn run_mount(
     log_level: LogLevel,
     output_format: OutputFormat,
 ) -> Result<(), CliError> {
-    let mountpoint = canonicalize_mountpoint(mountpoint).map_err(state_error)?;
+    let mountpoint = canonicalize_mountpoint(mountpoint)?;
     let daemon = daemon_executable()?;
     let mut child = Command::new(&daemon)
         .arg(digest.to_string())
@@ -442,7 +443,6 @@ fn render_active_status(status: SessionStatus, json: bool) {
                     "control_socket":status.control_socket,
                     "dirty":status.dirty,
                     "dirty_files":status.dirty_files,
-                    "cached_blobs":status.cached_blobs,
                     "snapshot_blockers":status.snapshot_blockers
                 }
             })
@@ -477,6 +477,8 @@ fn render_retained_status(session: SessionInfo, json: bool) {
     }
 }
 
+// TODO: unmount should not accept the path to unmount. It should just unmount the
+// currently mounted path.
 async fn run_unmount(config: &Config, supplied: Option<&Path>) -> Result<(), CliError> {
     let mut client = daemon_client(config).await.map_err(client_error)?;
     let status = client.status().await.map_err(client_error)?;
@@ -495,15 +497,45 @@ fn client_error(error: crate::daemon_client::ClientError) -> CliError {
 }
 
 fn validate_supplied_mountpoint(supplied: Option<&Path>, active: &Path) -> Result<(), CliError> {
-    let supplied = supplied
-        .map(canonicalize_mountpoint)
-        .transpose()
-        .map_err(state_error)?;
+    let supplied = supplied.map(canonicalize_mountpoint).transpose()?;
     validate_optional_mountpoint(supplied.as_deref(), Some(active))
 }
 
+/// Validates that a user-supplied mountpoint resolves to an existing directory.
+/// TODO: Refactor the mountpoint validation here and session.rs in rfs-common in
+/// one place.
+fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, CliError> {
+    let canonical = fs::canonicalize(path).map_err(|source| CliError::CommandFailed {
+        category: "state",
+        message: format!("canonicalize mountpoint {}: {source}", path.display()),
+    })?;
+    if !fs::metadata(&canonical)
+        .map_err(|source| CliError::CommandFailed {
+            category: "state",
+            message: format!(
+                "get metadata for mountpoint {} canonicalized to {}: {source}",
+                path.display(),
+                canonical.display()
+            ),
+        })?
+        .is_dir()
+    {
+        return Err(CliError::CommandFailed {
+            category: "state",
+            message: format!(
+                "validate mountpoint {} canonicalized to {}: result is not a directory",
+                path.display(),
+                canonical.display()
+            ),
+        });
+    }
+    // TODO: Prefer retaining the original user provided path if we decide to keep
+    // the unmount path provided during unmount.
+    Ok(canonical)
+}
+
 async fn run_upload(config: CliConfig, local_dir: PathBuf) -> Result<Digest, CliError> {
-    let mut uploader = BootstrapUploader::connect(BootstrapUploadConfig {
+    let uploader = BootstrapUploader::connect(BootstrapUploadConfig {
         cas_url: config.cas_url,
         instance_name: config.instance_name,
     })
@@ -604,13 +636,17 @@ fn config_error(error: ConfigError) -> CliError {
 
 fn state_error(error: SessionError) -> CliError {
     CliError::CommandFailed {
-        category: match error {
-            SessionError::ActiveSession { .. } => "active_session",
-            SessionError::InvalidSession { .. } => "stale_session",
-            SessionError::UnsafePath { .. } => "unsafe_state",
-            _ => "state",
-        },
+        category: state_error_category(&error),
         message: error.to_string(),
+    }
+}
+
+/// Selects the stable CLI category without inspecting diagnostic text.
+fn state_error_category(error: &SessionError) -> &'static str {
+    match error {
+        SessionError::Context { source, .. } => state_error_category(source),
+        SessionError::FailedPreconditionError { .. } => "failed_precondition",
+        _ => "unknown_error",
     }
 }
 

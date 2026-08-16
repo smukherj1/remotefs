@@ -51,13 +51,13 @@ impl BootstrapUploader {
     }
 
     /// Uploads a local directory and returns only its canonical root digest.
-    pub async fn upload(&mut self, path: &Path) -> Result<Digest, BootstrapUploadError> {
+    pub async fn upload(&self, path: &Path) -> Result<Digest, BootstrapUploadError> {
         if !path.is_dir() {
             return Err(BootstrapUploadError::InvalidRoot {
                 path: path.to_path_buf(),
             });
         }
-        let summary = upload_local_directory(&mut self.client, path, UploadOptions::default())
+        let summary = upload_local_directory(&self.client, path, UploadOptions::default())
             .await
             .map_err(|error| BootstrapUploadError::Upload {
                 path: path.to_path_buf(),

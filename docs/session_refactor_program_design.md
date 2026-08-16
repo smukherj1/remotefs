@@ -435,7 +435,7 @@ details and are not part of the component API.
 
 ### Target shape
 
-`StoredSession` and its value types are unchanged and are not repeated.
+`SessionMetadata` and its value types are unchanged and are not repeated.
 
 ```rust
 /// Repository for the durable lifecycle and merged namespace of one session.
@@ -509,10 +509,10 @@ impl SessionStore {
 
     /// Reads validated retained metadata from `path` using a read-only connection.
     ///
-    /// Returns the singleton `StoredSession`. Returns `SessionError` for a
+    /// Returns the singleton `SessionMetadata`. Returns `SessionError` for a
     /// missing database, unsupported schema, invalid row, or SQLite failure.
     /// Opens and closes a separate read-only connection without modifying state.
-    pub(super) fn inspect(path: &Path) -> Result<StoredSession, SessionError>;
+    pub(super) fn inspect(path: &Path) -> Result<SessionMetadata, SessionError>;
 
     /// Fetches the row identified by `inode`, including a tombstoned row.
     ///

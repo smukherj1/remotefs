@@ -349,7 +349,8 @@ impl DirectoryBuilder {
             .into_iter()
             .map(|entry| {
                 let name = entry.name.clone();
-                directory_node(entry).with_context(|| format!("encode directory node {name}"))
+                directory_node(entry, &mut warnings)
+                    .with_context(|| format!("encode directory node {name}"))
             })
             .collect::<Result<Vec<_>, _>>()
             .context("encode all directory nodes for directory")?;
@@ -487,10 +488,17 @@ fn file_node(entry: FileEntry, warnings: &mut TreeWarnings) -> Result<FileNode, 
     })
 }
 
-fn directory_node(entry: DirectoryEntry) -> Result<DirectoryNode, TreeError> {
+fn directory_node(
+    entry: DirectoryEntry,
+    warnings: &mut TreeWarnings,
+) -> Result<DirectoryNode, TreeError> {
+    let path = PathBuf::from(&entry.name);
+    let node_properties = normalize_optional_metadata(Some(entry.metadata), path, warnings)
+        .with_context(|| format!("normalize directory node metadata for {}", entry.name))?;
     Ok(DirectoryNode {
         name: entry.name,
         digest: Some(entry.digest.to_reapi()),
+        node_properties,
     })
 }
 

@@ -13,8 +13,7 @@ use fuser::{
     TimeOrNow,
 };
 use libc::{EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, EROFS};
-use rfs_common::cas::BlobStore;
-use rfs_common::session::{Inode, InodeId, NodeKind, SessionError};
+use rfs_common::session::{Inode, InodeId, NodeKind};
 
 use crate::filesystem::{FilesystemError, FilesystemService};
 
@@ -27,13 +26,7 @@ pub(crate) struct FuseMount {
 
 impl FuseMount {
     /// Mounts the validated core and waits until the kernel finishes FUSE init.
-    pub(crate) fn mount<S>(
-        filesystem: Arc<FilesystemService<S>>,
-        mountpoint: &Path,
-    ) -> io::Result<Self>
-    where
-        S: BlobStore + Clone + Send + Sync + 'static,
-    {
+    pub(crate) fn mount(filesystem: Arc<FilesystemService>, mountpoint: &Path) -> io::Result<Self> {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let adapter = FuseAdapter {
             filesystem,
@@ -72,12 +65,12 @@ impl FuseMount {
     }
 }
 
-struct FuseAdapter<S> {
-    filesystem: Arc<FilesystemService<S>>,
+struct FuseAdapter {
+    filesystem: Arc<FilesystemService>,
     ready: Option<SyncSender<()>>,
 }
 
-impl<S: BlobStore + Clone + Send + Sync + 'static> FuseAdapter<S> {
+impl FuseAdapter {
     fn lookup_node(&self, parent: u64, name: &OsStr) -> Result<Inode, i32> {
         let name = name.to_str().ok_or(ENOENT)?;
         let parent = InodeId::new(parent).map_err(|_| EINVAL)?;
@@ -92,7 +85,7 @@ impl<S: BlobStore + Clone + Send + Sync + 'static> FuseAdapter<S> {
     }
 }
 
-impl<S: BlobStore + Clone + Send + Sync + 'static> Filesystem for FuseAdapter<S> {
+impl Filesystem for FuseAdapter {
     fn init(&mut self, _request: &Request<'_>, _config: &mut KernelConfig) -> Result<(), i32> {
         if let Some(ready) = self.ready.take() {
             let _ = ready.send(());
@@ -409,39 +402,12 @@ fn timestamp_to_system_time(timestamp: rfs_common::session::NodeTime) -> SystemT
 
 fn errno_for_error(error: FilesystemError) -> i32 {
     match error {
-        FilesystemError::Session {
-            source: SessionError::UnknownInode { .. } | SessionError::NotFound { .. },
-            ..
-        } => ENOENT,
-        FilesystemError::Session {
-            source:
-                SessionError::WrongKind {
-                    expected: NodeKind::Directory,
-                    ..
-                },
-            ..
-        } => ENOTDIR,
-        FilesystemError::Session {
-            source:
-                SessionError::WrongKind {
-                    actual: NodeKind::Directory,
-                    ..
-                },
-            ..
-        } => EISDIR,
-        FilesystemError::Session {
-            source: SessionError::WrongKind { .. } | SessionError::InvalidInode { .. },
-            ..
-        } => EINVAL,
-        FilesystemError::MissingDigest { .. }
-        | FilesystemError::InvalidDigest { .. }
-        | FilesystemError::InvalidTimestamp { .. }
-        | FilesystemError::Cas { .. }
-        | FilesystemError::Directory { .. }
-        | FilesystemError::Session { .. }
-        | FilesystemError::InvalidInode { .. }
-        | FilesystemError::DownloadLock { .. }
-        | FilesystemError::Context { .. } => EIO,
+        FilesystemError::Context { source, .. } => errno_for_error(*source),
+        FilesystemError::NotFound { .. } => ENOENT,
+        FilesystemError::NotDirectory { .. } => ENOTDIR,
+        FilesystemError::IsDirectory { .. } => EISDIR,
+        FilesystemError::InvalidArgument { .. } => EINVAL,
+        FilesystemError::Session { .. } | FilesystemError::InvalidInode { .. } => EIO,
     }
 }
 
@@ -450,37 +416,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maps_lookup_and_kind_errors_to_posix_errno() {
-        let inode = InodeId::new(2).unwrap();
+    fn maps_typed_filesystem_errors_to_posix_errno() {
         assert_eq!(
-            errno_for_error(FilesystemError::Session {
-                inode,
-                source: SessionError::NotFound {
-                    parent: InodeId::ROOT,
-                    name: "missing".to_owned(),
-                },
+            errno_for_error(FilesystemError::NotFound {
+                reason: "missing".to_owned()
             }),
             ENOENT
         );
         assert_eq!(
-            errno_for_error(FilesystemError::Session {
-                inode,
-                source: SessionError::WrongKind {
-                    inode,
-                    expected: NodeKind::Directory,
-                    actual: NodeKind::File,
-                },
+            errno_for_error(FilesystemError::NotDirectory {
+                reason: "file".to_owned()
             }),
             ENOTDIR
         );
         assert_eq!(
-            errno_for_error(FilesystemError::Session {
-                inode,
-                source: SessionError::WrongKind {
-                    inode,
-                    expected: NodeKind::File,
-                    actual: NodeKind::Directory,
-                },
+            errno_for_error(FilesystemError::IsDirectory {
+                reason: "directory".to_owned()
             }),
             EISDIR
         );

@@ -349,8 +349,8 @@ Fields are intentionally compact:
 |  | `lifecycle` | `initializing`, `active`, or `closed`. |
 |  | `root_digest_hash`, `root_digest_size` | Validated SHA-256 root digest components. |
 |  | `mountpoint` | Canonical absolute mountpoint. |
-|  | `created_at_seconds`, `created_at_nanos` | Session creation time. |
-|  | `closed_at_seconds`, `closed_at_nanos` | Clean-close time; both are present only when closed. |
+|  | `created_at_seconds` | Session creation time in whole seconds. |
+|  | `closed_at_seconds` | Clean-close time in whole seconds; present only when closed. |
 |  | `log_level`, `log_format` | Effective daemon logging settings. |
 | `inodes` | `inode` | Synthetic primary key; root is always `1`. |
 |  | `parent_inode`, `name` | Parent and UTF-8 basename; unique together. Root alone has no parent and an empty name. |

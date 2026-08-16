@@ -874,6 +874,9 @@ message DirectoryNode {
   // represented. See [Digest][build.bazel.remote.execution.v2.Digest]
   // for information about how to take the digest of a proto message.
   Digest digest = 2;
+
+  // The node properties of the DirectoryNode.
+  NodeProperties node_properties = 3;
 }
 
 // A `SymlinkNode` represents a symbolic link.

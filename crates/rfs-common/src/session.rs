@@ -1,56 +1,53 @@
 //! Concrete local-session facade for durable namespace state and immutable blobs.
-//!
-//! `Session` is the only local-storage type exposed to higher layers. It owns a
-//! shared content-addressed cache and one exclusive active session. SQLite is
-//! authoritative for the visible namespace; cache paths, database connections,
-//! overlay paths, and advisory-lock handles remain private.
 
 mod cache;
 mod overlay;
 mod store;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::runtime::Handle;
 use uuid::Uuid;
 
+use crate::cas::BlobStore;
 use crate::config::Config;
 use crate::digest::Digest;
 use crate::error_context::{ResultContext, ResultContextError};
+use crate::tree::decode_directory;
 
 pub use crate::tree::NodeKind;
-pub use cache::BlobWriter;
-
-use cache::BlobCache;
+use cache::CachedBlobStore;
 use overlay::OverlayStore;
-use store::{
-    Inode as StoreInode, Lookup as StoreLookup, ROOT_INODE_ID, ReadSource, SessionStore,
-    StoreNodeKind,
-};
+use store::{Inode as StoreInode, SessionStore};
 
 /// Session-stable inode identity that is positive and representable by SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InodeId(i64);
 
 impl InodeId {
+    /// Default inode ID.
+    pub const INVALID: Self = Self(0);
     /// Root inode shared by every mounted workspace.
-    pub const ROOT: Self = Self(ROOT_INODE_ID);
+    pub const ROOT: Self = Self(1);
 
     /// Validates a raw inode supplied by an external adapter.
     pub fn new(value: u64) -> Result<Self, SessionError> {
-        let value = i64::try_from(value).map_err(|_| SessionError::InvalidInode { value })?;
-        if value == 0 {
-            return Err(SessionError::InvalidInode { value: 0 });
-        }
+        let value = i64::try_from(value).map_err(|_| {
+            internal_error(format!(
+                "validate external inode value {value}: outside the supported range"
+            ))
+        })?;
         Ok(Self(value))
     }
 
@@ -58,24 +55,22 @@ impl InodeId {
     pub fn get(self) -> u64 {
         u64::try_from(self.0).expect("validated inode is positive")
     }
-
     pub(super) fn sqlite(self) -> i64 {
         self.0
     }
-
     pub(super) fn from_sqlite(value: i64) -> Result<Self, SessionError> {
         if value <= 0 {
-            return Err(SessionError::InvalidStoredInode {
-                reason: format!("stored inode {value} is not positive"),
-            });
+            return Err(internal_error(format!(
+                "decode stored inode {value}: value is not positive"
+            )));
         }
         Ok(Self(value))
     }
 }
 
 impl fmt::Display for InodeId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.get().fmt(formatter)
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.get().fmt(f)
     }
 }
 
@@ -92,19 +87,16 @@ impl NodeTime {
         seconds: 0,
         nanos: 0,
     };
-
     /// Constructs a time in the range supported by REAPI timestamps.
     pub fn new(seconds: i64, nanos: u32) -> Option<Self> {
         ((MIN_TIMESTAMP_SECONDS..=MAX_TIMESTAMP_SECONDS).contains(&seconds)
             && nanos < 1_000_000_000)
             .then_some(Self { seconds, nanos })
     }
-
     /// Whole seconds relative to the Unix epoch.
     pub fn seconds(self) -> i64 {
         self.seconds
     }
-
     /// Normalized nanosecond fraction.
     pub fn nanos(self) -> u32 {
         self.nanos
@@ -132,54 +124,17 @@ pub struct Inode {
     pub symlink_target: Option<String>,
 }
 
-/// Kind-safe immutable identity for a decoded remote child.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RemoteContent {
-    /// Regular-file content digest.
-    File(Digest),
-    /// Child-directory message digest.
-    Directory(Digest),
-    /// Exact symbolic-link target.
-    Symlink(String),
-}
-
-/// Transport-independent child descriptor used for atomic materialization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteChild {
-    /// UTF-8 basename relative to the materialized parent.
-    pub name: String,
-    /// Kind-safe immutable content identity.
-    pub content: RemoteContent,
-    /// Preserved remote mode; absence is distinct from zero.
-    pub mode: Option<u32>,
-    /// Preserved remote mtime; absence is distinct from the epoch.
-    pub mtime: Option<NodeTime>,
-}
-
-/// Result of a lazy namespace operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Lookup<T> {
-    /// SQLite contains a definitive visible result.
-    Ready(T),
-    /// The caller must fetch and materialize this complete directory object.
-    NeedsMaterialization { digest: Digest },
-}
-
 /// Durable session lifecycle stored in SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionLifecycle {
-    /// Durable creation started but did not activate.
     Initializing,
-    /// The daemon currently owns the session.
     Active,
-    /// Clean close committed successfully.
     Closed,
 }
-
 impl fmt::Display for SessionLifecycle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
             Self::Initializing => "initializing",
             Self::Active => "active",
             Self::Closed => "closed",
@@ -192,83 +147,55 @@ impl fmt::Display for SessionLifecycle {
 pub struct SessionInfo {
     /// Immutable root directory digest.
     pub root_digest: Digest,
-    /// Canonical mounted workspace path.
+    /// Path where the active fuse session is mounted.
     pub mountpoint: PathBuf,
     /// Daemon process ID.
     pub daemon_pid: u32,
-    /// Path to the Unix socket serving the daemon's control endpoint.
+    /// Path to the Unix control socket.
     pub control_endpoint: PathBuf,
-    /// Path to the file containing the daemon logs for a session.
+    /// Path to the retained daemon log file.
     pub log_path: PathBuf,
+}
+
+/// Metrics for remote blob downloads and verified-cache hits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IoCounters {
+    /// Directory objects streamed from remote storage.
+    pub directory_downloads: u64,
+    /// Directory objects served from the verified cache.
+    pub directory_cache_hits: u64,
+    /// File objects streamed from remote storage.
+    pub file_downloads: u64,
+    /// File objects served from the verified cache.
+    pub file_cache_hits: u64,
 }
 
 /// Failures owned by the local session hierarchy.
 #[derive(Debug, Error)]
 pub enum SessionError {
-    /// A path violates type, ownership, permission, or inventory policy.
-    #[error("local session path `{path}` is unsafe: {reason}")]
-    UnsafePath { path: PathBuf, reason: String },
-    /// Another process holds the stable advisory lock.
-    #[error("another RemoteFS session owns `{path}`{owner}")]
-    ActiveSession { path: PathBuf, owner: String },
-    /// Session state does not exist or is malformed.
-    #[error(
-        "missing or malformed session state at `{path}`; delete the session directory (if it exists) and start again: {reason}"
-    )]
-    InvalidSession { path: PathBuf, reason: String },
-    /// A named local filesystem operation failed.
-    #[error("filesystem operation on `{path}` failed: {source}")]
-    Filesystem {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    /// A named SQLite operation failed.
-    #[error("SQLite {operation} on `{path}` failed: {source}")]
+    /// Unexpected local-session failure.
+    #[error("session internal error: {reason}")]
+    InternalError { reason: String },
+    /// Current state blocks the operation.
+    #[error("current session state does not permit this operation: {reason}")]
+    FailedPreconditionError { reason: String },
+    /// Requested inode or entry is not visible.
+    #[error("not found: {reason}")]
+    NotFound { reason: String },
+    /// Directory operation received another node kind.
+    #[error("not a directory: {reason}")]
+    NotDirectory { reason: String },
+    /// Regular-file operation received a directory.
+    #[error("is a directory: {reason}")]
+    IsDirectory { reason: String },
+    /// A SQLite API operation failed.
+    #[error("SQLite {operation} failed on db {dbpath}: {source}")]
     Database {
         operation: &'static str,
-        path: PathBuf,
+        dbpath: PathBuf,
         #[source]
         source: rusqlite::Error,
     },
-    /// A mutex protecting session-owned state was poisoned.
-    #[error("session synchronization failed while {operation}")]
-    Synchronization { operation: &'static str },
-    /// The supplied mountpoint is not a canonicalizable directory.
-    #[error("mountpoint `{path}` must be an existing directory")]
-    InvalidMountpoint { path: PathBuf },
-    /// A raw inode is zero or exceeds SQLite's signed range.
-    #[error("inode value {value} is outside the supported range")]
-    InvalidInode { value: u64 },
-    /// A stored inode row violates the session namespace invariants.
-    #[error("invalid stored inode: {reason}")]
-    InvalidStoredInode { reason: String },
-    /// No visible row exists for an inode.
-    #[error("inode {inode} is not visible")]
-    UnknownInode { inode: InodeId },
-    /// A fully materialized directory has no visible child with this name.
-    #[error("entry `{name}` was not found in directory inode {parent}")]
-    NotFound { parent: InodeId, name: String },
-    /// An operation was applied to the wrong node kind.
-    #[error("inode {inode} is a {actual:?}, expected {expected:?}")]
-    WrongKind {
-        inode: InodeId,
-        expected: NodeKind,
-        actual: NodeKind,
-    },
-    /// Completed pending bytes do not match the expected digest.
-    #[error("blob verification failed: expected {expected}, got {actual}")]
-    BlobIntegrity { expected: Digest, actual: Digest },
-    /// A remote-backed file was read before its blob was admitted to the cache.
-    #[error("blob {digest} is missing from the local cache")]
-    MissingBlob { digest: Digest },
-    /// Current wall-clock time cannot be stored safely.
-    #[error("system time is outside the supported timestamp range")]
-    InvalidSystemTime,
-    /// An operation requiring active resources ran after clean close.
-    #[error("session is already closed")]
-    Closed,
-    /// Additional owning-operation context for another session error.
     #[error("{operation}: {source}")]
     Context {
         operation: String,
@@ -277,6 +204,40 @@ pub enum SessionError {
     },
 }
 
+/// Builds an unexpected session failure with complete diagnostic context.
+pub(super) fn internal_error(reason: impl Into<String>) -> SessionError {
+    SessionError::InternalError {
+        reason: reason.into(),
+    }
+}
+
+/// Builds an error for an operation blocked by current session state.
+pub(super) fn failed_precondition(reason: impl Into<String>) -> SessionError {
+    SessionError::FailedPreconditionError {
+        reason: reason.into(),
+    }
+}
+
+/// Builds an error for a missing visible inode or directory entry.
+pub(super) fn not_found(reason: impl Into<String>) -> SessionError {
+    SessionError::NotFound {
+        reason: reason.into(),
+    }
+}
+
+/// Builds an error for a directory operation on another node kind.
+pub(super) fn not_directory(reason: impl Into<String>) -> SessionError {
+    SessionError::NotDirectory {
+        reason: reason.into(),
+    }
+}
+
+/// Builds an error for a regular-file operation on a directory.
+pub(super) fn is_directory(reason: impl Into<String>) -> SessionError {
+    SessionError::IsDirectory {
+        reason: reason.into(),
+    }
+}
 impl ResultContextError for SessionError {
     fn with_context(self, operation: String) -> Self {
         Self::Context {
@@ -286,13 +247,34 @@ impl ResultContextError for SessionError {
     }
 }
 
-/// Concrete synchronous facade for all local storage used by one workspace.
+/// Session-owned internal download and cache metrics.
+struct InternalIoCounters {
+    directory_downloads: AtomicU64,
+    directory_cache_hits: AtomicU64,
+    file_downloads: AtomicU64,
+    file_cache_hits: AtomicU64,
+}
+
+/// Concrete synchronous facade for one mounted workspace.
 pub struct Session {
+    /// Immutable mounted root directory digest.
     root_digest: Digest,
+    /// Path where the root of this session is mounted.
     mountpoint: PathBuf,
+    /// Fixed paths beneath the configured RemoteFS home.
     layout: SessionLayout,
-    cache: BlobCache,
-    active: ActiveSession,
+    /// Durable session lifecycle and merged namespace repository.
+    store: SessionStore,
+    /// Synchronous remote read-through cache.
+    cached_blob_store: CachedBlobStore,
+    /// Local storage for editable file content.
+    overlay: OverlayStore,
+    /// Stable lock retained until the session is dropped.
+    _session_lock: SessionLock,
+    /// Strong references to per-inode operation locks.
+    inode_locks: Mutex<HashMap<InodeId, Arc<Mutex<()>>>>,
+    /// Atomic download and cache-hit metrics.
+    counters: InternalIoCounters,
 }
 
 impl Session {
@@ -301,204 +283,292 @@ impl Session {
         config: Config,
         root_digest: Digest,
         mountpoint: impl AsRef<Path>,
+        blob_store: Box<dyn BlobStore>,
+        runtime: Handle,
     ) -> Result<Self, SessionError> {
-        tracing::info!(
-            "Session::open(home={}, root_digest={}, mountpoint={}",
-            config.rfs_home.display(),
-            root_digest,
-            mountpoint.as_ref().display()
-        );
         let mountpoint = canonicalize_mountpoint(mountpoint.as_ref()).with_context(|| {
             format!(
-                "unable to canonizalize session mountpoint {}",
+                "canonicalize session mountpoint {}",
                 mountpoint.as_ref().display()
             )
         })?;
-        ensure_writable_home(&config)
-            .with_context(|| "unable to set up the session writable home directory".to_string())?;
+        ensure_writable_home(&config).with_context(|| "set up writable session home".to_owned())?;
         let layout = SessionLayout::new(&config.rfs_home);
-        let cache = BlobCache::open(layout.cache.clone()).with_context(|| {
+        let session_id = Uuid::new_v4().to_string();
+        let mut session_lock = SessionLock::acquire(&layout.session_lock)
+            .with_context(|| format!("acquire session lock {}", layout.session_lock.display()))?;
+        session_lock
+            .write_record(
+                &layout.session_lock,
+                &LockRecord {
+                    record_version: LOCK_RECORD_VERSION,
+                    session_id: session_id.clone(),
+                    pid: std::process::id(),
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "write session lock record {}",
+                    layout.session_lock.display()
+                )
+            })?;
+        remove_if_present(&layout.session)
+            .with_context(|| format!("replace session directory {}", layout.session.display()))?;
+        create_dir_if_absent(&layout.session)
+            .with_context(|| format!("create session directory {}", layout.session.display()))?;
+        create_empty_file(&layout.log_path())
+            .with_context(|| format!("create session log {}", layout.log_path().display()))?;
+        create_empty_file(&layout.database_path()).with_context(|| {
             format!(
-                "while initializing the blob cache in {}",
-                layout.cache.display()
+                "create session database {}",
+                layout.database_path().display()
             )
         })?;
-
-        let active = ActiveSession::open(
-            layout.session.clone(),
-            layout.session_lock.clone(),
+        let cached_blob_store = CachedBlobStore::open(layout.cache.clone(), blob_store, runtime)
+            .with_context(|| format!("open verified cache {}", layout.cache.display()))?;
+        let overlay = OverlayStore::open(layout.overlay_path())
+            .with_context(|| format!("open session overlay {}", layout.overlay_path().display()))?;
+        let store = SessionStore::create(
+            layout.database_path(),
+            session_id,
+            std::process::id(),
             root_digest.clone(),
             mountpoint.clone(),
         )
-        .with_context(|| {
-            format!(
-                "while initializing active session in {} with lock {}",
-                layout.session.display(),
-                layout.session_lock.display()
-            )
-        })?;
-
+        .with_context(|| format!("create session store {}", layout.database_path().display()))?;
         Ok(Self {
             root_digest,
             mountpoint,
             layout,
-            cache,
-            active,
+            store,
+            cached_blob_store,
+            overlay,
+            _session_lock: session_lock,
+            inode_locks: Mutex::new(HashMap::new()),
+            counters: InternalIoCounters {
+                directory_downloads: AtomicU64::new(0),
+                directory_cache_hits: AtomicU64::new(0),
+                file_downloads: AtomicU64::new(0),
+                file_cache_hits: AtomicU64::new(0),
+            },
         })
     }
 
-    /// Returns immutable startup and live-status facts without rereading SQLite.
+    /// Returns immutable startup facts without I/O.
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             root_digest: self.root_digest.clone(),
             mountpoint: self.mountpoint.clone(),
             daemon_pid: std::process::id(),
             control_endpoint: self.layout.control_endpoint.clone(),
-            log_path: self.active.layout.log_path.clone(),
+            log_path: self.layout.log_path(),
         }
     }
 
-    /// Derives the fixed control endpoint without opening SQLite or mutating state.
+    /// Derives the fixed control endpoint without opening or modifying session state.
     pub fn control_endpoint(config: &Config) -> Result<PathBuf, SessionError> {
-        ensure_reader_home(config)
-            .with_context(|| "unable to open home directory for inspection".to_string())?;
-        let layout = SessionLayout::new(&config.rfs_home);
-        Ok(layout.control_endpoint.clone())
+        ensure_reader_home(config)?;
+        Ok(SessionLayout::new(&config.rfs_home).control_endpoint)
     }
 
-    /// Performs one-shot read-only retained-session inspection.
+    /// Inspects retained session metadata without creating, locking, or modifying state.
     pub fn inspect(config: &Config) -> Result<Option<SessionInfo>, SessionError> {
-        ensure_reader_home(config)
-            .with_context(|| "unable to open home directory for inspection".to_string())?;
+        ensure_reader_home(config)?;
         let layout = SessionLayout::new(&config.rfs_home);
-        ActiveSession::inspect(&layout.session)
+        if !layout.session.exists() {
+            return Ok(None);
+        }
+        let stored = SessionStore::inspect(&layout.database_path())?;
+        Ok(Some(SessionInfo {
+            root_digest: stored.root_digest,
+            mountpoint: stored.mountpoint,
+            daemon_pid: stored.daemon_pid,
+            control_endpoint: layout.control_endpoint.clone(),
+            log_path: layout.log_path(),
+        }))
     }
 
-    /// Returns one visible inode from authoritative SQLite state.
-    pub fn node(&self, inode: InodeId) -> Result<Inode, SessionError> {
-        self.active
-            .with_store(|store| store_inode_to_session(store.node(inode)?))
+    /// Returns one effective visible inode without remote I/O.
+    pub fn get_inode(&self, inode: InodeId) -> Result<Inode, SessionError> {
+        project_inode(self.get_visible_inode(inode)?)
     }
 
-    /// Looks up a child or reports the remote directory that still needs loading.
-    pub fn lookup(&self, parent: InodeId, name: &str) -> Result<Lookup<Inode>, SessionError> {
-        self.active
-            .with_store(|store| store_lookup_to_session(store.lookup(parent, name)?))
-    }
-
-    /// Lists a directory or reports the remote directory that still needs loading.
-    pub fn list_directory(&self, inode: InodeId) -> Result<Lookup<Vec<Inode>>, SessionError> {
-        self.active
-            .with_store(|store| store_list_to_session(store.list_directory(inode)?))
-    }
-
-    /// Atomically records a complete decoded remote child set.
-    pub fn materialize_directory(
-        &self,
-        parent: InodeId,
-        remote_digest: &Digest,
-        remote_children: Vec<RemoteChild>,
-    ) -> Result<Vec<Inode>, SessionError> {
-        self.active.with_store(|store| {
-            let children = remote_children
-                .into_iter()
-                .map(|child| remote_child_store_insert(parent, child))
-                .collect::<Vec<_>>();
-            let inodes =
-                store.materialize_directory(parent, &remote_digest.to_string(), &children)?;
-            translate_store_inodes(inodes)
-        })
-    }
-
-    /// Checks if the given digest exists in the local blob cache.
-    pub fn exists(&self, digest: &Digest) -> bool {
-        self.cache.exists(digest)
-    }
-
-    /// Reads a complete admitted object, returning `None` on a cache miss.
-    pub fn read_blob(&self, digest: &Digest) -> Result<Option<Bytes>, SessionError> {
-        self.cache.read_blob(digest)
-    }
-
-    /// Returns the immutable digest for a remote-backed file.
-    ///
-    /// Overlay-backed files return `None`. The inode must identify a visible
-    /// regular file.
-    pub fn remote_file_digest(&self, inode: InodeId) -> Result<Option<Digest>, SessionError> {
-        match self
-            .active
-            .with_store(|store| store.get_file_source(inode))?
-        {
-            ReadSource::Remote(digest) => parse_stored_digest(inode, &digest).map(Some),
-            ReadSource::Overlay(path) => {
-                validate_overlay_path(inode, path)?;
-                Ok(None)
-            }
+    /// Resolves one visible direct child, loading its parent directory if needed.
+    pub fn lookup_child(&self, parent: InodeId, name: &str) -> Result<Inode, SessionError> {
+        self.ensure_directory_loaded(parent)?;
+        match self.store.child(parent, name)? {
+            Some(child) if !child.tombstone => project_inode(child),
+            Some(_) => Err(not_found(format!(
+                "look up child `{name}` in directory inode {parent}: entry is not visible"
+            ))),
+            None => Err(not_found(format!(
+                "look up child `{name}` in directory inode {parent}: entry does not exist"
+            ))),
         }
     }
 
-    /// Resolves current inode backing and serves a range from local storage.
-    ///
-    /// A remote-backed file's verified blob must already be admitted to the
-    /// cache. Overlay-backed files are read directly from the active session.
+    /// Lists all visible direct children in basename order, loading the directory if needed.
+    pub fn list_directory(&self, inode: InodeId) -> Result<Vec<Inode>, SessionError> {
+        self.ensure_directory_loaded(inode)?;
+        self.store
+            .get_directory_children(inode)?
+            .into_iter()
+            .filter(|child| !child.tombstone)
+            .map(project_inode)
+            .collect()
+    }
+
+    /// Reads a file range, preferring overlay data over remote-backed cache data.
     pub fn read_range(
         &self,
         inode: InodeId,
         offset: u64,
         size: usize,
     ) -> Result<Bytes, SessionError> {
-        match self
-            .active
-            .with_store(|store| store.get_file_source(inode))?
-        {
-            ReadSource::Remote(digest) => {
-                let digest = parse_stored_digest(inode, &digest)?;
-                self.cache
-                    .read_range(&digest, offset, size)?
-                    .ok_or(SessionError::MissingBlob { digest })
-            }
-            ReadSource::Overlay(path) => {
-                let path = validate_overlay_path(inode, path)?;
-                self.active.read_overlay_range(&path, offset, size)
-            }
+        let lock = self.inode_lock(inode)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| internal_error(format!("read inode {inode}: inode lock is poisoned")))?;
+        let stored = self.get_visible_inode(inode)?;
+        if stored.kind == NodeKind::Directory {
+            return Err(is_directory(format!(
+                "read inode {inode}: actual kind is directory"
+            )));
+        }
+        if stored.kind != NodeKind::File {
+            return Err(internal_error(format!(
+                "read inode {inode}: actual kind is {:?}",
+                stored.kind
+            )));
+        }
+        if let Some(path) = stored.file_overlay_path {
+            return self.overlay.read_range(&path, offset, size);
+        }
+        let digest = stored.file_remote_digest.ok_or_else(|| {
+            internal_error(format!("read inode {inode}: file has no backing digest"))
+        })?;
+        let (bytes, downloaded) = self.cached_blob_store.read_range(&digest, offset, size)?;
+        self.record_file_read(downloaded);
+        Ok(bytes)
+    }
+
+    /// Returns a snapshot of the current cache and download counters.
+    pub fn io_counters(&self) -> IoCounters {
+        IoCounters {
+            directory_downloads: self.counters.directory_downloads.load(Ordering::Relaxed),
+            directory_cache_hits: self.counters.directory_cache_hits.load(Ordering::Relaxed),
+            file_downloads: self.counters.file_downloads.load(Ordering::Relaxed),
+            file_cache_hits: self.counters.file_cache_hits.load(Ordering::Relaxed),
         }
     }
 
-    /// Rechecks cache presence and creates an opaque streaming writer on a miss.
-    pub fn start_blob_download(&self, digest: &Digest) -> Result<BlobWriter, SessionError> {
-        self.cache.start_download(digest)
-    }
-
-    /// Verifies, syncs, and atomically admits a completed pending blob.
-    pub fn finalize_blob(&self, writer: BlobWriter) -> Result<(), SessionError> {
-        self.cache.finalize(writer)
-    }
-
-    /// Counts admitted cache files for live status composition.
-    pub fn cached_blob_count(&self) -> Result<u64, SessionError> {
-        self.cache.entry_count()
-    }
-
-    /// Commits clean close and releases active resources. Repeated calls succeed.
+    /// Commits the one-shot active-to-closed lifecycle transition.
     pub fn close(&self) -> Result<(), SessionError> {
-        self.active.close()
+        self.store.close()
+    }
+
+    fn ensure_directory_loaded(&self, inode: InodeId) -> Result<(), SessionError> {
+        let lock = self.inode_lock(inode)?;
+        let _guard = lock.lock().map_err(|_| {
+            internal_error(format!(
+                "load directory inode {inode}: inode lock is poisoned"
+            ))
+        })?;
+        let directory = self.get_visible_inode(inode)?;
+        if directory.kind != NodeKind::Directory {
+            return Err(not_directory(format!(
+                "load directory inode {inode}: actual kind is {:?}",
+                directory.kind
+            )));
+        }
+        if directory.directory_loaded == Some(true) {
+            return Ok(());
+        }
+        let digest = directory.directory_remote_digest.ok_or_else(|| {
+            internal_error(format!(
+                "directory inode {inode} is not loaded but has no backing remote digest to fetch from the blob store"
+            ))
+        })?;
+        let (bytes, downloaded) = self.cached_blob_store.read_blob(&digest)?;
+        let decoded = decode_directory(&digest, bytes).map_err(|source| {
+            internal_error(format!("decode directory blob {digest}: {source}"))
+        })?;
+        let children = decoded_directory_children(decoded)?;
+        self.store.create_directory_children(inode, &children)?;
+        self.record_directory_read(downloaded);
+        Ok(())
+    }
+
+    fn inode_lock(&self, inode: InodeId) -> Result<Arc<Mutex<()>>, SessionError> {
+        self.inode_locks
+            .lock()
+            .map_err(|_| {
+                internal_error(format!(
+                    "coordinate inode lock {inode}: lock map is poisoned"
+                ))
+            })
+            .map(|mut locks| {
+                locks
+                    .entry(inode)
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            })
+    }
+    /// Returns an existing, non-tombstoned inode without projecting it for callers.
+    fn get_visible_inode(&self, inode: InodeId) -> Result<StoreInode, SessionError> {
+        match self.store.inode(inode)? {
+            Some(stored) if !stored.tombstone => Ok(stored),
+            Some(_) => Err(not_found(format!("inode {inode} is not visible"))),
+            None => Err(not_found(format!("inode {inode} doesn't exist"))),
+        }
+    }
+    fn record_directory_read(&self, downloaded: bool) {
+        if downloaded {
+            self.counters
+                .directory_downloads
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters
+                .directory_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn record_file_read(&self, downloaded: bool) {
+        if downloaded {
+            self.counters.file_downloads.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters
+                .file_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 /// Resolves a mountpoint to a canonical existing directory.
-pub fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, SessionError> {
-    let canonical = fs::canonicalize(path).map_err(|_| SessionError::InvalidMountpoint {
-        path: path.to_path_buf(),
+/// TODO: Refactor the mountpoint validation here and in cli.rs into a
+/// common location.
+pub(crate) fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, SessionError> {
+    let canonical = fs::canonicalize(path).map_err(|source| {
+        internal_error(format!(
+            "canonicalize mountpoint {}: {source}",
+            path.display()
+        ))
     })?;
     if !fs::metadata(&canonical)
-        .map_err(|_| SessionError::InvalidMountpoint {
-            path: path.to_path_buf(),
+        .map_err(|source| {
+            internal_error(format!(
+                "inspect mountpoint {} canonicalized to {}: {source}",
+                path.display(),
+                canonical.display()
+            ))
         })?
         .is_dir()
     {
-        return Err(SessionError::InvalidMountpoint {
-            path: path.to_path_buf(),
-        });
+        return Err(internal_error(format!(
+            "validate mountpoint {} canonicalized to {}: result is not a directory",
+            path.display(),
+            canonical.display()
+        )));
     }
     Ok(canonical)
 }
@@ -507,437 +577,181 @@ const LOCK_RECORD_VERSION: u32 = 1;
 const MIN_TIMESTAMP_SECONDS: i64 = -62_135_596_800;
 const MAX_TIMESTAMP_SECONDS: i64 = 253_402_300_799;
 
-fn store_lookup_to_session(lookup: StoreLookup<StoreInode>) -> Result<Lookup<Inode>, SessionError> {
-    match lookup {
-        StoreLookup::Ready(inode) => store_inode_to_session(inode).map(Lookup::Ready),
-        StoreLookup::NeedsMaterialization { digest } => {
-            let digest = digest.parse().map_err(|error| {
-                invalid_stored_inode(format!("invalid directory materialization digest: {error}"))
-            })?;
-            Ok(Lookup::NeedsMaterialization { digest })
-        }
-    }
-}
-
-fn store_list_to_session(
-    lookup: StoreLookup<Vec<StoreInode>>,
-) -> Result<Lookup<Vec<Inode>>, SessionError> {
-    match lookup {
-        StoreLookup::Ready(inodes) => translate_store_inodes(inodes).map(Lookup::Ready),
-        StoreLookup::NeedsMaterialization { digest } => {
-            let digest = digest.parse().map_err(|error| {
-                invalid_stored_inode(format!("invalid directory materialization digest: {error}"))
-            })?;
-            Ok(Lookup::NeedsMaterialization { digest })
-        }
-    }
-}
-
-fn translate_store_inodes(inodes: Vec<StoreInode>) -> Result<Vec<Inode>, SessionError> {
-    inodes.into_iter().map(store_inode_to_session).collect()
-}
-
-/// Validates one complete SQLite-shaped record and projects its visible fields.
-///
-/// Persistence-only backing, tombstone, and dirty fields are deliberately not
-/// exposed. Nullable mode and mtime receive effective defaults only here.
-fn store_inode_to_session(stored: StoreInode) -> Result<Inode, SessionError> {
-    let (inode, parent) = validate_store_inode_identity(&stored)?;
-    if stored.tombstone {
-        return Err(invalid_stored_inode(format!(
-            "inode {inode} is unexpectedly tombstoned"
-        )));
-    }
-    let kind = session_node_kind(stored.kind);
-    if inode == InodeId::ROOT && kind != NodeKind::Directory {
-        return Err(invalid_stored_inode("root inode is not a directory".into()));
-    }
-    let remote_digest = stored
-        .remote_digest
-        .as_ref()
-        .map(|value| parse_stored_digest(inode, value))
-        .transpose()?;
-    let overlay_file = stored
-        .overlay_file
-        .as_ref()
-        .map(|path| validate_overlay_path(inode, path.clone()))
-        .transpose()?;
-    let mode = validate_stored_mode(inode, stored.mode)?;
-    let mtime = validate_stored_mtime(inode, stored.mtime_seconds, stored.mtime_nanos)?;
-    validate_store_inode_shape(
-        inode,
-        &stored,
-        kind,
-        remote_digest.as_ref(),
-        overlay_file.as_deref(),
-    )?;
-    let size = visible_inode_size(
-        kind,
-        remote_digest.as_ref(),
-        stored.symlink_target.as_deref(),
-    );
+fn project_inode(stored: StoreInode) -> Result<Inode, SessionError> {
+    let inode = stored.id;
+    let parent = stored.parent.unwrap_or(inode);
+    let mode = stored.mode.unwrap_or(match stored.kind {
+        NodeKind::File => 0o444,
+        NodeKind::Directory => 0o555,
+        NodeKind::Symlink => 0o777,
+    });
+    let size = match stored.kind {
+        NodeKind::File => stored
+            .file_remote_digest
+            .as_ref()
+            .map(Digest::size_bytes)
+            .map(|size| {
+                u64::try_from(size).map_err(|_| {
+                    internal_error(format!(
+                        "project file inode {inode}: size {size} is negative"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0),
+        NodeKind::Directory => 0,
+        NodeKind::Symlink => u64::try_from(stored.symlink_target.as_ref().map_or(0, String::len))
+            .map_err(|_| {
+            internal_error(format!(
+                "project symlink inode {inode}: target is oversized"
+            ))
+        })?,
+    };
     Ok(Inode {
         inode,
         parent,
         name: stored.name,
-        kind,
+        kind: stored.kind,
         size,
-        mode: mode.unwrap_or_else(|| default_mode(kind)),
-        mtime: mtime.unwrap_or(NodeTime::UNIX_EPOCH),
+        mode,
+        mtime: stored.mtime.unwrap_or(NodeTime::UNIX_EPOCH),
         symlink_target: stored.symlink_target,
     })
 }
 
-fn validate_store_inode_identity(stored: &StoreInode) -> Result<(InodeId, InodeId), SessionError> {
-    let inode = match stored.inode {
-        Some(value) => InodeId::from_sqlite(value)?,
-        None => {
-            return Err(invalid_stored_inode(
-                "inode row is missing its identity".into(),
-            ));
-        }
-    };
-    let parent = match (inode, stored.parent_inode) {
-        (InodeId::ROOT, None) if stored.name.is_empty() => InodeId::ROOT,
-        (InodeId::ROOT, Some(_)) => {
-            return Err(invalid_stored_inode(
-                "root inode has a parent, which is unexpected".into(),
-            ));
-        }
-        (InodeId::ROOT, None) => {
-            return Err(invalid_stored_inode(
-                "root inode has a non-empty name".into(),
-            ));
-        }
-        (_, Some(parent)) => {
-            validate_stored_name(inode, &stored.name)?;
-            InodeId::from_sqlite(parent)?
-        }
-        (_, None) => {
-            return Err(invalid_stored_inode(format!(
-                "inode {inode} has no parent but is not the root inode"
-            )));
-        }
-    };
-    Ok((inode, parent))
-}
-
-fn session_node_kind(kind: StoreNodeKind) -> NodeKind {
-    match kind {
-        StoreNodeKind::File => NodeKind::File,
-        StoreNodeKind::Directory => NodeKind::Directory,
-        StoreNodeKind::Symlink => NodeKind::Symlink,
+fn decoded_directory_children(
+    directory: crate::reapi::remote_execution::Directory,
+) -> Result<Vec<StoreInode>, SessionError> {
+    let mut children = Vec::with_capacity(
+        directory.files.len() + directory.directories.len() + directory.symlinks.len(),
+    );
+    for node in directory.files {
+        let name = node.name;
+        children.push(remote_file(
+            name.clone(),
+            node.digest.as_ref().ok_or_else(|| {
+                internal_error(format!("decode file node `{name}`: missing digest"))
+            })?,
+            node.node_properties.as_ref(),
+        )?);
     }
-}
-
-fn parse_stored_digest(inode: InodeId, value: &str) -> Result<Digest, SessionError> {
-    value.parse().map_err(|error| {
-        invalid_stored_inode(format!(
-            "inode {inode} has an invalid remote digest: {error}"
-        ))
-    })
-}
-
-fn validate_stored_mode(inode: InodeId, mode: Option<i64>) -> Result<Option<u32>, SessionError> {
-    mode.map(|value| {
-        u32::try_from(value)
-            .map_err(|_| invalid_stored_inode(format!("inode {inode} has an invalid mode")))
-    })
-    .transpose()
-}
-
-fn validate_stored_mtime(
-    inode: InodeId,
-    seconds: Option<i64>,
-    nanos: Option<i64>,
-) -> Result<Option<NodeTime>, SessionError> {
-    match (seconds, nanos) {
-        (None, None) => Ok(None),
-        (Some(seconds), Some(nanos)) => u32::try_from(nanos)
-            .ok()
-            .and_then(|nanos| NodeTime::new(seconds, nanos))
-            .map(Some)
-            .ok_or_else(|| {
-                invalid_stored_inode(format!("inode {inode} has an invalid modification time"))
-            }),
-        _ => Err(invalid_stored_inode(format!(
-            "inode {inode} has a partial modification time"
-        ))),
+    for node in directory.directories {
+        let name = node.name;
+        children.push(remote_directory(
+            name.clone(),
+            node.digest.as_ref().ok_or_else(|| {
+                internal_error(format!("decode directory node `{name}`: missing digest"))
+            })?,
+            node.node_properties.as_ref(),
+        )?);
     }
-}
-
-fn validate_store_inode_shape(
-    inode: InodeId,
-    stored: &StoreInode,
-    kind: NodeKind,
-    remote_digest: Option<&Digest>,
-    overlay_file: Option<&Path>,
-) -> Result<(), SessionError> {
-    let valid_shape = match kind {
-        NodeKind::File => stored.symlink_target.is_none(),
-        NodeKind::Directory => stored.symlink_target.is_none() && overlay_file.is_none(),
-        NodeKind::Symlink => {
-            stored.symlink_target.is_some() && remote_digest.is_none() && overlay_file.is_none()
-        }
-    };
-    if valid_shape {
-        Ok(())
-    } else {
-        Err(invalid_stored_inode(format!(
-            "inode {inode} fields do not match its kind"
-        )))
+    for node in directory.symlinks {
+        children.push(remote_symlink(
+            node.name,
+            node.target,
+            node.node_properties.as_ref(),
+        )?);
     }
+    Ok(children)
 }
 
-fn visible_inode_size(
-    kind: NodeKind,
-    remote_digest: Option<&Digest>,
-    symlink_target: Option<&str>,
-) -> u64 {
-    match kind {
-        NodeKind::File => remote_digest
-            .map(|digest| u64::try_from(digest.size_bytes()).expect("digest size is non-negative"))
-            .unwrap_or(0),
-        NodeKind::Directory => 0,
-        NodeKind::Symlink => symlink_target.map_or(0, |target| {
-            u64::try_from(target.len()).expect("string length fits u64")
-        }),
-    }
-}
-
-fn default_mode(kind: NodeKind) -> u32 {
-    match kind {
-        NodeKind::File => 0o444,
-        NodeKind::Directory => 0o555,
-        NodeKind::Symlink => 0o777,
-    }
-}
-
-fn validate_stored_name(inode: InodeId, name: &str) -> Result<(), SessionError> {
-    if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
-        return Err(invalid_stored_inode(format!(
-            "inode {inode} has invalid name `{name}`"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_overlay_path(inode: InodeId, value: String) -> Result<PathBuf, SessionError> {
-    let path = PathBuf::from(value);
-    let mut components = path.components();
-    let is_filename = matches!(components.next(), Some(std::path::Component::Normal(_)))
-        && components.next().is_none();
-    if !is_filename {
-        return Err(invalid_stored_inode(format!(
-            "inode {inode} has an invalid overlay file"
-        )));
-    }
-    Ok(path)
-}
-
-/// Builds the exact clean, remote-backed root row for a fresh session.
-fn root_store_insert(root_digest: &Digest) -> StoreInode {
-    StoreInode {
-        inode: Some(ROOT_INODE_ID),
-        parent_inode: None,
-        name: String::new(),
-        kind: StoreNodeKind::Directory,
-        remote_digest: Some(root_digest.to_string()),
+fn remote_file(
+    name: String,
+    digest: &crate::reapi::remote_execution::Digest,
+    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
+) -> Result<StoreInode, SessionError> {
+    let (mode, mtime) = node_metadata(properties)?;
+    Ok(StoreInode {
+        id: InodeId::INVALID,
+        parent: None,
+        name: name.clone(),
+        kind: NodeKind::File,
+        mode,
+        mtime,
+        tombstone: false,
+        file_remote_digest: Some(Digest::from_reapi(digest).map_err(|error| {
+            internal_error(format!(
+                "error translating digest of file node {name} from REAPI digest: {error}"
+            ))
+        })?),
+        file_overlay_path: None,
+        file_content_dirty: Some(false),
         symlink_target: None,
-        overlay_file: None,
-        mode: None,
-        mtime_seconds: None,
-        mtime_nanos: None,
-        tombstone: false,
-        content_dirty: false,
-        tree_dirty: false,
-    }
+        directory_remote_digest: None,
+        directory_loaded: None,
+    })
 }
-
-/// Builds one clean remote child row while retaining nullable remote metadata.
-fn remote_child_store_insert(parent: InodeId, child: RemoteChild) -> StoreInode {
-    let (kind, remote_digest, symlink_target) = match child.content {
-        RemoteContent::File(digest) => (StoreNodeKind::File, Some(digest.to_string()), None),
-        RemoteContent::Directory(digest) => {
-            (StoreNodeKind::Directory, Some(digest.to_string()), None)
-        }
-        RemoteContent::Symlink(target) => (StoreNodeKind::Symlink, None, Some(target)),
+fn remote_directory(
+    name: String,
+    digest: &crate::reapi::remote_execution::Digest,
+    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
+) -> Result<StoreInode, SessionError> {
+    let (mode, mtime) = node_metadata(properties)?;
+    Ok(StoreInode {
+        id: InodeId::INVALID,
+        parent: None,
+        name: name.clone(),
+        kind: NodeKind::Directory,
+        mode,
+        mtime,
+        tombstone: false,
+        file_remote_digest: None,
+        file_overlay_path: None,
+        file_content_dirty: None,
+        symlink_target: None,
+        directory_remote_digest: Some(Digest::from_reapi(digest).map_err(|error| {
+            internal_error(format!("decode child `{name}` directory digest: {error}"))
+        })?),
+        directory_loaded: Some(false),
+    })
+}
+fn remote_symlink(
+    name: String,
+    target: String,
+    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
+) -> Result<StoreInode, SessionError> {
+    let (mode, mtime) = node_metadata(properties)?;
+    Ok(StoreInode {
+        id: InodeId::INVALID,
+        parent: None,
+        name,
+        kind: NodeKind::Symlink,
+        mode,
+        mtime,
+        tombstone: false,
+        file_remote_digest: None,
+        file_overlay_path: None,
+        file_content_dirty: None,
+        symlink_target: Some(target),
+        directory_remote_digest: None,
+        directory_loaded: None,
+    })
+}
+fn node_metadata(
+    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
+) -> Result<(Option<u32>, Option<NodeTime>), SessionError> {
+    let Some(properties) = properties else {
+        return Ok((None, None));
     };
-    let (mtime_seconds, mtime_nanos) = child
+    let mtime = properties
         .mtime
-        .map(|time| (Some(time.seconds()), Some(i64::from(time.nanos()))))
-        .unwrap_or((None, None));
-    StoreInode {
-        inode: None,
-        parent_inode: Some(parent.sqlite()),
-        name: child.name,
-        kind,
-        remote_digest,
-        symlink_target,
-        overlay_file: None,
-        mode: child.mode.map(i64::from),
-        mtime_seconds,
-        mtime_nanos,
-        tombstone: false,
-        content_dirty: false,
-        tree_dirty: false,
-    }
-}
-
-struct ActiveSessionLayout {
-    log_path: PathBuf,
-    db_path: PathBuf,
-    overlay_dir: PathBuf,
-}
-
-impl ActiveSessionLayout {
-    fn new(session_dir: PathBuf) -> Self {
-        Self {
-            log_path: session_dir.join("session.log"),
-            db_path: session_dir.join("session.db"),
-            overlay_dir: session_dir.join("overlay"),
-        }
-    }
-}
-
-struct ActiveSession {
-    layout: ActiveSessionLayout,
-    resources: Mutex<Option<ActiveResources>>,
-}
-
-struct ActiveResources {
-    store: SessionStore,
-    overlay: OverlayStore,
-    _lock: SessionLock,
-}
-
-impl ActiveSession {
-    fn open(
-        session_dir: PathBuf,
-        lock_path: PathBuf,
-        root_digest: Digest,
-        mountpoint: PathBuf,
-    ) -> Result<Self, SessionError> {
-        let session_id = Uuid::new_v4().to_string();
-        tracing::info!(
-            "ActiveSession(session_dir={}, lock_path={}, root_digest={}, mountpoint={}), session_id={}",
-            session_dir.display(),
-            lock_path.display(),
-            root_digest,
-            mountpoint.display(),
-            session_id
-        );
-        let mut lock = SessionLock::acquire(&lock_path).with_context(|| {
-            format!(
-                "unable to acquire lock {} when creating a new active session",
-                lock_path.display()
-            )
-        })?;
-        lock.write_record(
-            &lock_path,
-            &LockRecord {
-                record_version: LOCK_RECORD_VERSION,
-                session_id: session_id.clone(),
-                pid: std::process::id(),
-            },
-        )?;
-
-        tracing::info!("Creating new session directory: {}", session_dir.display());
-        remove_if_present(&session_dir)
-            .with_context(|| "removing old session directory".to_string())?;
-        create_dir_if_absent(&session_dir)
-            .with_context(|| "creating session directory".to_string())?;
-
-        let layout = ActiveSessionLayout::new(session_dir);
-        tracing::info!("Creating logs file: {}", layout.log_path.display());
-        create_empty_file(&layout.log_path)
-            .with_context(|| "creating file for daemon session logs".to_string())?;
-        tracing::info!("Creating session db: {}", layout.db_path.display());
-        create_empty_file(&layout.db_path)
-            .with_context(|| "creating file for session db".to_string())?;
-        let overlay = OverlayStore::open(layout.overlay_dir.clone())?;
-        let root_inode = root_store_insert(&root_digest);
-        let store = SessionStore::create(
-            layout.db_path.clone(),
-            session_id,
-            std::process::id(),
-            root_digest,
-            mountpoint,
-            root_inode,
-        )?;
-        Ok(Self {
-            layout,
-            resources: Mutex::new(Some(ActiveResources {
-                store,
-                overlay,
-                _lock: lock,
-            })),
+        .as_ref()
+        .map(|time| {
+            let nanos = u32::try_from(time.nanos).map_err(|_| {
+                internal_error(format!(
+                    "decode node mtime seconds {} nanos {}: unable to cast nanos to a 32-bit unsigned integer",
+                    time.seconds, time.nanos
+                ))
+            })?;
+            NodeTime::new(time.seconds, nanos).ok_or_else(|| {
+                internal_error(format!(
+                    "decode node mtime seconds {} nanos {}: invalid timestamp",
+                    time.seconds, time.nanos
+                ))
+            })
         })
-    }
-
-    fn inspect(root: &Path) -> Result<Option<SessionInfo>, SessionError> {
-        if !root.exists() {
-            return Ok(None);
-        }
-        let layout = ActiveSessionLayout::new(root.to_path_buf());
-        let stored = SessionStore::inspect(&layout.db_path)
-            .with_context(|| "inspecting session status from session db".to_string())?;
-        Ok(Some(SessionInfo {
-            root_digest: stored.root_digest,
-            mountpoint: stored.mountpoint,
-            daemon_pid: stored.daemon_pid,
-            control_endpoint: PathBuf::from(""),
-            log_path: layout.log_path,
-        }))
-    }
-
-    fn with_store<T>(
-        &self,
-        operation: impl FnOnce(&SessionStore) -> Result<T, SessionError>,
-    ) -> Result<T, SessionError> {
-        let guard = self
-            .resources
-            .lock()
-            .map_err(|_| SessionError::Synchronization {
-                operation: "access active session resources",
-            })?;
-        let resources = guard.as_ref().ok_or(SessionError::Closed)?;
-        operation(&resources.store)
-    }
-
-    fn read_overlay_range(
-        &self,
-        relative: &Path,
-        offset: u64,
-        size: usize,
-    ) -> Result<Bytes, SessionError> {
-        let guard = self
-            .resources
-            .lock()
-            .map_err(|_| SessionError::Synchronization {
-                operation: "read active overlay",
-            })?;
-        let resources = guard.as_ref().ok_or(SessionError::Closed)?;
-        resources.overlay.read_range(relative, offset, size)
-    }
-
-    fn close(&self) -> Result<(), SessionError> {
-        let mut guard = self
-            .resources
-            .lock()
-            .map_err(|_| SessionError::Synchronization {
-                operation: "close active session",
-            })?;
-        let Some(resources) = guard.take() else {
-            return Ok(());
-        };
-        if let Err(error) = resources.store.close() {
-            *guard = Some(resources);
-            return Err(error);
-        }
-        drop(resources);
-        Ok(())
-    }
+        .transpose()?;
+    Ok((properties.unix_mode, mtime))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -946,11 +760,9 @@ struct LockRecord {
     session_id: String,
     pid: u32,
 }
-
 struct SessionLock {
     file: File,
 }
-
 impl SessionLock {
     fn acquire(path: &Path) -> Result<Self, SessionError> {
         let file = OpenOptions::new()
@@ -963,22 +775,20 @@ impl SessionLock {
             .map_err(|source| fs_error("open session lock", path, source))?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .map_err(|source| fs_error("secure session lock", path, source))?;
-        // TODO: Use the native file like API provided by the standard fs crate instead of doing
-        // usafe calls.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let owner = fs::read_to_string(path)
                 .ok()
                 .and_then(|value| serde_json::from_str::<LockRecord>(&value).ok())
-                .map(|value| format!(" (pid {}, session {})", value.pid, value.session_id))
-                .unwrap_or_else(|| " (owner diagnostics unavailable)".into());
-            return Err(SessionError::ActiveSession {
-                path: path.to_path_buf(),
-                owner,
-            });
+                .map(|value| format!("(pid {}, session {})", value.pid, value.session_id))
+                .unwrap_or_else(|| "(owner diagnostics unavailable)".into());
+            return Err(failed_precondition(format!(
+                "acquire session lock {}: another RemoteFS session owns it {}",
+                path.display(),
+                owner
+            )));
         }
         Ok(Self { file })
     }
-
     fn write_record(&mut self, path: &Path, record: &LockRecord) -> Result<(), SessionError> {
         self.file
             .set_len(0)
@@ -987,17 +797,16 @@ impl SessionLock {
             .seek(SeekFrom::Start(0))
             .map_err(|source| fs_error("rewind session lock", path, source))?;
         serde_json::to_writer(&mut self.file, record).map_err(|source| {
-            SessionError::UnsafePath {
-                path: path.to_path_buf(),
-                reason: format!("cannot encode lock record: {source}"),
-            }
+            internal_error(format!(
+                "encode session lock record {}: {source}",
+                path.display()
+            ))
         })?;
         self.file
             .write_all(b"\n")
             .map_err(|source| fs_error("write session lock", path, source))
     }
 }
-
 impl Drop for SessionLock {
     fn drop(&mut self) {
         unsafe {
@@ -1015,22 +824,16 @@ fn ensure_writable_home(config: &Config) -> Result<(), SessionError> {
     }
     Ok(())
 }
-
 fn ensure_reader_home(config: &Config) -> Result<(), SessionError> {
     if config.rfs_home.exists() {
-        return Ok(());
-    }
-
-    Err(SessionError::InvalidSession {
-        path: config.rfs_home.clone(),
-        reason: format!(
-            "unable to query session status because session home directory {} does not exist",
+        Ok(())
+    } else {
+        Err(failed_precondition(format!(
+            "inspect session home {}: path does not exist",
             config.rfs_home.display()
-        ),
-    })
+        )))
+    }
 }
-
-// Wraps the filesystem directory creation method to return a SessionError.
 fn create_dir_if_absent(path: &Path) -> Result<(), SessionError> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
@@ -1038,8 +841,6 @@ fn create_dir_if_absent(path: &Path) -> Result<(), SessionError> {
         Err(source) => Err(fs_error("create directory", path, source)),
     }
 }
-
-// Wraps the filesystem file creation method to return a SessionError.
 fn create_empty_file(path: &Path) -> Result<(), SessionError> {
     OpenOptions::new()
         .write(true)
@@ -1048,60 +849,30 @@ fn create_empty_file(path: &Path) -> Result<(), SessionError> {
         .map_err(|source| fs_error("create file", path, source))?;
     Ok(())
 }
-
 fn remove_if_present(path: &Path) -> Result<(), SessionError> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(()),
         Err(source) => Err(fs_error("local state cleanup", path, source)),
     }
 }
 
-fn now_parts() -> Result<(i64, i64), SessionError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| SessionError::InvalidSystemTime)?;
-    Ok((
-        i64::try_from(duration.as_secs()).map_err(|_| SessionError::InvalidSystemTime)?,
-        i64::from(duration.subsec_nanos()),
-    ))
+pub(super) fn fs_error(
+    operation: &'static str,
+    path: &Path,
+    source: std::io::Error,
+) -> SessionError {
+    internal_error(format!("{operation} {}: {source}", path.display()))
 }
 
-fn stale_path(path: &Path, reason: String) -> SessionError {
-    SessionError::InvalidSession {
-        path: path.to_path_buf(),
-        reason,
-    }
-}
-
-fn invalid_stored_inode(reason: String) -> SessionError {
-    SessionError::InvalidStoredInode { reason }
-}
-
-fn fs_error(operation: &'static str, path: &Path, source: std::io::Error) -> SessionError {
-    let kind = source.kind();
-    SessionError::Filesystem {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(kind, format!("{operation} failed: {source}")),
-    }
-}
-
-/// Layout of files under the home directory maintain by the rfs daemon. This
-/// includes both the blob cache that can live across sessions as well as
-/// files created for a specific daemon session.
+/// Fixed local filesystem paths owned by one RemoteFS home.
 struct SessionLayout {
-    /// Directory containing cached blobs downloaded from the CAS server.
     cache: PathBuf,
-    /// Directory containing files and directories for the active session.
     session: PathBuf,
-    /// Lock file for the active session.
     session_lock: PathBuf,
-    /// The UDS socket serving the daemon's control endpoint.
     control_endpoint: PathBuf,
 }
-
 impl SessionLayout {
-    // Initialize a new session layout under the given rfsd home directory.
     fn new(home: &Path) -> Self {
         let session = home.join("session");
         Self {
@@ -1110,5 +881,457 @@ impl SessionLayout {
             session_lock: home.join("session.lock"),
             control_endpoint: session.join("control.sock"),
         }
+    }
+    fn database_path(&self) -> PathBuf {
+        self.session.join("session.db")
+    }
+    fn overlay_path(&self) -> PathBuf {
+        self.session.join("overlay")
+    }
+    fn log_path(&self) -> PathBuf {
+        self.session.join("session.log")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io::Write;
+    use std::sync::{Arc, Barrier, Mutex};
+
+    use async_trait::async_trait;
+    use prost_types::Timestamp;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::cas::{Blob, CasError, UploadStats};
+    use crate::logging::init_test;
+    use crate::tree::{DirectoryBuilder, DirectoryEntry, FileEntry, NodeMetadata};
+
+    /// In-memory backing store used to exercise the public Session boundary.
+    struct FakeBlobStore {
+        blobs: HashMap<Digest, Bytes>,
+        streams: Mutex<u64>,
+    }
+
+    #[async_trait]
+    impl BlobStore for FakeBlobStore {
+        async fn find_missing_blobs(&self, digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
+            Ok(digests
+                .iter()
+                .filter(|digest| !self.blobs.contains_key(*digest))
+                .cloned()
+                .collect())
+        }
+
+        async fn upload_blobs(&self, _blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
+            Ok(UploadStats::default())
+        }
+
+        async fn stream_blob(
+            &self,
+            digest: &Digest,
+            destination: &mut (dyn Write + Send),
+        ) -> Result<(), CasError> {
+            let bytes = self.blobs.get(digest).ok_or_else(|| {
+                CasError::InvalidInstanceName("fake".to_owned(), "missing blob".to_owned())
+            })?;
+            *self.streams.lock().expect("test stream mutex") += 1;
+            destination
+                .write_all(bytes)
+                .expect("test destination is writable");
+            Ok(())
+        }
+    }
+
+    /// Opens a session with one remote file exposed by its root directory.
+    fn session() -> (TempDir, tokio::runtime::Runtime, Session, InodeId) {
+        let home = TempDir::new().expect("temporary home");
+        let mountpoint = TempDir::new().expect("temporary mountpoint");
+        let file_bytes = Bytes::from_static(b"hello remote filesystem");
+        let file_digest = Digest::for_bytes(&file_bytes);
+        let mut builder = DirectoryBuilder::new();
+        builder
+            .add_file(FileEntry {
+                name: "readme".to_owned(),
+                digest: file_digest.clone(),
+                metadata: NodeMetadata::new(
+                    NodeKind::File,
+                    Some(0o644),
+                    Some(Timestamp {
+                        seconds: 42,
+                        nanos: 7,
+                    }),
+                ),
+            })
+            .expect("valid test file entry");
+        let root = builder.encode().expect("encode test root");
+        let blobs = HashMap::from([(root.digest.clone(), root.bytes), (file_digest, file_bytes)]);
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = Session::open(
+            Config {
+                rfs_home: home.path().join("home"),
+            },
+            root.digest,
+            mountpoint.path(),
+            Box::new(FakeBlobStore {
+                blobs,
+                streams: Mutex::new(0),
+            }),
+            runtime.handle().clone(),
+        )
+        .expect("open test session");
+        (home, runtime, session, InodeId::ROOT)
+    }
+
+    /// A directory load creates visible children and remote range reads reuse the cache.
+    #[test]
+    fn directory_loading_and_file_reads_use_the_session_facade() {
+        init_test();
+        let (_home, _runtime, session, root) = session();
+
+        let child = session.lookup_child(root, "readme").expect("load child");
+        assert_eq!(child.kind, NodeKind::File);
+        assert_eq!(child.mode, 0o644);
+        assert_eq!(
+            child.mtime,
+            NodeTime::new(42, 7).expect("valid metadata time")
+        );
+        assert_eq!(
+            session.list_directory(root).expect("list root"),
+            vec![child.clone()]
+        );
+        assert_eq!(
+            session.read_range(child.inode, 6, 6).expect("read range"),
+            "remote"
+        );
+        assert_eq!(
+            session
+                .read_range(child.inode, 0, 5)
+                .expect("read cached range"),
+            "hello"
+        );
+        assert!(matches!(
+            session.lookup_child(root, "missing"),
+            Err(SessionError::NotFound { .. })
+        ));
+        assert!(matches!(
+            session.get_inode(InodeId::new(99).expect("valid inode")),
+            Err(SessionError::NotFound { .. })
+        ));
+        assert_eq!(
+            session.io_counters(),
+            IoCounters {
+                directory_downloads: 1,
+                directory_cache_hits: 0,
+                file_downloads: 1,
+                file_cache_hits: 1
+            }
+        );
+    }
+
+    /// A child directory retains the mode and modification time encoded in its parent.
+    #[test]
+    fn directory_child_metadata_is_visible_through_the_session_facade() {
+        init_test();
+        let home = TempDir::new().expect("temporary home");
+        let mountpoint = TempDir::new().expect("temporary mountpoint");
+        let child_directory = DirectoryBuilder::new()
+            .encode()
+            .expect("encode child directory");
+        let mut root_builder = DirectoryBuilder::new();
+        root_builder
+            .add_directory(DirectoryEntry {
+                name: "nested".to_owned(),
+                digest: child_directory.digest.clone(),
+                metadata: NodeMetadata::new(
+                    NodeKind::Directory,
+                    Some(0o750),
+                    Some(Timestamp {
+                        seconds: 123,
+                        nanos: 456,
+                    }),
+                ),
+            })
+            .expect("add child directory");
+        let root = root_builder.encode().expect("encode root directory");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = Session::open(
+            Config {
+                rfs_home: home.path().join("home"),
+            },
+            root.digest.clone(),
+            mountpoint.path(),
+            Box::new(FakeBlobStore {
+                blobs: HashMap::from([
+                    (root.digest, root.bytes),
+                    (child_directory.digest, child_directory.bytes),
+                ]),
+                streams: Mutex::new(0),
+            }),
+            runtime.handle().clone(),
+        )
+        .expect("open session");
+
+        let child = session
+            .lookup_child(InodeId::ROOT, "nested")
+            .expect("load child directory");
+
+        assert_eq!(child.kind, NodeKind::Directory);
+        assert_eq!(child.mode, 0o750);
+        assert_eq!(
+            child.mtime,
+            NodeTime::new(123, 456).expect("valid directory metadata time")
+        );
+    }
+
+    /// Closing a session is a one-shot durable transition that retained inspection can read.
+    #[test]
+    fn close_is_one_shot_and_retained_metadata_is_inspectable() {
+        init_test();
+        let (home, _runtime, session, _) = session();
+        let config = Config {
+            rfs_home: home.path().join("home"),
+        };
+
+        session.close().expect("close active session");
+        assert!(session.close().is_err());
+        drop(session);
+        assert!(
+            Session::inspect(&config)
+                .expect("inspect retained state")
+                .is_some()
+        );
+    }
+
+    /// An empty directory can be loaded concurrently without allocating inconsistent state.
+    #[test]
+    fn empty_directory_loading_is_stable_under_concurrent_calls() {
+        init_test();
+        let home = TempDir::new().expect("temporary home");
+        let mountpoint = TempDir::new().expect("temporary mountpoint");
+        let root = DirectoryBuilder::new().encode().expect("encode empty root");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = Arc::new(
+            Session::open(
+                Config {
+                    rfs_home: home.path().join("home"),
+                },
+                root.digest.clone(),
+                mountpoint.path(),
+                Box::new(FakeBlobStore {
+                    blobs: HashMap::from([(root.digest, root.bytes)]),
+                    streams: Mutex::new(0),
+                }),
+                runtime.handle().clone(),
+            )
+            .expect("open empty session"),
+        );
+        let barrier = Arc::new(Barrier::new(5));
+        let threads = (0..4)
+            .map(|_| {
+                let session = Arc::clone(&session);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    session
+                        .list_directory(InodeId::ROOT)
+                        .expect("list empty root")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for thread in threads {
+            assert!(thread.join().expect("join listing thread").is_empty());
+        }
+        assert_eq!(session.io_counters().directory_downloads, 1);
+    }
+
+    /// A malformed directory never exposes partial children through the public namespace API.
+    #[test]
+    fn malformed_directory_does_not_make_children_visible() {
+        init_test();
+        let home = TempDir::new().expect("temporary home");
+        let mountpoint = TempDir::new().expect("temporary mountpoint");
+        let malformed = Bytes::from_static(b"not a directory proto");
+        let root = Digest::for_bytes(&malformed);
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = Session::open(
+            Config {
+                rfs_home: home.path().join("home"),
+            },
+            root.clone(),
+            mountpoint.path(),
+            Box::new(FakeBlobStore {
+                blobs: HashMap::from([(root, malformed)]),
+                streams: Mutex::new(0),
+            }),
+            runtime.handle().clone(),
+        )
+        .expect("open malformed session");
+        assert!(matches!(
+            session.list_directory(InodeId::ROOT),
+            Err(SessionError::InternalError { .. })
+        ));
+        assert!(matches!(
+            session.lookup_child(InodeId::ROOT, "partial"),
+            Err(SessionError::InternalError { .. })
+        ));
+    }
+
+    /// A mismatched directory blob fails cache verification before namespace rows are committed.
+    #[test]
+    fn digest_mismatched_directory_does_not_make_children_visible() {
+        init_test();
+        let home = TempDir::new().expect("temporary home");
+        let mountpoint = TempDir::new().expect("temporary mountpoint");
+        let root = Digest::for_bytes(b"expected directory");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = Session::open(
+            Config {
+                rfs_home: home.path().join("home"),
+            },
+            root.clone(),
+            mountpoint.path(),
+            Box::new(FakeBlobStore {
+                blobs: HashMap::from([(root, Bytes::from_static(b"wrong directory"))]),
+                streams: Mutex::new(0),
+            }),
+            runtime.handle().clone(),
+        )
+        .expect("open mismatched session");
+        assert!(matches!(
+            session.list_directory(InodeId::ROOT),
+            Err(SessionError::InternalError { .. })
+        ));
+        assert!(matches!(
+            session.lookup_child(InodeId::ROOT, "partial"),
+            Err(SessionError::InternalError { .. })
+        ));
+    }
+
+    /// Overlay data wins over remote bytes, and both backing kinds return EOF as empty bytes.
+    #[test]
+    fn overlay_precedence_and_eof_are_visible_through_read_range() {
+        init_test();
+        let (_home, _runtime, session, root) = session();
+        let child = session.lookup_child(root, "readme").expect("load child");
+        assert!(
+            session
+                .read_range(child.inode, 99, 1)
+                .expect("read remote EOF")
+                .is_empty(),
+            "reading file at offset past its size did not return an empty bytea array"
+        );
+        let overlay_path = session.layout.overlay_path().join("data/replacement");
+        fs::write(&overlay_path, b"overlay").expect("write test overlay");
+        let database = session.layout.database_path();
+        // TODO: Use method from store module that'll likely be needed in the future
+        // anyways.
+        rusqlite::Connection::open(database).expect("open test database")
+            .execute("UPDATE inodes SET file_overlay_path = 'replacement', file_content_dirty = 1 WHERE id = ?1", [child.inode.sqlite()])
+            .expect("set test overlay backing");
+        assert_eq!(
+            session
+                .read_range(child.inode, 0, 32)
+                .expect("read overlay"),
+            "overlay"
+        );
+        assert!(
+            session
+                .read_range(child.inode, 99, 1)
+                .expect("read overlay EOF")
+                .is_empty()
+        );
+    }
+
+    /// Two inodes sharing one digest classify the cache fill and follower as separate outcomes.
+    #[test]
+    fn shared_digest_reads_report_one_download_and_one_cache_hit() {
+        init_test();
+        let home = TempDir::new().expect("temporary home");
+        let mountpoint = TempDir::new().expect("temporary mountpoint");
+        let bytes = Bytes::from_static(b"shared bytes");
+        let digest = Digest::for_bytes(&bytes);
+        let mut builder = DirectoryBuilder::new();
+        for name in ["first", "second"] {
+            builder
+                .add_file(FileEntry {
+                    name: name.to_owned(),
+                    digest: digest.clone(),
+                    metadata: NodeMetadata::new(NodeKind::File, None, None),
+                })
+                .expect("add shared file");
+        }
+        let root = builder.encode().expect("encode shared root");
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let session = Arc::new(
+            Session::open(
+                Config {
+                    rfs_home: home.path().join("home"),
+                },
+                root.digest.clone(),
+                mountpoint.path(),
+                Box::new(FakeBlobStore {
+                    blobs: HashMap::from([(root.digest, root.bytes), (digest, bytes)]),
+                    streams: Mutex::new(0),
+                }),
+                runtime.handle().clone(),
+            )
+            .expect("open shared session"),
+        );
+        let first = session
+            .lookup_child(InodeId::ROOT, "first")
+            .expect("load first");
+        let second = session
+            .lookup_child(InodeId::ROOT, "second")
+            .expect("load second");
+        let barrier = Arc::new(Barrier::new(3));
+        let threads = [first, second].map(|inode| {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                session
+                    .read_range(inode.inode, 0, 32)
+                    .expect("read shared blob")
+            })
+        });
+        barrier.wait();
+        for thread in threads {
+            assert_eq!(thread.join().expect("join read thread"), "shared bytes");
+        }
+        assert_eq!(session.io_counters().file_downloads, 1);
+        assert_eq!(session.io_counters().file_cache_hits, 1);
+    }
+
+    /// Info and retained inspection are read-only, while control endpoint discovery creates no state.
+    #[test]
+    fn info_control_endpoint_and_inspect_are_read_only() {
+        init_test();
+        let missing = TempDir::new().expect("temporary missing home");
+        let missing_config = Config {
+            rfs_home: missing.path().join("missing"),
+        };
+        assert!(Session::control_endpoint(&missing_config).is_err());
+        assert!(Session::inspect(&missing_config).is_err());
+        assert!(!missing_config.rfs_home.exists());
+
+        let (home, _runtime, session, _) = session();
+        let config = Config {
+            rfs_home: home.path().join("home"),
+        };
+        assert_eq!(
+            Session::control_endpoint(&config).expect("control endpoint"),
+            session.info().control_endpoint
+        );
+        assert_eq!(
+            Session::inspect(&config)
+                .expect("inspect active")
+                .expect("retained info")
+                .root_digest,
+            session.info().root_digest
+        );
     }
 }

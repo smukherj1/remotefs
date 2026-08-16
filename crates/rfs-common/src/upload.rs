@@ -220,8 +220,8 @@ impl crate::error_context::ResultContextError for UploadError {
 /// The pipeline scans metadata without following symlinks, hashes regular files
 /// with bounded worker concurrency, encodes REAPI directories bottom-up, checks
 /// CAS existence once, and uploads only missing file blobs and directory nodes.
-pub async fn upload_local_directory<S: BlobStore + Send>(
-    store: &mut S,
+pub async fn upload_local_directory<S: BlobStore + ?Sized>(
+    store: &S,
     root: impl AsRef<Path>,
     options: UploadOptions,
 ) -> Result<UploadSummary, UploadError> {
@@ -374,8 +374,8 @@ struct UploadObjectStats {
     bytes_uploaded: u64,
 }
 
-async fn upload_encoded_tree<S: BlobStore + Send>(
-    store: &mut S,
+async fn upload_encoded_tree<S: BlobStore + ?Sized>(
+    store: &S,
     tree: &EncodedDirectoryTree,
 ) -> Result<UploadObjectStats, UploadError> {
     let mut sources_by_digest: HashMap<Digest, Blob> = HashMap::new();
@@ -801,21 +801,19 @@ mod tests {
     use std::collections::HashSet;
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
+    use std::sync::Mutex;
     use tempfile::tempdir;
 
     #[derive(Default)]
     struct FakeStore {
         missing: HashSet<Digest>,
         unexpected_missing: Option<Digest>,
-        uploaded: Vec<Blob>,
+        uploaded: Mutex<Vec<Blob>>,
     }
 
     #[async_trait]
     impl BlobStore for FakeStore {
-        async fn find_missing_blobs(
-            &mut self,
-            digests: &[Digest],
-        ) -> Result<Vec<Digest>, CasError> {
+        async fn find_missing_blobs(&self, digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
             let mut missing = digests
                 .iter()
                 .filter(|digest| self.missing.contains(*digest))
@@ -825,7 +823,7 @@ mod tests {
             Ok(missing)
         }
 
-        async fn upload_blobs(&mut self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
+        async fn upload_blobs(&self, blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
             let stats = UploadStats {
                 uploaded_blobs: blobs.len(),
                 bytes_uploaded: blobs
@@ -833,12 +831,12 @@ mod tests {
                     .map(|blob| blob.digest.size_bytes() as u64)
                     .sum(),
             };
-            self.uploaded.extend(blobs);
+            self.uploaded.lock().unwrap().extend(blobs);
             Ok(stats)
         }
 
         async fn stream_blob(
-            &mut self,
+            &self,
             _digest: &Digest,
             _destination: &mut (dyn std::io::Write + Send),
         ) -> Result<(), CasError> {
@@ -958,13 +956,13 @@ mod tests {
                     .map(|directory| directory.digest.clone()),
             )
             .collect::<HashSet<_>>();
-        let mut store = FakeStore {
+        let store = FakeStore {
             missing,
             unexpected_missing: None,
-            uploaded: Vec::new(),
+            uploaded: Mutex::new(Vec::new()),
         };
 
-        let summary = upload_local_directory(&mut store, temp.path(), UploadOptions::default())
+        let summary = upload_local_directory(&store, temp.path(), UploadOptions::default())
             .await
             .unwrap();
 
@@ -972,7 +970,7 @@ mod tests {
         assert_eq!(summary.directories, 1);
         assert_eq!(summary.uploaded_blobs, 2);
         assert_eq!(summary.reused_blobs, 0);
-        assert_eq!(store.uploaded.len(), 2);
+        assert_eq!(store.uploaded.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -980,13 +978,13 @@ mod tests {
         let temp = tempdir().unwrap();
         fs::write(temp.path().join("file.txt"), b"hello").unwrap();
         let unexpected = Digest::for_bytes(b"not requested");
-        let mut store = FakeStore {
+        let store = FakeStore {
             missing: HashSet::new(),
             unexpected_missing: Some(unexpected.clone()),
-            uploaded: Vec::new(),
+            uploaded: Mutex::new(Vec::new()),
         };
 
-        let error = upload_local_directory(&mut store, temp.path(), UploadOptions::default())
+        let error = upload_local_directory(&store, temp.path(), UploadOptions::default())
             .await
             .unwrap_err();
 
@@ -995,6 +993,6 @@ mod tests {
             UploadError::Context { source, .. }
                 if matches!(source.as_ref(), UploadError::UnexpectedMissingDigest { digest } if digest == &unexpected)
         ));
-        assert!(store.uploaded.is_empty());
+        assert!(store.uploaded.lock().unwrap().is_empty());
     }
 }
