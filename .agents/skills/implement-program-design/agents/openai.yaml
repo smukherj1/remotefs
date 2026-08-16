@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Program Design"
+  short_description: "Build a program design in dependency order"
+  default_prompt: "Use $implement-program-design to implement this program-design document."
