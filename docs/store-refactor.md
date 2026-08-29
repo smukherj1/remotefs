@@ -11,39 +11,6 @@ file is named.
 
 ---
 
-## P4 — Directory child materialization is now one explicit atomic workflow
-
-**Status:** Resolved by `get_or_create_dir_children`.
-
-The store now reads the parent and its current children in one transaction. A
-loaded parent returns its committed child set without validating irrelevant
-input. An unloaded parent must have no rows; otherwise the operation returns an
-internal invariant error without mutation. Only a consistent unloaded parent
-validates and inserts the complete remote child set before setting the loaded
-flag. The parent and children are then read back and validated before commit.
-Per-child reconciliation and its duplicated commit/read tails were removed.
-
----
-
-## P5 — Transaction begin/commit boilerplate repeated at every write site
-
-**Location:** `get_or_create_dir_children`, `close`, and `initialize_database`.
-
-**Problem.** Every write repeats the same four-step dance: lock connection,
-`transaction()` with a mapped begin error, work, `commit()` with a mapped
-commit error. Only the operation label varies.
-
-**Impact.** Noise that buries each operation's actual decisions; a future
-change (e.g., retry-on-busy) must be applied in three places.
-
-**Proposal.** Add a private helper on `SessionStore`, e.g.
-`fn transaction(&self, operation: &'static str) -> Result<Transaction<'_>, SessionError>`
-for the begin half, and/or a `with_transaction(&self, operation, body)` runner
-that owns commit mapping. `initialize_database` can take an opened transaction
-instead of building its own.
-
----
-
 ## P6 — `validate_inode`: boolean flag parameter and opaque field grouping
 
 **Location:** `store.rs:636-713`; callers pass literal `true` at `store.rs:571`

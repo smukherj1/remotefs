@@ -191,7 +191,7 @@ pub enum SessionError {
     /// A SQLite API operation failed.
     #[error("SQLite {operation} failed on db {dbpath}: {source}")]
     Database {
-        operation: &'static str,
+        operation: String,
         dbpath: PathBuf,
         #[source]
         source: rusqlite::Error,

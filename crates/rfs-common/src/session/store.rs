@@ -134,59 +134,53 @@ impl SessionStore {
         parent: InodeId,
         children: &[Inode],
     ) -> Result<Vec<Inode>, SessionError> {
-        let mut connection = self.connection("get or create directory children")?;
-        let transaction = connection
-            .transaction()
-            .map_err(|source| self.db_error("begin child creation", source))?;
-        let parent_inode = self
-            .get_inode_by_id(&transaction, parent)
-            .with_context(|| format!("read parent inode {parent} to create its children"))?
-            .ok_or_else(|| {
-                internal_error(format!(
-                    "can't create children because parent inode {parent} is missing"
-                ))
+        self.with_transaction("get or create directory children", |transaction| {
+            let parent_inode = self
+                .get_inode_by_id(transaction, parent)
+                .with_context(|| format!("read parent inode {parent} to create its children"))?
+                .ok_or_else(|| {
+                    internal_error(format!(
+                        "can't create children because parent inode {parent} is missing"
+                    ))
+                })?;
+            ensure_inode_is_dir(&parent_inode).with_context(|| {
+                format!("can't create children for non-directory inode {parent}")
             })?;
-        ensure_inode_is_dir(&parent_inode)
-            .with_context(|| format!("can't create children for non-directory inode {parent}"))?;
-        let stored_children = self
-            .get_directory_children_on(&transaction, parent)
-            .with_context(|| format!("read stored children of directory inode {parent}"))?;
-        if parent_inode.directory_loaded == Some(true) {
+            let stored_children = self
+                .get_directory_children_on(transaction, parent)
+                .with_context(|| format!("read stored children of directory inode {parent}"))?;
+            if parent_inode.directory_loaded == Some(true) {
+                return Ok(stored_children);
+            }
+            if !stored_children.is_empty() {
+                return Err(internal_error(format!(
+                    "unloaded directory inode {parent} already has stored children"
+                )));
+            }
+            validate_child_inodes_for_creation(children).with_context(|| {
+                format!("validate children to create in directory inode {parent}")
+            })?;
+            for child in children {
+                self.insert_inode(
+                    transaction,
+                    "insert directory child",
+                    &child_for_parent(parent, child),
+                )
+                .with_context(|| {
+                    format!("insert child `{}` in directory inode {parent}", child.name)
+                })?;
+            }
             transaction
-                .commit()
-                .map_err(|source| self.db_error("commit existing child read", source))?;
-            return Ok(stored_children);
-        }
-        if !stored_children.is_empty() {
-            return Err(internal_error(format!(
-                "unloaded directory inode {parent} already has stored children"
-            )));
-        }
-        validate_child_inodes_for_creation(children)
-            .with_context(|| format!("validate children to create in directory inode {parent}"))?;
-        for child in children {
-            self.insert_inode(
-                &transaction,
-                "insert directory child",
-                &child_for_parent(parent, child),
-            )
-            .with_context(|| {
-                format!("insert child `{}` in directory inode {parent}", child.name)
-            })?;
-        }
-        transaction
-            .execute(
-                "UPDATE inodes SET directory_loaded = 1 WHERE id = ?1",
-                [parent.sqlite()],
-            )
-            .map_err(|source| self.db_error("mark directory loaded", source))?;
-        let result = self
-            .get_directory_children_on(&transaction, parent)
-            .with_context(|| format!("read children of directory inode {parent} after creation"))?;
-        transaction
-            .commit()
-            .map_err(|source| self.db_error("commit child creation", source))?;
-        Ok(result)
+                .execute(
+                    "UPDATE inodes SET directory_loaded = 1 WHERE id = ?1",
+                    [parent.sqlite()],
+                )
+                .map_err(|source| self.db_error("mark directory loaded", source))?;
+            self.get_directory_children_on(transaction, parent)
+                .with_context(|| {
+                    format!("read children of directory inode {parent} after creation")
+                })
+        })
     }
 
     /// Transitions active metadata to closed exactly once.
@@ -196,17 +190,13 @@ impl SessionStore {
     pub(super) fn close(&self) -> Result<(), SessionError> {
         let seconds = now_seconds()
             .context("getting current time to set session close time in session state db")?;
-        let mut connection = self.connection("close session")?;
-        let transaction = connection
-            .transaction()
-            .map_err(|source| self.db_error("begin close", source))?;
-        self.ensure_active(&transaction)
-            .context("can't close already closed session")?;
-        transaction.execute("UPDATE session_metadata SET lifecycle = 'closed', closed_at_seconds = ?1 WHERE singleton = 1", [seconds])
-            .map_err(|source| self.db_error("mark session closed", source))?;
-        transaction
-            .commit()
-            .map_err(|source| self.db_error("commit close", source))
+        self.with_transaction("close session", |transaction| {
+            self.ensure_active(transaction)
+                .context("can't close already closed session")?;
+            transaction.execute("UPDATE session_metadata SET lifecycle = 'closed', closed_at_seconds = ?1 WHERE singleton = 1", [seconds])
+                .map_err(|source| self.db_error("mark session closed", source))?;
+            Ok(())
+        })
     }
 
     fn connection(
@@ -216,6 +206,28 @@ impl SessionStore {
         self.connection
             .lock()
             .map_err(|_| internal_error(format!("{operation}: connection lock is poisoned")))
+    }
+
+    /// Runs `body` inside a newly opened transaction and commits its result.
+    ///
+    /// The operation labels lock, begin, and commit failures. The body receives
+    /// the transaction and may return any result value. A body or commit error is
+    /// returned as a session error; a body error rolls the transaction back when
+    /// it is dropped.
+    fn with_transaction<T>(
+        &self,
+        operation: &'static str,
+        body: impl FnOnce(&Transaction<'_>) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        let mut connection = self.connection(operation)?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| self.db_error(format!("begin {operation}"), source))?;
+        let result = body(&transaction).with_context(|| format!("run {operation} transaction"))?;
+        transaction
+            .commit()
+            .map_err(|source| self.db_error(format!("commit {operation}"), source))?;
+        Ok(result)
     }
 
     /// Seeds active session metadata and the unloaded root inode atomically.
@@ -233,22 +245,17 @@ impl SessionStore {
             return Err(internal_error("invalid session identity"));
         }
         let now = now_seconds().context("determine current time for session creation")?;
-        let mut connection = self.connection("initialize database")?;
-        let transaction = connection
-            .transaction()
-            .map_err(|source| self.db_error("begin initialization", source))?;
-        self.insert_session(
-            &transaction,
-            session_id,
-            daemon_pid,
-            root_digest,
-            mountpoint,
-            now,
-        )?;
-        self.insert_root_inode(&transaction, root_digest)?;
-        transaction
-            .commit()
-            .map_err(|source| self.db_error("commit initialization", source))
+        self.with_transaction("initialize database", |transaction| {
+            self.insert_session(
+                transaction,
+                session_id,
+                daemon_pid,
+                root_digest,
+                mountpoint,
+                now,
+            )?;
+            self.insert_root_inode(transaction, root_digest)
+        })
     }
 
     /// Inserts the initial active session metadata row.
@@ -462,7 +469,7 @@ impl SessionStore {
     }
 
     /// Maps a SQLite failure from this store's owned connection to its database path.
-    fn db_error(&self, operation: &'static str, source: rusqlite::Error) -> SessionError {
+    fn db_error(&self, operation: impl Into<String>, source: rusqlite::Error) -> SessionError {
         database_error(operation, &self.database_path, source)
     }
 
@@ -1077,9 +1084,14 @@ fn kind_text(kind: NodeKind) -> &'static str {
         NodeKind::Symlink => "symlink",
     }
 }
-fn database_error(operation: &'static str, path: &Path, source: rusqlite::Error) -> SessionError {
+/// Builds a database error with an owned operation label and stable database path.
+fn database_error(
+    operation: impl Into<String>,
+    path: &Path,
+    source: rusqlite::Error,
+) -> SessionError {
     SessionError::Database {
-        operation,
+        operation: operation.into(),
         dbpath: path.to_path_buf(),
         source,
     }
