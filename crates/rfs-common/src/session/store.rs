@@ -82,20 +82,14 @@ impl SessionStore {
         root_digest: Digest,
         mountpoint: PathBuf,
     ) -> Result<Self, SessionError> {
-        let mut connection = open_database(&database_path, false)?;
+        let connection = open_database(&database_path, false)?;
         prepare_schema(&connection, &database_path)?;
-        initialize_database(
-            &mut connection,
-            &database_path,
-            &session_id,
-            daemon_pid,
-            &root_digest,
-            &mountpoint,
-        )?;
-        Ok(Self {
+        let store = Self {
             database_path,
             connection: Mutex::new(connection),
-        })
+        };
+        store.initialize_database(&session_id, daemon_pid, &root_digest, &mountpoint)?;
+        Ok(store)
     }
 
     /// Reads retained metadata through a separate read-only connection.
@@ -124,33 +118,26 @@ impl SessionStore {
         parent: InodeId,
     ) -> Result<Vec<Inode>, SessionError> {
         let connection = self.connection("list children")?;
-        read_children(&connection, &self.database_path, parent)
+        self.get_directory_children_on(&connection, parent)
     }
 
-    /// Atomically creates an unloaded directory's complete remote child set.
-    pub(super) fn create_directory_children(
+    /// Returns an already-loaded child set or atomically materializes an unloaded one.
+    ///
+    /// Inputs: `parent`, the stored directory inode, and `children`, its complete
+    /// decoded remote child set. Returns stored children in basename order with
+    /// allocated inode IDs. Errors: missing or malformed parents, non-directory
+    /// parents, inconsistent unloaded state, invalid child sets, and SQLite
+    /// failures. A successful materialization inserts all children and marks the
+    /// parent loaded in one transaction.
+    pub(super) fn get_or_create_dir_children(
         &self,
         parent: InodeId,
         children: &[Inode],
     ) -> Result<Vec<Inode>, SessionError> {
-        // TODO: Simplify logic.
-        // Case 1: Directory is loaded, then just return. Nothing to do.
-        // Case 2: Directory is not loaded.
-        //   Case 2a: Directory has children, return internal error as this is
-        //            unexpected. We should be atomically creating children and
-        //            set loaded to true.
-        //   Case 2b: Directory doesn't have children, create them and atomically
-        //            set loaded to true.
-        validate_child_inodes_for_creation(children).with_context(|| {
-            format!(
-                "validating child inodes to be created in directory inode {}",
-                parent
-            )
-        })?;
-        let mut connection = self.connection("create directory children")?;
+        let mut connection = self.connection("get or create directory children")?;
         let transaction = connection
             .transaction()
-            .map_err(|source| db_error("begin child creation", &self.database_path, source))?;
+            .map_err(|source| self.db_error("begin child creation", source))?;
         let parent_inode = self
             .get_inode_by_id(&transaction, parent)
             .with_context(|| format!("read parent inode {parent} to create its children"))?
@@ -161,63 +148,44 @@ impl SessionStore {
             })?;
         ensure_inode_is_dir(&parent_inode)
             .with_context(|| format!("can't create children for non-directory inode {parent}"))?;
+        let stored_children = self
+            .get_directory_children_on(&transaction, parent)
+            .with_context(|| format!("read stored children of directory inode {parent}"))?;
         if parent_inode.directory_loaded == Some(true) {
-            let result =
-                read_children(&transaction, &self.database_path, parent).with_context(|| {
-                    format!("reading child inodes of directory inode {} from db", parent)
-                })?;
-            transaction.commit().map_err(|source| {
-                db_error(
-                    "commit repeated child creation",
-                    &self.database_path,
-                    source,
-                )
-            })?;
-            return Ok(result);
+            transaction
+                .commit()
+                .map_err(|source| self.db_error("commit existing child read", source))?;
+            return Ok(stored_children);
         }
+        if !stored_children.is_empty() {
+            return Err(internal_error(format!(
+                "unloaded directory inode {parent} already has stored children"
+            )));
+        }
+        validate_child_inodes_for_creation(children)
+            .with_context(|| format!("validate children to create in directory inode {parent}"))?;
         for child in children {
-            match self
-                .lookup_child_in_dir_inode(&transaction, parent, &child.name)
-                .with_context(|| format!("read stored child `{}` of inode {parent}", child.name))?
-            {
-                Some(existing) if authoritative_overlay(&existing) => {}
-                Some(existing) if remote_inode_matches(&existing, child) => {}
-                Some(_) => {
-                    return Err(internal_error(format!(
-                        "directory inode {parent} has conflicting child `{}`",
-                        child.name
-                    )));
-                }
-                None => insert_inode(
-                    &transaction,
-                    &self.database_path,
-                    "insert directory child",
-                    &child_for_parent(parent, child),
-                )
-                .with_context(|| {
-                    format!(
-                        "inserting child inode {} in directory inode {} to db",
-                        child.name, parent
-                    )
-                })?,
-            }
+            self.insert_inode(
+                &transaction,
+                "insert directory child",
+                &child_for_parent(parent, child),
+            )
+            .with_context(|| {
+                format!("insert child `{}` in directory inode {parent}", child.name)
+            })?;
         }
         transaction
             .execute(
                 "UPDATE inodes SET directory_loaded = 1 WHERE id = ?1",
                 [parent.sqlite()],
             )
-            .map_err(|source| db_error("mark directory loaded", &self.database_path, source))?;
-        let result =
-            read_children(&transaction, &self.database_path, parent).with_context(|| {
-                format!(
-                    "loading children of directory inode {} after creating children inodes",
-                    parent
-                )
-            })?;
+            .map_err(|source| self.db_error("mark directory loaded", source))?;
+        let result = self
+            .get_directory_children_on(&transaction, parent)
+            .with_context(|| format!("read children of directory inode {parent} after creation"))?;
         transaction
             .commit()
-            .map_err(|source| db_error("commit child creation", &self.database_path, source))?;
+            .map_err(|source| self.db_error("commit child creation", source))?;
         Ok(result)
     }
 
@@ -231,14 +199,14 @@ impl SessionStore {
         let mut connection = self.connection("close session")?;
         let transaction = connection
             .transaction()
-            .map_err(|source| db_error("begin close", &self.database_path, source))?;
+            .map_err(|source| self.db_error("begin close", source))?;
         self.ensure_active(&transaction)
             .context("can't close already closed session")?;
         transaction.execute("UPDATE session_metadata SET lifecycle = 'closed', closed_at_seconds = ?1 WHERE singleton = 1", [seconds])
-            .map_err(|source| db_error("mark session closed", &self.database_path, source))?;
+            .map_err(|source| self.db_error("mark session closed", source))?;
         transaction
             .commit()
-            .map_err(|source| db_error("commit close", &self.database_path, source))
+            .map_err(|source| self.db_error("commit close", source))
     }
 
     fn connection(
@@ -248,6 +216,113 @@ impl SessionStore {
         self.connection
             .lock()
             .map_err(|_| internal_error(format!("{operation}: connection lock is poisoned")))
+    }
+
+    /// Seeds active session metadata and the unloaded root inode atomically.
+    fn initialize_database(
+        &self,
+        session_id: &str,
+        daemon_pid: u32,
+        root_digest: &Digest,
+        mountpoint: &Path,
+    ) -> Result<(), SessionError> {
+        let mountpoint = mountpoint
+            .to_str()
+            .ok_or_else(|| internal_error("mountpoint is not UTF-8"))?;
+        if Uuid::parse_str(session_id).is_err() || daemon_pid == 0 {
+            return Err(internal_error("invalid session identity"));
+        }
+        let now = now_seconds().context("determine current time for session creation")?;
+        let mut connection = self.connection("initialize database")?;
+        let transaction = connection
+            .transaction()
+            .map_err(|source| self.db_error("begin initialization", source))?;
+        self.insert_session(
+            &transaction,
+            session_id,
+            daemon_pid,
+            root_digest,
+            mountpoint,
+            now,
+        )?;
+        self.insert_root_inode(&transaction, root_digest)?;
+        transaction
+            .commit()
+            .map_err(|source| self.db_error("commit initialization", source))
+    }
+
+    /// Inserts the initial active session metadata row.
+    fn insert_session(
+        &self,
+        transaction: &Transaction<'_>,
+        session_id: &str,
+        daemon_pid: u32,
+        root_digest: &Digest,
+        mountpoint: &str,
+        created_at_seconds: i64,
+    ) -> Result<(), SessionError> {
+        transaction
+            .execute(
+                "INSERT INTO session_metadata (
+                    singleton,
+                    session_id,
+                    daemon_pid,
+                    lifecycle,
+                    root_digest_hash,
+                    root_digest_size,
+                    mountpoint,
+                    created_at_seconds,
+                    closed_at_seconds,
+                    log_level,
+                    log_format
+                ) VALUES (
+                    1,
+                    ?1,
+                    ?2,
+                    'active',
+                    ?3,
+                    ?4,
+                    ?5,
+                    ?6,
+                    NULL,
+                    'info',
+                    'text'
+                )",
+                params![
+                    session_id,
+                    i64::from(daemon_pid),
+                    root_digest.hash(),
+                    root_digest.size_bytes(),
+                    mountpoint,
+                    created_at_seconds,
+                ],
+            )
+            .map_err(|source| self.db_error("insert session metadata", source))?;
+        Ok(())
+    }
+
+    /// Constructs and inserts the unloaded remote root inode for a new session.
+    fn insert_root_inode(
+        &self,
+        transaction: &Transaction<'_>,
+        root_digest: &Digest,
+    ) -> Result<(), SessionError> {
+        let root = Inode {
+            id: InodeId::ROOT,
+            parent: None,
+            name: String::new(),
+            kind: NodeKind::Directory,
+            mode: None,
+            mtime: None,
+            tombstone: false,
+            file_remote_digest: None,
+            file_overlay_path: None,
+            file_content_dirty: None,
+            symlink_target: None,
+            directory_remote_digest: Some(root_digest.clone()),
+            directory_loaded: Some(false),
+        };
+        self.insert_inode(transaction, "insert root inode", &root)
     }
 
     /// Fetches one inode row by identity without applying visibility policy.
@@ -270,7 +345,7 @@ impl SessionStore {
                 InodeRow::from_rusqlite_row,
             )
             .optional()
-            .map_err(|source| db_error("get inode by id", &self.database_path, source))?
+            .map_err(|source| self.db_error("get inode by id", source))?
             .map(validate_inode_row)
             .transpose()
             .with_context(|| format!("validate stored inode {inode_id}"))
@@ -298,18 +373,97 @@ impl SessionStore {
                 InodeRow::from_rusqlite_row,
             )
             .optional()
-            .map_err(|source| {
-                db_error(
-                    "lookup child by name in dir inode",
-                    &self.database_path,
-                    source,
-                )
-            })?
+            .map_err(|source| self.db_error("lookup child by name in dir inode", source))?
             .map(validate_inode_row)
             .transpose()
             .with_context(|| {
                 format!("validate stored child `{name}` of directory inode {parent_id}")
             })
+    }
+
+    /// Reads and validates every direct child in basename order on a borrowed connection.
+    fn get_directory_children_on(
+        &self,
+        connection: &Connection,
+        parent: InodeId,
+    ) -> Result<Vec<Inode>, SessionError> {
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {} FROM inodes WHERE parent_id = ?1 ORDER BY name",
+                InodeRow::column_list()
+            ))
+            .map_err(|source| self.db_error("prepare children", source))?;
+        let rows = statement
+            .query_map([parent.sqlite()], InodeRow::from_rusqlite_row)
+            .map_err(|source| self.db_error("list children", source))?;
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| self.db_error("decode child", source))?;
+        rows.into_iter()
+            .map(validate_inode_row)
+            .collect::<Result<Vec<_>, _>>()
+            .with_context(|| format!("validate stored children of directory inode {parent}"))
+    }
+
+    /// Validates and inserts one root or unallocated child inode in a transaction.
+    fn insert_inode(
+        &self,
+        transaction: &Transaction<'_>,
+        operation: &'static str,
+        inode: &Inode,
+    ) -> Result<(), SessionError> {
+        if inode.id != InodeId::ROOT && inode.id != InodeId::INVALID {
+            return Err(internal_error(format!(
+                "insert inode specified id {}, must be root id {} or invalid id {}",
+                inode.id,
+                InodeId::ROOT,
+                InodeId::INVALID
+            )));
+        }
+        validate_inode(inode, false)?;
+        let overlay_path = inode
+            .file_overlay_path
+            .as_ref()
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| internal_error("overlay path is not UTF-8"))
+            })
+            .transpose()?;
+        let query = format!(
+            "INSERT INTO inodes ({}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            InodeRow::column_list()
+        );
+        let id = (inode.id != InodeId::INVALID).then(|| inode.id.sqlite());
+        transaction
+            .execute(
+                &query,
+                params![
+                    id,
+                    inode.parent.map(InodeId::sqlite),
+                    inode.name,
+                    kind_text(inode.kind),
+                    inode.mode.map(i64::from),
+                    inode.mtime.map(NodeTime::seconds),
+                    inode.mtime.map(|time| i64::from(time.nanos())),
+                    i64::from(inode.tombstone),
+                    inode.file_remote_digest.as_ref().map(ToString::to_string),
+                    overlay_path,
+                    inode.file_content_dirty.map(i64::from),
+                    inode.symlink_target,
+                    inode
+                        .directory_remote_digest
+                        .as_ref()
+                        .map(ToString::to_string),
+                    inode.directory_loaded.map(i64::from),
+                ],
+            )
+            .map_err(|source| self.db_error(operation, source))?;
+        Ok(())
+    }
+
+    /// Maps a SQLite failure from this store's owned connection to its database path.
+    fn db_error(&self, operation: &'static str, source: rusqlite::Error) -> SessionError {
+        database_error(operation, &self.database_path, source)
     }
 
     /// Requires the stored session metadata to report the active lifecycle.
@@ -397,67 +551,12 @@ impl InodeRow {
     }
 }
 
-fn initialize_database(
-    connection: &mut Connection,
-    path: &Path,
-    session_id: &str,
-    daemon_pid: u32,
-    root_digest: &Digest,
-    mountpoint: &Path,
-) -> Result<(), SessionError> {
-    let mountpoint = mountpoint
-        .to_str()
-        .ok_or_else(|| internal_error("mountpoint is not UTF-8"))?;
-    if Uuid::parse_str(session_id).is_err() || daemon_pid == 0 {
-        return Err(internal_error("invalid session identity"));
-    }
-    let now = now_seconds()
-        .with_context(|| "unable to determine current time to set session open time".to_string())?;
-    let transaction = connection
-        .transaction()
-        .map_err(|source| db_error("begin initialization", path, source))?;
-    transaction.execute("INSERT INTO session_metadata (singleton, session_id, daemon_pid, lifecycle, root_digest_hash, root_digest_size, mountpoint, created_at_seconds, closed_at_seconds, log_level, log_format) VALUES (1, ?1, ?2, 'active', ?3, ?4, ?5, ?6, NULL, 'info', 'text')", params![session_id, i64::from(daemon_pid), root_digest.hash(), root_digest.size_bytes(), mountpoint, now])
-        .map_err(|source| db_error("insert session metadata", path, source))?;
-    let root = Inode {
-        id: InodeId::ROOT,
-        parent: None,
-        name: String::new(),
-        kind: NodeKind::Directory,
-        mode: None,
-        mtime: None,
-        tombstone: false,
-        file_remote_digest: None,
-        file_overlay_path: None,
-        file_content_dirty: None,
-        symlink_target: None,
-        directory_remote_digest: Some(root_digest.clone()),
-        directory_loaded: Some(false),
-    };
-    insert_inode(&transaction, path, "insert root inode", &root)?;
-    transaction
-        .commit()
-        .map_err(|source| db_error("commit initialization", path, source))
-}
-
+/// Copies an unallocated proposed child and assigns its stored parent.
 fn child_for_parent(parent: InodeId, child: &Inode) -> Inode {
     let mut child = child.clone();
     child.id = InodeId::INVALID;
     child.parent = Some(parent);
     child
-}
-fn authoritative_overlay(inode: &Inode) -> bool {
-    inode.tombstone
-        || inode.file_overlay_path.is_some()
-        || (inode.kind == NodeKind::Directory && inode.directory_remote_digest.is_none())
-}
-fn remote_inode_matches(stored: &Inode, proposed: &Inode) -> bool {
-    stored.kind == proposed.kind
-        && stored.mode == proposed.mode
-        && stored.mtime == proposed.mtime
-        && stored.tombstone == proposed.tombstone
-        && stored.file_remote_digest == proposed.file_remote_digest
-        && stored.symlink_target == proposed.symlink_target
-        && stored.directory_remote_digest == proposed.directory_remote_digest
 }
 
 fn validate_child_inodes_for_creation(children: &[Inode]) -> Result<(), SessionError> {
@@ -751,91 +850,6 @@ fn validate_child_name(name: &str) -> Result<(), SessionError> {
     }
 }
 
-fn insert_inode(
-    transaction: &Transaction<'_>,
-    path: &Path,
-    operation: &'static str,
-    inode: &Inode,
-) -> Result<(), SessionError> {
-    if inode.id != InodeId::ROOT && inode.id != InodeId::INVALID {
-        return Err(internal_error(format!(
-            "insert inode specified id {}, must be either root id {} or set to invalid id {} for auto-assignment of next available inode id",
-            inode.id,
-            InodeId::ROOT,
-            InodeId::INVALID
-        )));
-    }
-    validate_inode(inode, false)?;
-    let overlay_path = inode
-        .file_overlay_path
-        .as_ref()
-        .map(|overlay_path| {
-            overlay_path
-                .to_str()
-                .ok_or_else(|| internal_error("overlay path is not UTF-8"))
-        })
-        .transpose()?;
-    let query = format!(
-        "INSERT INTO inodes ({})
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        InodeRow::column_list()
-    );
-
-    let id = if inode.id == InodeId::INVALID {
-        // Setting id to None / NULL makes Sqlite auto-assign the next id.
-        None
-    } else {
-        Some(inode.id.sqlite())
-    };
-
-    let params = params![
-        id,
-        inode.parent.map(InodeId::sqlite),
-        inode.name,
-        kind_text(inode.kind),
-        inode.mode.map(i64::from),
-        inode.mtime.map(NodeTime::seconds),
-        inode.mtime.map(|time| i64::from(time.nanos())),
-        i64::from(inode.tombstone),
-        inode.file_remote_digest.as_ref().map(ToString::to_string),
-        overlay_path,
-        inode.file_content_dirty.map(i64::from),
-        inode.symlink_target,
-        inode
-            .directory_remote_digest
-            .as_ref()
-            .map(ToString::to_string),
-        inode.directory_loaded.map(i64::from)
-    ];
-    transaction
-        .execute(&query, params)
-        .map_err(|source| db_error(operation, path, source))?;
-    Ok(())
-}
-
-fn read_children(
-    connection: &Connection,
-    path: &Path,
-    parent: InodeId,
-) -> Result<Vec<Inode>, SessionError> {
-    let mut statement = connection
-        .prepare(&format!(
-            "SELECT {} FROM inodes WHERE parent_id = ?1 ORDER BY name",
-            InodeRow::column_list()
-        ))
-        .map_err(|source| db_error("prepare children", path, source))?;
-    let rows = statement
-        .query_map([parent.sqlite()], InodeRow::from_rusqlite_row)
-        .map_err(|source| db_error("list children", path, source))?;
-    let rows = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| db_error("decode child", path, source))?;
-    rows.into_iter()
-        .map(validate_inode_row)
-        .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("validate stored children of directory inode {parent}"))
-}
-
 /// Unvalidated session metadata decoded from the single `session_metadata` row.
 ///
 /// Field order in [`Self::from_rusqlite_row`] must match [`Self::column_list`].
@@ -921,7 +935,7 @@ fn read_stored_session(
             SessionMetadataRow::from_rusqlite_row,
         )
         .optional()
-        .map_err(|source| db_error("read session metadata", path, source))?
+        .map_err(|source| database_error("read session metadata", path, source))?
         .ok_or_else(|| {
             failed_precondition(
                 "db session is missing session metadata; either it wasn't seeded during session \
@@ -1012,17 +1026,17 @@ fn open_database(path: &Path, read_only: bool) -> Result<Connection, SessionErro
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
     };
     let connection = Connection::open_with_flags(path, flags)
-        .map_err(|source| db_error("open connection", path, source))?;
+        .map_err(|source| database_error("open connection", path, source))?;
     connection
         .busy_timeout(Duration::from_secs(2))
-        .map_err(|source| db_error("set busy timeout", path, source))?;
+        .map_err(|source| database_error("set busy timeout", path, source))?;
     if !read_only {
         connection
             .pragma_update(None, "journal_mode", "DELETE")
-            .map_err(|source| db_error("set journal mode", path, source))?;
+            .map_err(|source| database_error("set journal mode", path, source))?;
         connection
             .pragma_update(None, "foreign_keys", true)
-            .map_err(|source| db_error("enable foreign keys", path, source))?;
+            .map_err(|source| database_error("enable foreign keys", path, source))?;
     }
     Ok(connection)
 }
@@ -1033,18 +1047,18 @@ fn prepare_schema(connection: &Connection, path: &Path) -> Result<(), SessionErr
     }
     connection
         .execute_batch(SCHEMA_SQL)
-        .map_err(|source| db_error("create schema", path, source))?;
+        .map_err(|source| database_error("create schema", path, source))?;
     if version == 0 {
         connection
             .pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|source| db_error("record schema version", path, source))?;
+            .map_err(|source| database_error("record schema version", path, source))?;
     }
     Ok(())
 }
 fn schema_version(connection: &Connection, path: &Path) -> Result<i64, SessionError> {
     connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|source| db_error("read schema version", path, source))
+        .map_err(|source| database_error("read schema version", path, source))
 }
 fn validate_schema_version(connection: &Connection, path: &Path) -> Result<(), SessionError> {
     let version = schema_version(connection, path)?;
@@ -1063,7 +1077,7 @@ fn kind_text(kind: NodeKind) -> &'static str {
         NodeKind::Symlink => "symlink",
     }
 }
-fn db_error(operation: &'static str, path: &Path, source: rusqlite::Error) -> SessionError {
+fn database_error(operation: &'static str, path: &Path, source: rusqlite::Error) -> SessionError {
     SessionError::Database {
         operation,
         dbpath: path.to_path_buf(),
@@ -1160,6 +1174,80 @@ mod tests {
         }
     }
 
+    /// Returns an unsorted complete remote child fixture covering every node kind.
+    fn remote_children() -> Vec<Inode> {
+        let mut file = remote_file("b-file", Digest::for_bytes(b"file"));
+        file.mode = Some(0o640);
+        file.mtime = NodeTime::new(-1, 42);
+        vec![
+            file,
+            remote_symlink("c-link", "target"),
+            remote_directory("a-directory", Digest::for_bytes(b"directory")),
+        ]
+    }
+
+    /// Seeds children directly so tests can construct loaded and inconsistent states.
+    fn seed_directory_state(
+        store: &SessionStore,
+        directory: InodeId,
+        loaded: bool,
+        children: &[Inode],
+    ) -> Vec<Inode> {
+        let mut connection = store.connection.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for child in children {
+            store
+                .insert_inode(
+                    &transaction,
+                    "seed directory child",
+                    &child_for_parent(directory, child),
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "UPDATE inodes SET directory_loaded = ?1 WHERE id = ?2",
+                params![i64::from(loaded), directory.sqlite()],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        store.get_directory_children(directory).unwrap()
+    }
+
+    /// Verifies proposed children were stored losslessly with allocated identities.
+    fn assert_created_children(parent: InodeId, proposed: &[Inode], actual: &[Inode]) {
+        let mut expected = proposed.to_vec();
+        expected.sort_by(|left, right| left.name.cmp(&right.name));
+        assert_eq!(expected.len(), actual.len());
+        let mut ids = HashSet::new();
+        for (mut expected, actual) in expected.into_iter().zip(actual) {
+            assert_ne!(actual.id, InodeId::INVALID);
+            assert_ne!(actual.id, InodeId::ROOT);
+            assert!(ids.insert(actual.id));
+            expected.id = actual.id;
+            expected.parent = Some(parent);
+            assert_eq!(expected, *actual);
+        }
+    }
+
+    /// Verifies the exact persisted loaded flag and complete child vector.
+    fn assert_directory_state(
+        store: &SessionStore,
+        directory: InodeId,
+        loaded: bool,
+        expected_children: &[Inode],
+    ) {
+        assert_eq!(
+            store.inode(directory).unwrap().unwrap().directory_loaded,
+            Some(loaded)
+        );
+        assert_eq!(
+            store.get_directory_children(directory).unwrap(),
+            expected_children
+        );
+    }
+
     /// A new store exposes an unloaded remote root and retained active metadata.
     #[test]
     fn create_persists_unloaded_root() {
@@ -1175,35 +1263,19 @@ mod tests {
         assert_eq!(retained.state, SessionLifecycle::Active);
     }
 
-    /// Lossless child reads retain nullable metadata, include every node kind,
-    /// and return rows sorted by basename.
+    /// An unloaded directory atomically stores its complete lossless remote child set.
     #[test]
-    fn child_and_children_are_lossless_and_sorted() {
+    fn get_or_create_dir_children_materializes_unloaded_directory() {
         init_test();
         let (_directory, store, _) = store();
-        let mut file = remote_file("b-file", Digest::for_bytes(b"file"));
-        file.mode = Some(0o640);
-        file.mtime = NodeTime::new(-1, 42);
-        let directory = remote_directory("a-directory", Digest::for_bytes(b"directory"));
-        let symlink = remote_symlink("c-link", "target");
+        let proposed = remote_children();
 
-        let children = store
-            .create_directory_children(InodeId::ROOT, &[file, directory, symlink])
+        let actual = store
+            .get_or_create_dir_children(InodeId::ROOT, &proposed)
             .unwrap();
-        let file = store.child(InodeId::ROOT, "b-file").unwrap().unwrap();
 
-        assert_eq!(
-            children
-                .iter()
-                .map(|child| child.name.as_str())
-                .collect::<Vec<_>>(),
-            ["a-directory", "b-file", "c-link"]
-        );
-        assert_eq!(file.mode, Some(0o640));
-        assert_eq!(file.mtime, NodeTime::new(-1, 42));
-        assert_eq!(file.file_remote_digest, Some(Digest::for_bytes(b"file")));
-        assert_eq!(children[0].directory_loaded, Some(false));
-        assert_eq!(children[2].symlink_target.as_deref(), Some("target"));
+        assert_created_children(InodeId::ROOT, &proposed, &actual);
+        assert_directory_state(&store, InodeId::ROOT, true, &actual);
     }
 
     /// Directly corrupts stored root values to verify that raw SQLite decoding
@@ -1246,142 +1318,191 @@ mod tests {
         }
     }
 
-    /// Empty and repeated loads persist one complete child set and stable allocated identities.
+    /// An empty remote directory becomes distinguishably loaded with no children.
     #[test]
-    fn directory_child_creation_handles_empty_and_repeated_loads() {
+    fn get_or_create_dir_children_materializes_empty_directory() {
         init_test();
         let (_directory, store, _) = store();
-        let first = store
-            .create_directory_children(
-                InodeId::ROOT,
-                &[remote_directory(
-                    "empty",
-                    Digest::for_bytes(b"empty directory"),
-                )],
-            )
-            .unwrap();
-        let second = store.create_directory_children(InodeId::ROOT, &[]).unwrap();
 
-        let empty = first[0].id;
-        assert_eq!(first, second);
-        assert_ne!(first[0].id, InodeId::ROOT);
         assert!(
             store
-                .create_directory_children(empty, &[])
+                .get_or_create_dir_children(InodeId::ROOT, &[])
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(
-            store.inode(empty).unwrap().unwrap().directory_loaded,
-            Some(true)
-        );
-        assert_eq!(
-            store
-                .inode(InodeId::ROOT)
-                .unwrap()
-                .unwrap()
-                .directory_loaded,
-            Some(true)
-        );
+        assert_directory_state(&store, InodeId::ROOT, true, &[]);
     }
 
-    /// Concurrent callers observe the first complete remote child set without allocating another identity.
+    /// A loaded directory ignores a different proposed child set and retains its identities.
     #[test]
-    fn concurrent_directory_child_creation_reuses_allocations() {
+    fn get_or_create_dir_children_returns_existing_when_already_loaded() {
         init_test();
         let (_directory, store, _) = store();
+        let existing = seed_directory_state(&store, InodeId::ROOT, true, &remote_children());
+        let mut invalid_proposal = remote_file("ignored", Digest::for_bytes(b"ignored"));
+        invalid_proposal.id = InodeId::ROOT;
+
+        let actual = store
+            .get_or_create_dir_children(InodeId::ROOT, &[invalid_proposal])
+            .unwrap();
+
+        assert_eq!(actual, existing);
+        assert_directory_state(&store, InodeId::ROOT, true, &existing);
+    }
+
+    /// Concurrent updates accept one complete proposed set without mixing or corruption.
+    #[test]
+    fn concurrent_directory_child_creation_succeeds() {
+        init_test();
+        let (_directory, store, _) = store();
+        let first_proposed = remote_children();
+        let second_proposed = vec![remote_file("other-file", Digest::for_bytes(b"other-file"))];
         let store = Arc::new(store);
         let first_store = Arc::clone(&store);
         let second_store = Arc::clone(&store);
+        let first_children = first_proposed.clone();
+        let second_children = second_proposed.clone();
         let first = std::thread::spawn(move || {
-            first_store.create_directory_children(
-                InodeId::ROOT,
-                &[remote_file("entry", Digest::for_bytes(b"entry"))],
-            )
+            first_store.get_or_create_dir_children(InodeId::ROOT, &first_children)
         });
         let second = std::thread::spawn(move || {
-            second_store.create_directory_children(
-                InodeId::ROOT,
-                &[remote_file("entry", Digest::for_bytes(b"entry"))],
-            )
+            second_store.get_or_create_dir_children(InodeId::ROOT, &second_children)
         });
 
-        assert_eq!(
-            first.join().unwrap().unwrap(),
-            second.join().unwrap().unwrap()
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(first, second);
+        let accepted = if first.len() == first_proposed.len() {
+            &first_proposed
+        } else {
+            &second_proposed
+        };
+        assert_created_children(InodeId::ROOT, accepted, &first);
+        assert_directory_state(&store, InodeId::ROOT, true, &first);
+    }
+
+    /// An unloaded directory with children is rejected without repairing inconsistent state.
+    #[test]
+    fn get_or_create_dir_children_rejects_unloaded_directory_with_children() {
+        init_test();
+        let (_directory, store, _) = store();
+        let existing = seed_directory_state(&store, InodeId::ROOT, false, &remote_children());
+
+        let error = store
+            .get_or_create_dir_children(InodeId::ROOT, &[])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("already has stored children"));
+        assert_directory_state(&store, InodeId::ROOT, false, &existing);
+    }
+
+    /// Missing and non-directory parents retain their distinct domain errors.
+    #[test]
+    fn get_or_create_dir_children_rejects_invalid_parent() {
+        init_test();
+        let (_directory, store, _) = store();
+        let file = seed_directory_state(
+            &store,
+            InodeId::ROOT,
+            true,
+            &[remote_file("file", Digest::for_bytes(b"file"))],
+        )[0]
+        .id;
+
+        assert!(matches!(
+            store
+                .get_or_create_dir_children(InodeId::INVALID, &[])
+                .unwrap_err(),
+            SessionError::InternalError { .. } | SessionError::Context { .. }
+        ));
+        assert!(
+            store
+                .get_or_create_dir_children(file, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("not a directory")
         );
     }
 
-    /// Child creation rejects a supplied inode identity before its write transaction.
+    /// A directory with a NULL loaded flag is rejected as malformed stored data.
     #[test]
-    fn supplied_child_inode_is_rejected_without_changes() {
+    fn get_or_create_dir_children_rejects_parent_without_loaded_flag() {
         init_test();
         let (_directory, store, _) = store();
-        let mut child = remote_file("entry", Digest::for_bytes(b"entry"));
-        child.id = InodeId::ROOT;
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE inodes SET directory_loaded = NULL WHERE id = ?1",
+                [InodeId::ROOT.sqlite()],
+            )
+            .unwrap();
 
-        assert!(
-            store
-                .create_directory_children(InodeId::ROOT, &[child])
-                .is_err()
-        );
+        let error = store
+            .get_or_create_dir_children(InodeId::ROOT, &[])
+            .unwrap_err();
+        assert!(error.to_string().contains("root inode shape is invalid"));
         assert!(
             store
                 .get_directory_children(InodeId::ROOT)
                 .unwrap()
                 .is_empty()
-        );
-        assert_eq!(
-            store
-                .inode(InodeId::ROOT)
-                .unwrap()
-                .unwrap()
-                .directory_loaded,
-            Some(false)
         );
     }
 
-    /// Invalid kind fields and duplicate names fail before a transaction can expose partial children.
+    /// Every invalid child set fails before any prefix or loaded flag is committed.
     #[test]
-    fn invalid_children_do_not_partially_commit() {
+    fn get_or_create_dir_children_rejects_invalid_child_sets_atomically() {
         init_test();
-        let (_directory, store, _) = store();
-        let invalid = remote_file("duplicate", Digest::for_bytes(b"first"));
-        let duplicate = remote_file("duplicate", Digest::for_bytes(b"second"));
+        let mut supplied_id = remote_file("id", Digest::for_bytes(b"id"));
+        supplied_id.id = InodeId::ROOT;
+        let mut supplied_parent = remote_file("parent", Digest::for_bytes(b"parent"));
+        supplied_parent.parent = Some(InodeId::ROOT);
+        let mut invalid_mode = remote_file("mode", Digest::for_bytes(b"mode"));
+        invalid_mode.mode = Some(0o100000);
+        let mut wrong_fields = remote_file("fields", Digest::for_bytes(b"fields"));
+        wrong_fields.symlink_target = Some("target".to_owned());
+        let mut tombstone = remote_file("tombstone", Digest::for_bytes(b"tombstone"));
+        tombstone.tombstone = true;
+        let mut overlay = remote_file("overlay", Digest::for_bytes(b"overlay"));
+        overlay.file_overlay_path = Some(PathBuf::from("overlay"));
+        let mut dirty = remote_file("dirty", Digest::for_bytes(b"dirty"));
+        dirty.file_content_dirty = Some(true);
+        let mut no_file_digest = remote_file("file-digest", Digest::for_bytes(b"digest"));
+        no_file_digest.file_remote_digest = None;
+        let mut no_dir_digest = remote_directory("dir-digest", Digest::for_bytes(b"digest"));
+        no_dir_digest.directory_remote_digest = None;
+        let mut loaded_dir = remote_directory("loaded", Digest::for_bytes(b"loaded"));
+        loaded_dir.directory_loaded = Some(true);
+        let duplicate = remote_file("duplicate", Digest::for_bytes(b"one"));
+        let cases = vec![
+            vec![supplied_id],
+            vec![supplied_parent],
+            vec![remote_file("", Digest::for_bytes(b"empty"))],
+            vec![remote_file(".", Digest::for_bytes(b"dot"))],
+            vec![remote_file("..", Digest::for_bytes(b"dotdot"))],
+            vec![remote_file("a/b", Digest::for_bytes(b"slash"))],
+            vec![duplicate.clone(), duplicate],
+            vec![invalid_mode],
+            vec![wrong_fields],
+            vec![tombstone],
+            vec![overlay],
+            vec![dirty],
+            vec![no_file_digest],
+            vec![no_dir_digest],
+            vec![loaded_dir],
+        ];
 
-        assert!(
-            store
-                .create_directory_children(InodeId::ROOT, &[invalid, duplicate])
-                .is_err()
-        );
-        assert!(
-            store
-                .get_directory_children(InodeId::ROOT)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            store
-                .inode(InodeId::ROOT)
-                .unwrap()
-                .unwrap()
-                .directory_loaded,
-            Some(false)
-        );
-
-        let mut invalid_kind = remote_file("invalid", Digest::for_bytes(b"invalid"));
-        invalid_kind.directory_loaded = Some(false);
-        assert!(
-            store
-                .create_directory_children(InodeId::ROOT, &[invalid_kind])
-                .is_err()
-        );
-        assert!(
-            store
-                .get_directory_children(InodeId::ROOT)
-                .unwrap()
-                .is_empty()
-        );
+        for children in cases {
+            let (_directory, store, _) = store();
+            assert!(
+                store
+                    .get_or_create_dir_children(InodeId::ROOT, &children)
+                    .is_err()
+            );
+            assert_directory_state(&store, InodeId::ROOT, false, &[]);
+        }
     }
 
     /// Closing changes lifecycle once and retained inspection exposes the completed transition.

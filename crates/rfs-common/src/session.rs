@@ -494,7 +494,7 @@ impl Session {
             internal_error(format!("decode directory blob {digest}: {source}"))
         })?;
         let children = decoded_directory_children(decoded)?;
-        self.store.create_directory_children(inode, &children)?;
+        self.store.get_or_create_dir_children(inode, &children)?;
         self.record_directory_read(downloaded);
         Ok(())
     }

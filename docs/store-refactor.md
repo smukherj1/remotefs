@@ -11,45 +11,23 @@ file is named.
 
 ---
 
-## P4 — `create_directory_children` mixes five responsibilities
+## P4 — Directory child materialization is now one explicit atomic workflow
 
-**Location:** `store.rs:131-222`.
+**Status:** Resolved by `get_or_create_dir_children`.
 
-**Problem.** One method performs: input validation, transaction setup, parent
-existence/kind checks, idempotent already-loaded short-circuit, per-child
-reconciliation (the classification match at 178-203 with side effects in the
-loop body), marking loaded, and read-back + commit. At ~91 lines with a
-three-level nest (method → loop → match arms), it exceeds the guideline
-thresholds ("functions over about 40 non-blank lines, nesting beyond two
-control-flow levels"). Additionally, the read-back-and-commit tail appears
-twice (164-176 for the repeated-load branch and 211-221 for the normal path),
-differing only in the commit label. A code comment (`// TODO: Simplify logic.`)
-acknowledges this.
-
-**Impact.** The reconciliation policy — the actual domain rule this method
-exists to enforce — is buried under plumbing; the duplicated tail invites
-edits to one copy only.
-
-**Proposal.**
-
-1. Extract `reconcile_remote_children(tx, path, parent, children) -> Result<(), _>`
-   containing the per-child loop; keep classification in the match arms but route
-   insertion through `insert_inode` (loop body then dispatches via domain-result
-   functions, per guidelines).
-2. Restructure so there is one common tail: reconcile conditionally, mark
-   loaded only when rows were inserted, then a single
-   read-children/commit/return sequence.
-3. Optionally fold `Some(existing) if authoritative_overlay(..)` and
-   `Some(existing) if remote_inode_matches(..)` into one
-   `stored_entry_accepts(stored, proposed) -> bool` arm with a comment naming
-   the rule (see P8).
+The store now reads the parent and its current children in one transaction. A
+loaded parent returns its committed child set without validating irrelevant
+input. An unloaded parent must have no rows; otherwise the operation returns an
+internal invariant error without mutation. Only a consistent unloaded parent
+validates and inserts the complete remote child set before setting the loaded
+flag. The parent and children are then read back and validated before commit.
+Per-child reconciliation and its duplicated commit/read tails were removed.
 
 ---
 
 ## P5 — Transaction begin/commit boilerplate repeated at every write site
 
-**Location:** `create_directory_children` (150-153, 169-175, 218-220),
-`close` (231-234, 239-241), `initialize_database` (416-418, 437-439).
+**Location:** `get_or_create_dir_children`, `close`, and `initialize_database`.
 
 **Problem.** Every write repeats the same four-step dance: lock connection,
 `transaction()` with a mapped begin error, work, `commit()` with a mapped
@@ -127,39 +105,15 @@ important, decode by column name or add a projection-order regression test.
 
 ---
 
-## P8 — The "remote entry" rule is encoded three times under unrelated names
+## P8 — Remote child creation no longer shares reconciliation predicates
 
-**Location:** `authoritative_overlay` (`store.rs:448-452`),
-`remote_inode_matches` (`store.rs:453-461`), and the compound boolean in
-`validate_child_inodes_for_creation` (`store.rs:488-502`).
+**Location:** `validate_child_inodes_for_creation`; the former
+`authoritative_overlay` and `remote_inode_matches` helpers were removed.
 
-**Status & Problem.**
-
-- **Progress made:** The `directory_materializations` table has been removed;
-  directory state is now held directly on `Inode` (`directory_remote_digest` and
-  `directory_loaded`). `validate_directory_children` was renamed to
-  `validate_child_inodes_for_creation`.
-- **Remaining issue:** All three locations still encode aspects of one domain
-  rule — _which entries are pure remote-backed rows and when a stored row wins
-  over a proposed remote row_:
-  - `authoritative_overlay` returns true for tombstones, overlay files, and
-    unloaded local directories, but has no doc comment explaining the rule.
-  - `validate_child_inodes_for_creation` (488-502) mixes `||`/`&&`/`matches!`
-    across several lines; a `TODO` at line 488 notes that these combined checks
-    need clearer separation.
-  - `remote_inode_matches` compares stored vs. proposed but omits
-    `file_content_dirty` and parent/name — correct, but undocumented.
-
-**Impact.** A change to what counts as a remote entry must be mirrored in three
-places.
-
-**Proposal.** Define one documented predicate, e.g. `fn is_remote_entry(inode:
-&Inode) -> bool` (tombstone-free, no overlay, clean content, files carry a
-digest, directories carry digest + `loaded == Some(false)`) and use it in both
-validation and reconciliation; rename `authoritative_overlay` to something
-accurate like `stored_entry_is_authoritative` with a doc comment stating the
-rule; add a comment to `remote_inode_matches` listing why dirty-state and
-identity fields are intentionally not compared.
+**Status:** Partially resolved. `authoritative_overlay` and
+`remote_inode_matches` were removed with reconciliation. The remaining remote
+input checks exist only in `validate_child_inodes_for_creation`; separating its
+combined conditions and error messages remains useful follow-up work under P6.
 
 ---
 
@@ -183,7 +137,7 @@ identity fields are intentionally not compared.
 sentinel checks.
 
 **Proposal.** Introduce a `ProposedInode` input type (same fields minus `id`,
-with `parent` set by the store helper) used by `create_directory_children` and
+with `parent` set by the store helper) used by `get_or_create_dir_children` and
 `insert_inode`; keep `Inode` strictly for stored, numbered rows.
 
 ---
@@ -195,20 +149,19 @@ with `parent` set by the store helper) used by `create_directory_children` and
 **Status & Problem.**
 
 - **Progress made:** Public `SessionStore` methods (`create`, `inspect`, `inode`,
-  `child`, `get_directory_children`, `create_directory_children`, `close`) and
+  `child`, `get_directory_children`, `get_or_create_dir_children`, `close`) and
   key private helpers (`InodeRow`, `validate_inode_row`, its scalar validation
   helpers, `SessionMetadataRow`, `read_stored_session`, `validate_session`,
   `get_inode_by_id`, `lookup_child_in_dir_inode`, `ensure_inode_is_dir`, and
   `ensure_active`) now have guideline-compliant doc comments.
 - **Remaining undocumented items:**
   - Constants: `SCHEMA_VERSION` (19), `SCHEMA_SQL` (20)
-  - Private helpers: `connection` (244), `initialize_database` (400),
-    `child_for_parent` (442), `authoritative_overlay` (448),
-    `remote_inode_matches` (453), `validate_child_inodes_for_creation` (463),
+  - Private helpers: `connection`, `validate_child_inodes_for_creation`,
     `validate_inode` (636), `validate_stored_identity` (715),
-    `validate_child_name` (746), `insert_inode` (754), `read_children` (816),
+    `validate_child_name`,
     `open_database` (1008), `prepare_schema` (1029), `schema_version` (1044),
-    `validate_schema_version` (1049), `kind_text` (1059), `db_error` (1066).
+    `validate_schema_version` (1049), `kind_text` (1059), and the standalone
+    `database_error` helper.
 - Specific wording fix: `now_seconds` doc comment still says "for session
   metadata" even though it is also used by `close()`.
 
@@ -219,12 +172,9 @@ constants.
 
 ## P11 — Minor style and structure nits
 
-1. **Missing blank lines between items** at 447/448 (`child_for_parent` /
-   `authoritative_overlay`), 452/453 (`authoritative_overlay` / `remote_inode_matches`),
-   1028/1029 (`open_database` / `prepare_schema`), 1043/1044 (`prepare_schema` /
-   `schema_version`), 1048/1049 (`schema_version` / `validate_schema_version`),
-   1058/1059 (`validate_schema_version` / `kind_text`), 1065/1066 (`kind_text` /
-   `db_error`).
+1. **Missing blank lines between items** remain among the standalone database,
+   schema-version, kind-text, and database-error helpers near the end of the
+   production section.
 2. **`SessionStore::create` takes five loose scalars** (78-84): two `PathBuf`s,
    a `String`, a `u32`, and a `Digest` invite transposition at the call site.
    Group identity inputs into a seed struct.
@@ -237,10 +187,9 @@ constants.
 5. **Test builders triplicated** (1106-1161): `remote_file`, `remote_directory`,
    `remote_symlink` share ten identical fields; a `base_proposed(name, kind)`
    helper would shrink them.
-6. **Per-call `format!` SQL** in `get_inode_by_id` (265),
-   `lookup_child_in_dir_inode` (293), `insert_inode` (778), `read_children`
-   (822), and `read_stored_session` (915): hoist to constants or statement
-   builders.
+6. **Per-call `format!` SQL** remains in `get_inode_by_id`,
+   `lookup_child_in_dir_inode`, `insert_inode`, `get_directory_children_on`, and
+   `read_stored_session`: hoist to constants or statement builders.
 
 ---
 
