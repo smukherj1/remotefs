@@ -11,36 +11,6 @@ file is named.
 
 ---
 
-## P6 — `validate_inode`: boolean flag parameter and opaque field grouping
-
-**Location:** `store.rs:636-713`; callers pass literal `true` at `store.rs:571`
-(`validate_inode_row`) and `false` at `store.rs:487`
-(`validate_child_inodes_for_creation`) and `store.rs:768` (`insert_inode`).
-
-**Problem.**
-
-- The `is_stored: bool` parameter hides control flow: callers pass opposite
-  values and readers must trace which branches depend on it.
-- The `file_values` tuple (`648-652`) replaces readable field names with
-  `.0/.1/.2` indexing purely to reuse the tuple across three match arms; direct
-  field access would be clearer and no longer.
-- The three kind branches repeat exclusion checks (e.g., every non-symlink kind
-  rejects `symlink_target.is_some()`), producing long `||` chains that are hard
-  to verify against the schema's nullability rules.
-
-At ~79 lines this also trips the length guideline.
-
-**Impact.** The kind/field matrix is the store's central invariant; its current
-shape resists verification and makes adding a node kind error-prone.
-
-**Proposal.** Split into `validate_stored_inode` and `validate_proposed_inode`,
-each delegating to small per-kind predicates (`validate_file_fields`,
-`validate_symlink_fields`, `validate_directory_fields`) that take `&Inode` and
-check exactly their kind's nullability/exclusivity rules. Drop the
-`file_values` tuple.
-
----
-
 ## P7 — Positional inode row decoding is now localized
 
 **Location:** `InodeRow` (`store.rs:334-398`), `validate_inode_row`

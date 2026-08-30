@@ -107,7 +107,12 @@ impl SessionStore {
 
     /// Fetches one named child row without applying visibility policy.
     pub(super) fn child(&self, parent: InodeId, name: &str) -> Result<Option<Inode>, SessionError> {
-        validate_child_name(name)?;
+        validate_inode_name(name).with_context(|| {
+            format!(
+                "invalid name {} given to lookup in parent inode {}",
+                name, parent
+            )
+        })?;
         let connection = self.connection("create sql db connection to read child")?;
         self.lookup_child_in_dir_inode(&connection, parent, name)
     }
@@ -427,7 +432,8 @@ impl SessionStore {
                 InodeId::INVALID
             )));
         }
-        validate_inode(inode, false)?;
+        validate_inode_for_create(inode)
+            .with_context(|| "inode failed validation for insertion".to_owned())?;
         let overlay_path = inode
             .file_overlay_path
             .as_ref()
@@ -583,14 +589,14 @@ fn validate_child_inodes_for_creation(children: &[Inode]) -> Result<(), SessionE
                 child.name
             )));
         }
-        validate_child_name(&child.name)?;
+        validate_inode_name(&child.name)?;
         if !names.insert(child.name.as_str()) {
             return Err(internal_error(format!(
                 "duplicate child name `{}`",
                 child.name
             )));
         }
-        validate_inode(child, false)?;
+        validate_inode_for_create(child)?;
         // TODO: Lots of different checks combined into one here that need distinct error
         // messages.
         if child.tombstone
@@ -674,7 +680,7 @@ fn validate_inode_row(row: InodeRow) -> Result<Inode, SessionError> {
             .transpose()
             .with_context(|| format!("validate loaded state of stored inode {inode}"))?,
     };
-    validate_inode(&result, true).with_context(|| format!("validate stored inode {inode}"))?;
+    validate_inode(&result).with_context(|| format!("validate stored inode {inode}"))?;
     Ok(result)
 }
 
@@ -739,7 +745,23 @@ fn validate_stored_digest(
         .transpose()
 }
 
-fn validate_inode(inode: &Inode, is_stored: bool) -> Result<(), SessionError> {
+/// Validates an inode.
+///
+/// Inputs: `inode` with an allocated identity. Returns `Ok(())` when its
+/// identity, mode, and kind-specific fields are valid. Errors: invalid stored
+/// identity or invalid fields for the inode kind.
+fn validate_inode(inode: &Inode) -> Result<(), SessionError> {
+    validate_inode_basics(inode)?;
+    validate_inode_for_create(inode)
+}
+
+/// Validates a new inode that's being created and doesn't have an allocated
+/// id yet.
+///
+/// Inputs: `inode` created for insertion. Returns `Ok(())` when its mode and
+/// kind-specific fields are valid. Errors: an unsupported mode or fields that
+/// violate the inode kind's nullability and exclusivity rules.
+fn validate_inode_for_create(inode: &Inode) -> Result<(), SessionError> {
     if let Some(mode) = inode.mode
         && mode > 0o7777
     {
@@ -748,90 +770,112 @@ fn validate_inode(inode: &Inode, is_stored: bool) -> Result<(), SessionError> {
             inode.name
         )));
     }
-    if is_stored {
-        validate_stored_identity(inode)?;
-    }
-    let file_values = (
-        &inode.file_remote_digest,
-        &inode.file_overlay_path,
-        inode.file_content_dirty,
-    );
     match inode.kind {
-        NodeKind::File => {
-            if inode.symlink_target.is_some()
-                || inode.directory_remote_digest.is_some()
-                || inode.directory_loaded.is_some()
-                || inode.file_content_dirty.is_none()
-            {
-                return Err(internal_error(format!(
-                    "file inode `{}` has invalid fields",
-                    inode.name
-                )));
-            }
-            if let Some(overlay_path) = &inode.file_overlay_path
-                && (overlay_path.as_os_str().is_empty()
-                    || overlay_path.is_absolute()
-                    || overlay_path
-                        .components()
-                        .any(|component| matches!(component, std::path::Component::ParentDir)))
-            {
-                return Err(internal_error(format!(
-                    "file inode `{}` has an invalid overlay path",
-                    inode.name
-                )));
-            }
-        }
-        NodeKind::Symlink => {
-            if inode.symlink_target.is_none()
-                || file_values.0.is_some()
-                || file_values.1.is_some()
-                || file_values.2.is_some()
-                || inode.directory_remote_digest.is_some()
-                || inode.directory_loaded.is_some()
-            {
-                return Err(internal_error(format!(
-                    "symlink inode `{}` has invalid fields",
-                    inode.name
-                )));
-            }
-        }
-        NodeKind::Directory => {
-            if file_values.0.is_some()
-                || file_values.1.is_some()
-                || file_values.2.is_some()
-                || inode.symlink_target.is_some()
-                || inode.directory_loaded.is_none()
-            {
-                return Err(internal_error(format!(
-                    "directory inode `{}` has invalid fields",
-                    inode.name
-                )));
-            }
-            if inode.directory_remote_digest.is_none() && inode.directory_loaded != Some(true) {
-                return Err(internal_error(format!(
-                    "local directory inode `{}` is not loaded",
-                    inode.name
-                )));
-            }
-        }
+        NodeKind::File => validate_file_fields(inode),
+        NodeKind::Symlink => validate_symlink_fields(inode),
+        NodeKind::Directory => validate_directory_fields(inode),
+    }
+}
+
+/// Validates the field combination and overlay path of a file inode.
+fn validate_file_fields(inode: &Inode) -> Result<(), SessionError> {
+    if inode.symlink_target.is_some()
+        || inode.directory_remote_digest.is_some()
+        || inode.directory_loaded.is_some()
+        || inode.file_content_dirty.is_none()
+    {
+        return Err(internal_error(format!(
+            "file inode `{}` has invalid fields",
+            inode.name
+        )));
+    }
+    if let Some(overlay_path) = &inode.file_overlay_path
+        && (overlay_path.as_os_str().is_empty()
+            || overlay_path.is_absolute()
+            || overlay_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)))
+    {
+        return Err(internal_error(format!(
+            "file inode `{}` has an invalid overlay path",
+            inode.name
+        )));
     }
     Ok(())
 }
 
-fn validate_stored_identity(inode: &Inode) -> Result<(), SessionError> {
-    let identity = inode.id;
-    match (identity, inode.parent) {
-        (InodeId::ROOT, None)
-            if inode.name.is_empty()
-                && inode.kind == NodeKind::Directory
-                && inode.directory_remote_digest.is_some()
-                && inode.directory_loaded.is_some() =>
-        {
+/// Validates that a symbolic-link inode has only a target and common fields.
+fn validate_symlink_fields(inode: &Inode) -> Result<(), SessionError> {
+    if inode.symlink_target.is_none()
+        || inode.file_remote_digest.is_some()
+        || inode.file_overlay_path.is_some()
+        || inode.file_content_dirty.is_some()
+        || inode.directory_remote_digest.is_some()
+        || inode.directory_loaded.is_some()
+    {
+        return Err(internal_error(format!(
+            "symlink inode `{}` has invalid fields",
+            inode.name
+        )));
+    }
+    Ok(())
+}
+
+/// Validates that a directory inode has only directory-specific fields.
+fn validate_directory_fields(inode: &Inode) -> Result<(), SessionError> {
+    if inode.file_remote_digest.is_some()
+        || inode.file_overlay_path.is_some()
+        || inode.file_content_dirty.is_some()
+        || inode.symlink_target.is_some()
+        || inode.directory_loaded.is_none()
+    {
+        return Err(internal_error(format!(
+            "directory inode `{}` has invalid fields",
+            inode.name
+        )));
+    }
+    if inode.directory_remote_digest.is_none() && inode.directory_loaded != Some(true) {
+        return Err(internal_error(format!(
+            "local directory inode `{}` is not loaded",
+            inode.name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_inode_basics(inode: &Inode) -> Result<(), SessionError> {
+    match (inode.id, inode.parent) {
+        (InodeId::ROOT, None) => {
+            if !inode.name.is_empty() {
+                return Err(internal_error(format!(
+                    "root inode unexpected had name {}, expected empty name",
+                    inode.name
+                )));
+            }
+            if inode.kind != NodeKind::Directory {
+                return Err(internal_error(format!(
+                    "root inode kind was {}, expected directory",
+                    inode.kind
+                )));
+            }
+            if inode.directory_remote_digest.is_none() {
+                return Err(internal_error("root inode remote digest is missing"));
+            }
+            if inode.directory_loaded.is_none() {
+                return Err(internal_error("root inode was not loaded"));
+            }
             Ok(())
         }
-        (InodeId::ROOT, _) => Err(internal_error("root inode shape is invalid")),
-        (_, Some(_)) => validate_child_name(&inode.name),
-        (_, None) => Err(internal_error(format!("inode {identity} has no parent"))),
+        (InodeId::ROOT, Some(parent)) => Err(internal_error(format!(
+            "root inode unexpectedly had a parent inode with id {}",
+            parent
+        ))),
+        (_, Some(_)) => validate_inode_name(&inode.name)
+            .with_context(|| format!("inode {} name validation failed", inode.id)),
+        (_, None) => Err(internal_error(format!(
+            "inode {} is not root but has no parent",
+            inode.id
+        ))),
     }
 }
 
@@ -849,9 +893,9 @@ fn ensure_inode_is_dir(inode: &Inode) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn validate_child_name(name: &str) -> Result<(), SessionError> {
+fn validate_inode_name(name: &str) -> Result<(), SessionError> {
     if name.is_empty() || name.contains('/') || matches!(name, "." | "..") {
-        Err(internal_error(format!("invalid child name `{name}`")))
+        Err(internal_error(format!("invalid inode name `{name}`")))
     } else {
         Ok(())
     }
@@ -1304,7 +1348,10 @@ mod tests {
                 "invalid directory remote digest",
             ),
             ("mode = 32768", "invalid mode"),
-            ("parent_id = 1", "root inode shape is invalid"),
+            (
+                "parent_id = 1",
+                "root inode unexpectedly had a parent inode with id 1",
+            ),
             ("file_content_dirty = 0", "has invalid fields"),
         ];
 
@@ -1454,7 +1501,7 @@ mod tests {
         let error = store
             .get_or_create_dir_children(InodeId::ROOT, &[])
             .unwrap_err();
-        assert!(error.to_string().contains("root inode shape is invalid"));
+        assert!(error.to_string().contains("root inode was not loaded"));
         assert!(
             store
                 .get_directory_children(InodeId::ROOT)
