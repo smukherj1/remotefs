@@ -500,7 +500,7 @@ impl SessionStore {
 
 /// Unvalidated inode values decoded directly from one SQLite row.
 ///
-/// Field order in [`Self::from_rusqlite_row`] must match [`Self::column_list`].
+/// The query projection must contain every field named by this decoder.
 struct InodeRow {
     /// Stored inode identity before positive-value validation.
     id: i64,
@@ -542,24 +542,24 @@ impl InodeRow {
 
     /// Decodes one inode projection without applying domain validation.
     ///
-    /// Inputs: `row` produced by a query using [`Self::column_list`]. Returns
+    /// Inputs: `row` whose projection contains the named inode columns. Returns
     /// the SQLite-shaped values. Errors: SQLite type or column-read failures.
     fn from_rusqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            id: row.get(0)?,
-            parent_id: row.get(1)?,
-            name: row.get(2)?,
-            kind: row.get(3)?,
-            mode: row.get(4)?,
-            mtime_seconds: row.get(5)?,
-            mtime_nanos: row.get(6)?,
-            tombstone: row.get(7)?,
-            file_remote_digest: row.get(8)?,
-            file_overlay_path: row.get(9)?,
-            file_content_dirty: row.get(10)?,
-            symlink_target: row.get(11)?,
-            directory_remote_digest: row.get(12)?,
-            directory_loaded: row.get(13)?,
+            id: row.get("id")?,
+            parent_id: row.get("parent_id")?,
+            name: row.get("name")?,
+            kind: row.get("kind")?,
+            mode: row.get("mode")?,
+            mtime_seconds: row.get("mtime_seconds")?,
+            mtime_nanos: row.get("mtime_nanos")?,
+            tombstone: row.get("tombstone")?,
+            file_remote_digest: row.get("file_remote_digest")?,
+            file_overlay_path: row.get("file_overlay_path")?,
+            file_content_dirty: row.get("file_content_dirty")?,
+            symlink_target: row.get("symlink_target")?,
+            directory_remote_digest: row.get("directory_remote_digest")?,
+            directory_loaded: row.get("directory_loaded")?,
         })
     }
 }
@@ -903,7 +903,7 @@ fn validate_inode_name(name: &str) -> Result<(), SessionError> {
 
 /// Unvalidated session metadata decoded from the single `session_metadata` row.
 ///
-/// Field order in [`Self::from_rusqlite_row`] must match [`Self::column_list`].
+/// The query projection must contain every field named by this decoder.
 struct SessionMetadataRow {
     /// Singleton row marker seeded by `initialize_database`; must equal 1.
     singleton: i64,
@@ -947,21 +947,22 @@ impl SessionMetadataRow {
 
     /// Decodes one session-metadata projection without applying domain validation.
     ///
-    /// Inputs: `row` produced by a query using [`Self::column_list`]. Returns
-    /// the SQLite-shaped values. Errors: SQLite type or column-read failures.
+    /// Inputs: `row` whose projection contains the named session-metadata
+    /// columns. Returns the SQLite-shaped values. Errors: SQLite type or
+    /// column-read failures.
     fn from_rusqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
-            singleton: row.get(0)?,
-            session_id: row.get(1)?,
-            daemon_pid: row.get(2)?,
-            lifecycle: row.get(3)?,
-            root_digest_hash: row.get(4)?,
-            root_digest_size: row.get(5)?,
-            mountpoint: row.get(6)?,
-            created_at_seconds: row.get(7)?,
-            closed_at_seconds: row.get(8)?,
-            log_level: row.get(9)?,
-            log_format: row.get(10)?,
+            singleton: row.get("singleton")?,
+            session_id: row.get("session_id")?,
+            daemon_pid: row.get("daemon_pid")?,
+            lifecycle: row.get("lifecycle")?,
+            root_digest_hash: row.get("root_digest_hash")?,
+            root_digest_size: row.get("root_digest_size")?,
+            mountpoint: row.get("mountpoint")?,
+            created_at_seconds: row.get("created_at_seconds")?,
+            closed_at_seconds: row.get("closed_at_seconds")?,
+            log_level: row.get("log_level")?,
+            log_format: row.get("log_format")?,
         })
     }
 }

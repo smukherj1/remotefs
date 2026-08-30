@@ -11,37 +11,6 @@ file is named.
 
 ---
 
-## P7 — Positional inode row decoding is now localized
-
-**Location:** `InodeRow` (`store.rs:334-398`), `validate_inode_row`
-(`store.rs:507-573`), and `SessionMetadataRow` (`store.rs:839-901`).
-
-**Status & Problem.**
-
-- **Resolved structure:** A private `InodeRow` now owns `column_list()` and
-  `from_rusqlite_row()`. SQLite callbacks only decode SQLite-shaped values.
-  `validate_inode_row` separately converts IDs, kinds, modes, timestamps,
-  booleans, paths, and digests before applying the shared inode invariants.
-- Single-row lookups validate after `optional()`, while directory reads collect
-  raw rows before validating them. Domain failures therefore remain
-  `SessionError`s instead of being flattened into `FromSqlConversionFailure`.
-- `SessionMetadataRow` now follows the same `column_list()` naming convention.
-- Corruption-oriented tests at `store.rs:1209-1247` cover invalid kinds,
-  booleans, partial timestamps, digests, modes, identity shape, and node-kind
-  field combinations.
-- **Remaining limitation:** both row types still use positional `row.get(...)`
-  calls. The column-order contract is centralized and easier to audit, but it
-  is not compile-time safe; reordering compatible columns can still misdecode a
-  row.
-
-**Impact.** The original mixed decoding/validation problem is resolved. Only
-the localized positional column-order risk remains during schema evolution.
-
-**Possible follow-up.** If compile-time-independent column ordering becomes
-important, decode by column name or add a projection-order regression test.
-
----
-
 ## P8 — Remote child creation no longer shares reconciliation predicates
 
 **Location:** `validate_child_inodes_for_creation`; the former
