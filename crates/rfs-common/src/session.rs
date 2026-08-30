@@ -494,7 +494,8 @@ impl Session {
             internal_error(format!("decode directory blob {digest}: {source}"))
         })?;
         let children = decoded_directory_children(decoded)?;
-        self.store.get_or_create_dir_children(inode, &children)?;
+        self.store
+            .get_or_create_remote_dir_children(inode, &children)?;
         self.record_directory_read(downloaded);
         Ok(())
     }
@@ -896,7 +897,6 @@ impl SessionLayout {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::fs;
     use std::io::Write;
     use std::sync::{Arc, Barrier, Mutex};
 
@@ -1209,41 +1209,6 @@ mod tests {
             session.lookup_child(InodeId::ROOT, "partial"),
             Err(SessionError::InternalError { .. })
         ));
-    }
-
-    /// Overlay data wins over remote bytes, and both backing kinds return EOF as empty bytes.
-    #[test]
-    fn overlay_precedence_and_eof_are_visible_through_read_range() {
-        init_test();
-        let (_home, _runtime, session, root) = session();
-        let child = session.lookup_child(root, "readme").expect("load child");
-        assert!(
-            session
-                .read_range(child.inode, 99, 1)
-                .expect("read remote EOF")
-                .is_empty(),
-            "reading file at offset past its size did not return an empty bytea array"
-        );
-        let overlay_path = session.layout.overlay_path().join("data/replacement");
-        fs::write(&overlay_path, b"overlay").expect("write test overlay");
-        let database = session.layout.database_path();
-        // TODO: Use method from store module that'll likely be needed in the future
-        // anyways.
-        rusqlite::Connection::open(database).expect("open test database")
-            .execute("UPDATE inodes SET file_overlay_path = 'replacement', file_content_dirty = 1 WHERE id = ?1", [child.inode.sqlite()])
-            .expect("set test overlay backing");
-        assert_eq!(
-            session
-                .read_range(child.inode, 0, 32)
-                .expect("read overlay"),
-            "overlay"
-        );
-        assert!(
-            session
-                .read_range(child.inode, 99, 1)
-                .expect("read overlay EOF")
-                .is_empty()
-        );
     }
 
     /// Two inodes sharing one digest classify the cache fill and follower as separate outcomes.

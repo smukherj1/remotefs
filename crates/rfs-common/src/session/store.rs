@@ -134,7 +134,7 @@ impl SessionStore {
     /// parents, inconsistent unloaded state, invalid child sets, and SQLite
     /// failures. A successful materialization inserts all children and marks the
     /// parent loaded in one transaction.
-    pub(super) fn get_or_create_dir_children(
+    pub(super) fn get_or_create_remote_dir_children(
         &self,
         parent: InodeId,
         children: &[Inode],
@@ -162,18 +162,15 @@ impl SessionStore {
                     "unloaded directory inode {parent} already has stored children"
                 )));
             }
-            validate_child_inodes_for_creation(children).with_context(|| {
-                format!("validate children to create in directory inode {parent}")
-            })?;
-            for child in children {
-                self.insert_inode(
-                    transaction,
-                    "insert directory child",
-                    &child_for_parent(parent, child),
-                )
+            let children = validated_remote_dir_child_inodes_for_creation(parent, children)
                 .with_context(|| {
-                    format!("insert child `{}` in directory inode {parent}", child.name)
+                    format!("validate children to create in directory inode {parent}")
                 })?;
+            for child in children {
+                self.insert_inode(transaction, "insert directory child", &child)
+                    .with_context(|| {
+                        format!("insert child `{}` in directory inode {parent}", child.name)
+                    })?;
             }
             transaction
                 .execute(
@@ -260,6 +257,7 @@ impl SessionStore {
                 now,
             )?;
             self.insert_root_inode(transaction, root_digest)
+                .with_context(|| "inserting root inode".to_owned())
         })
     }
 
@@ -424,14 +422,6 @@ impl SessionStore {
         operation: &'static str,
         inode: &Inode,
     ) -> Result<(), SessionError> {
-        if inode.id != InodeId::ROOT && inode.id != InodeId::INVALID {
-            return Err(internal_error(format!(
-                "insert inode specified id {}, must be root id {} or invalid id {}",
-                inode.id,
-                InodeId::ROOT,
-                InodeId::INVALID
-            )));
-        }
         validate_inode_for_create(inode)
             .with_context(|| "inode failed validation for insertion".to_owned())?;
         let overlay_path = inode
@@ -564,16 +554,20 @@ impl InodeRow {
     }
 }
 
-/// Copies an unallocated proposed child and assigns its stored parent.
-fn child_for_parent(parent: InodeId, child: &Inode) -> Inode {
-    let mut child = child.clone();
-    child.id = InodeId::INVALID;
-    child.parent = Some(parent);
-    child
-}
-
-fn validate_child_inodes_for_creation(children: &[Inode]) -> Result<(), SessionError> {
+/// Validates proposed remote children before they are materialized in SQLite
+/// and transforms it for insertion into the db.
+///
+/// Inputs: `children`, the complete remote child set for one unloaded
+/// directory. Returns the children inodes with their parent set to the given
+/// parent inode.
+/// state. Errors: the first invalid child, identified by name. Side effects:
+/// none.
+fn validated_remote_dir_child_inodes_for_creation(
+    parent: InodeId,
+    children: &[Inode],
+) -> Result<Vec<Inode>, SessionError> {
     let mut names = HashSet::with_capacity(children.len());
+    let mut result: Vec<Inode> = Vec::with_capacity(children.len());
     for child in children {
         if child.id != InodeId::INVALID {
             return Err(internal_error(format!(
@@ -589,6 +583,14 @@ fn validate_child_inodes_for_creation(children: &[Inode]) -> Result<(), SessionE
                 child.name
             )));
         }
+        // We're loading the 'parent' directory so any child directory inode
+        // can't also be loaded right now.
+        if child.directory_loaded.is_some_and(|loaded| loaded) {
+            return Err(internal_error(format!(
+                "new child directory inode `{}` is set to loaded",
+                child.name
+            )));
+        }
         validate_inode_name(&child.name)?;
         if !names.insert(child.name.as_str()) {
             return Err(internal_error(format!(
@@ -596,24 +598,12 @@ fn validate_child_inodes_for_creation(children: &[Inode]) -> Result<(), SessionE
                 child.name
             )));
         }
-        validate_inode_for_create(child)?;
-        // TODO: Lots of different checks combined into one here that need distinct error
-        // messages.
-        if child.tombstone
-            || child.file_overlay_path.is_some()
-            || child.file_content_dirty == Some(true)
-            || matches!(child.kind, NodeKind::File) && child.file_remote_digest.is_none()
-            || matches!(child.kind, NodeKind::Directory)
-                && (child.directory_remote_digest.is_none()
-                    || child.directory_loaded != Some(false))
-        {
-            return Err(internal_error(format!(
-                "child `{}` is not a remote inode",
-                child.name
-            )));
-        }
+        let mut child = child.clone();
+        child.parent = Some(parent);
+        validate_inode_for_create(&child)?;
+        result.push(child);
     }
-    Ok(())
+    Ok(result)
 }
 
 /// Converts one SQLite-shaped inode row into a validated domain inode.
@@ -751,8 +741,10 @@ fn validate_stored_digest(
 /// identity, mode, and kind-specific fields are valid. Errors: invalid stored
 /// identity or invalid fields for the inode kind.
 fn validate_inode(inode: &Inode) -> Result<(), SessionError> {
-    validate_inode_basics(inode)?;
-    validate_inode_for_create(inode)
+    if inode.id == InodeId::INVALID {
+        return Err(internal_error(format!("inode had invalid id {}", inode.id)));
+    }
+    validate_inode_common(inode)
 }
 
 /// Validates a new inode that's being created and doesn't have an allocated
@@ -762,23 +754,38 @@ fn validate_inode(inode: &Inode) -> Result<(), SessionError> {
 /// kind-specific fields are valid. Errors: an unsupported mode or fields that
 /// violate the inode kind's nullability and exclusivity rules.
 fn validate_inode_for_create(inode: &Inode) -> Result<(), SessionError> {
-    if let Some(mode) = inode.mode
-        && mode > 0o7777
-    {
+    if inode.id != InodeId::ROOT && inode.id != InodeId::INVALID {
         return Err(internal_error(format!(
-            "inode `{}` has invalid mode",
+            "insert inode specified id {}, must be root id {} or invalid id {}",
+            inode.id,
+            InodeId::ROOT,
+            InodeId::INVALID
+        )));
+    }
+    if inode.tombstone {
+        return Err(internal_error(format!(
+            "new inode `{}` can't be set to tombstoned",
             inode.name
         )));
     }
+    validate_inode_common(inode)
+}
+
+/// Validates one inode's kind-specific fields.
+///
+/// Inputs: `inode` and whether it is about to be materialized from a remote
+/// directory. Returns `Ok(())` when the kind's state is valid. Errors: field
+/// combinations incompatible with the inode kind. Side effects: none.
+fn validate_inode_kind(inode: &Inode) -> Result<(), SessionError> {
     match inode.kind {
-        NodeKind::File => validate_file_fields(inode),
-        NodeKind::Symlink => validate_symlink_fields(inode),
-        NodeKind::Directory => validate_directory_fields(inode),
+        NodeKind::File => validate_file_inode(inode),
+        NodeKind::Symlink => validate_symlink_inode(inode),
+        NodeKind::Directory => validate_directory_inode(inode),
     }
 }
 
-/// Validates the field combination and overlay path of a file inode.
-fn validate_file_fields(inode: &Inode) -> Result<(), SessionError> {
+/// Validates a file inode's fields and, when materializing one, its remote state.
+fn validate_file_inode(inode: &Inode) -> Result<(), SessionError> {
     if inode.symlink_target.is_some()
         || inode.directory_remote_digest.is_some()
         || inode.directory_loaded.is_some()
@@ -801,11 +808,34 @@ fn validate_file_fields(inode: &Inode) -> Result<(), SessionError> {
             inode.name
         )));
     }
+    if inode.file_overlay_path.is_none() && inode.file_content_dirty.is_some_and(|v| v) {
+        return Err(internal_error(format!(
+            "file inode `{}` is dirty but has no overlay path",
+            inode.name
+        )));
+    }
+    if inode.file_remote_digest.is_none() && inode.file_overlay_path.is_none() {
+        return Err(internal_error(format!(
+            "file inode `{}` neither has a remote digest nor an overlay path for the file contents",
+            inode.name
+        )));
+    }
+    match (&inode.file_remote_digest, &inode.file_overlay_path) {
+        (Some(digest), Some(overlay_path)) => {
+            return Err(internal_error(format!(
+                "file inode `{}` specified both remote digest {} and an overlay path {}, only one of these is permitted at a given time",
+                inode.name,
+                digest,
+                overlay_path.display()
+            )));
+        }
+        (_, _) => {}
+    };
     Ok(())
 }
 
-/// Validates that a symbolic-link inode has only a target and common fields.
-fn validate_symlink_fields(inode: &Inode) -> Result<(), SessionError> {
+/// Validates that a new symbolic-link inode has only clean remote link state.
+fn validate_symlink_inode(inode: &Inode) -> Result<(), SessionError> {
     if inode.symlink_target.is_none()
         || inode.file_remote_digest.is_some()
         || inode.file_overlay_path.is_some()
@@ -821,29 +851,50 @@ fn validate_symlink_fields(inode: &Inode) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// Validates that a directory inode has only directory-specific fields.
-fn validate_directory_fields(inode: &Inode) -> Result<(), SessionError> {
+/// Validates that a directory inode has remote backing and a valid load state.
+///
+/// A directory materialized from a remote child set must be unloaded. A
+/// persisted directory may already be loaded after its child set is stored.
+fn validate_directory_inode(inode: &Inode) -> Result<(), SessionError> {
     if inode.file_remote_digest.is_some()
         || inode.file_overlay_path.is_some()
         || inode.file_content_dirty.is_some()
         || inode.symlink_target.is_some()
-        || inode.directory_loaded.is_none()
     {
         return Err(internal_error(format!(
             "directory inode `{}` has invalid fields",
             inode.name
         )));
     }
-    if inode.directory_remote_digest.is_none() && inode.directory_loaded != Some(true) {
+    if inode.directory_loaded.is_none() {
         return Err(internal_error(format!(
-            "local directory inode `{}` is not loaded",
+            "directory inode `{}` did not specify a boolean for loaded",
             inode.name
         )));
     }
     Ok(())
 }
 
-fn validate_inode_basics(inode: &Inode) -> Result<(), SessionError> {
+/// Validate an inode with checks that's common between:
+/// - Existing stored inode.
+/// - A new inode being created.
+/// - Remote CAS blob backed inode.
+/// - Overlay file backed inode.
+fn validate_inode_common(inode: &Inode) -> Result<(), SessionError> {
+    if let Some(mode) = inode.mode
+        && mode > 0o7777
+    {
+        return Err(internal_error(format!(
+            "inode `{}` has invalid mode {}",
+            inode.name, mode
+        )));
+    }
+    validate_inode_hierarchy(inode)?;
+    validate_inode_kind(inode)
+}
+
+/// Validates the given inode is either a valid root or a descendent of the root.
+fn validate_inode_hierarchy(inode: &Inode) -> Result<(), SessionError> {
     match (inode.id, inode.parent) {
         (InodeId::ROOT, None) => {
             if !inode.name.is_empty() {
@@ -1253,12 +1304,10 @@ mod tests {
         let mut connection = store.connection.lock().unwrap();
         let transaction = connection.transaction().unwrap();
         for child in children {
+            let mut child = child.clone();
+            child.parent = Some(directory);
             store
-                .insert_inode(
-                    &transaction,
-                    "seed directory child",
-                    &child_for_parent(directory, child),
-                )
+                .insert_inode(&transaction, "seed directory child", &child)
                 .unwrap();
         }
         transaction
@@ -1328,7 +1377,7 @@ mod tests {
         let proposed = remote_children();
 
         let actual = store
-            .get_or_create_dir_children(InodeId::ROOT, &proposed)
+            .get_or_create_remote_dir_children(InodeId::ROOT, &proposed)
             .unwrap();
 
         assert_created_children(InodeId::ROOT, &proposed, &actual);
@@ -1386,7 +1435,7 @@ mod tests {
 
         assert!(
             store
-                .get_or_create_dir_children(InodeId::ROOT, &[])
+                .get_or_create_remote_dir_children(InodeId::ROOT, &[])
                 .unwrap()
                 .is_empty()
         );
@@ -1403,7 +1452,7 @@ mod tests {
         invalid_proposal.id = InodeId::ROOT;
 
         let actual = store
-            .get_or_create_dir_children(InodeId::ROOT, &[invalid_proposal])
+            .get_or_create_remote_dir_children(InodeId::ROOT, &[invalid_proposal])
             .unwrap();
 
         assert_eq!(actual, existing);
@@ -1423,10 +1472,10 @@ mod tests {
         let first_children = first_proposed.clone();
         let second_children = second_proposed.clone();
         let first = std::thread::spawn(move || {
-            first_store.get_or_create_dir_children(InodeId::ROOT, &first_children)
+            first_store.get_or_create_remote_dir_children(InodeId::ROOT, &first_children)
         });
         let second = std::thread::spawn(move || {
-            second_store.get_or_create_dir_children(InodeId::ROOT, &second_children)
+            second_store.get_or_create_remote_dir_children(InodeId::ROOT, &second_children)
         });
 
         let first = first.join().unwrap().unwrap();
@@ -1449,7 +1498,7 @@ mod tests {
         let existing = seed_directory_state(&store, InodeId::ROOT, false, &remote_children());
 
         let error = store
-            .get_or_create_dir_children(InodeId::ROOT, &[])
+            .get_or_create_remote_dir_children(InodeId::ROOT, &[])
             .unwrap_err();
 
         assert!(error.to_string().contains("already has stored children"));
@@ -1471,13 +1520,13 @@ mod tests {
 
         assert!(matches!(
             store
-                .get_or_create_dir_children(InodeId::INVALID, &[])
+                .get_or_create_remote_dir_children(InodeId::INVALID, &[])
                 .unwrap_err(),
             SessionError::InternalError { .. } | SessionError::Context { .. }
         ));
         assert!(
             store
-                .get_or_create_dir_children(file, &[])
+                .get_or_create_remote_dir_children(file, &[])
                 .unwrap_err()
                 .to_string()
                 .contains("not a directory")
@@ -1500,7 +1549,7 @@ mod tests {
             .unwrap();
 
         let error = store
-            .get_or_create_dir_children(InodeId::ROOT, &[])
+            .get_or_create_remote_dir_children(InodeId::ROOT, &[])
             .unwrap_err();
         assert!(error.to_string().contains("root inode was not loaded"));
         assert!(
@@ -1529,37 +1578,68 @@ mod tests {
         overlay.file_overlay_path = Some(PathBuf::from("overlay"));
         let mut dirty = remote_file("dirty", Digest::for_bytes(b"dirty"));
         dirty.file_content_dirty = Some(true);
-        let mut no_file_digest = remote_file("file-digest", Digest::for_bytes(b"digest"));
-        no_file_digest.file_remote_digest = None;
-        let mut no_dir_digest = remote_directory("dir-digest", Digest::for_bytes(b"digest"));
-        no_dir_digest.directory_remote_digest = None;
+        let mut file_no_contents = remote_file("file-no-contents", Digest::for_bytes(b"digest"));
+        file_no_contents.file_remote_digest = None;
         let mut loaded_dir = remote_directory("loaded", Digest::for_bytes(b"loaded"));
         loaded_dir.directory_loaded = Some(true);
         let duplicate = remote_file("duplicate", Digest::for_bytes(b"one"));
         let cases = vec![
-            vec![supplied_id],
-            vec![supplied_parent],
-            vec![remote_file("", Digest::for_bytes(b"empty"))],
-            vec![remote_file(".", Digest::for_bytes(b"dot"))],
-            vec![remote_file("..", Digest::for_bytes(b"dotdot"))],
-            vec![remote_file("a/b", Digest::for_bytes(b"slash"))],
-            vec![duplicate.clone(), duplicate],
-            vec![invalid_mode],
-            vec![wrong_fields],
-            vec![tombstone],
-            vec![overlay],
-            vec![dirty],
-            vec![no_file_digest],
-            vec![no_dir_digest],
-            vec![loaded_dir],
+            ("supplies an inode ID", vec![supplied_id]),
+            ("supplies a parent", vec![supplied_parent]),
+            (
+                "invalid inode name",
+                vec![remote_file("", Digest::for_bytes(b"empty"))],
+            ),
+            (
+                "invalid inode name",
+                vec![remote_file(".", Digest::for_bytes(b"dot"))],
+            ),
+            (
+                "invalid inode name",
+                vec![remote_file("..", Digest::for_bytes(b"dotdot"))],
+            ),
+            (
+                "invalid inode name",
+                vec![remote_file("a/b", Digest::for_bytes(b"slash"))],
+            ),
+            ("duplicate child name", vec![duplicate.clone(), duplicate]),
+            ("has invalid mode", vec![invalid_mode]),
+            ("has invalid fields", vec![wrong_fields]),
+            (
+                "new inode `tombstone` can't be set to tombstoned",
+                vec![tombstone],
+            ),
+            (
+                "file inode `overlay` specified both remote digest",
+                vec![overlay],
+            ),
+            (
+                "file inode `dirty` is dirty but has no overlay path",
+                vec![dirty],
+            ),
+            (
+                "file inode `file-no-contents` neither has a remote digest nor an overlay path for the file contents",
+                vec![file_no_contents],
+            ),
+            (
+                "new child directory inode `loaded` is set to loaded",
+                vec![loaded_dir],
+            ),
         ];
 
-        for children in cases {
+        for (expected_error, children) in cases {
             let (_directory, store, _) = store();
+            let result = store.get_or_create_remote_dir_children(InodeId::ROOT, &children);
+            let error = match result {
+                Ok(children) => panic!(
+                    "Got Ok result instead of error containing `{}`, result: {:#?}",
+                    expected_error, children
+                ),
+                Err(err) => err,
+            };
             assert!(
-                store
-                    .get_or_create_dir_children(InodeId::ROOT, &children)
-                    .is_err()
+                error.to_string().contains(expected_error),
+                "expected `{expected_error}` in `{error}`"
             );
             assert_directory_state(&store, InodeId::ROOT, false, &[]);
         }
