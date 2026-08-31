@@ -29,7 +29,7 @@ pub struct DaemonIdentity {
 pub struct SessionStatus {
     /// Root digest fixed when the daemon session started.
     pub root_digest: Digest,
-    /// Canonical mountpoint owned by the daemon.
+    /// User-supplied mountpoint owned by the daemon session.
     pub mountpoint: PathBuf,
     /// Process identifier reported by the daemon.
     pub daemon_pid: u32,

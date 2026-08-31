@@ -61,7 +61,7 @@ fn upload_mount_lazy_read() -> Result<()> {
 
     assert!(fs::write(mountpoint.join("root.txt"), b"changed").is_err());
     assert!(fs::create_dir(mountpoint.join("new-directory")).is_err());
-    unmount(&home, &mountpoint)?;
+    unmount(&home)?;
     Ok(())
 }
 
@@ -87,10 +87,10 @@ fn mount(
     Ok(())
 }
 
-fn unmount(home: &std::path::Path, mountpoint: &std::path::Path) -> Result<()> {
+fn unmount(home: &std::path::Path) -> Result<()> {
     assert_cmd::Command::new(cargo_bin("rfs"))
         .env("RFS_HOME", home)
-        .args(["unmount", mountpoint.to_str().unwrap()])
+        .arg("unmount")
         .assert()
         .success();
     Ok(())

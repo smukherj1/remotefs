@@ -31,7 +31,7 @@ The intended implementation order is:
 
 - MVP implementation targets Linux x86_64 with FUSE.
 - `rfs upload <local-dir>` is the only plain local-directory ingestion command.
-- `rfs snapshot [mountpoint]` is daemon-session-only and requires an active RemoteFS session under `RFS_HOME`.
+- `rfs snapshot` is daemon-session-only and requires an active RemoteFS session under `RFS_HOME`.
 - `--instance-name` is required and non-empty for CAS and ByteStream requests.
 - `--cas-url` requires an explicit URI scheme. MVP supports `grpc://`; `grpcs://` is deferred.
 - The default local CAS for development and evaluation is `bazel-remote`; Buildbarn remains a documented secondary compatibility target until the main REAPI path is stable.
@@ -332,9 +332,9 @@ Deliverables:
 - Implement `rfs` command structure:
   - `rfs upload <local-dir>`
   - `rfs mount <root-digest> <mountpoint>`
-  - `rfs snapshot [mountpoint]`
-  - `rfs unmount [mountpoint]`
-  - `rfs status [mountpoint]`
+  - `rfs snapshot`
+  - `rfs unmount`
+  - `rfs status`
   - `rfs cleanup`
 - Do not include `rfs doctor` in the MVP; command-specific validation lives in the commands and test targets that need it.
 - Implement common flags:
@@ -360,7 +360,7 @@ Tests:
 - Unit: configuration rejects missing CAS URL schemes and unsupported schemes.
 - Unit: CAS URL and REAPI `instance_name` are included in every CAS and ByteStream request.
 - Unit: command parsing for every expected command.
-- Unit: optional mountpoint arguments validate against active-session metadata when supplied.
+- Unit: status, snapshot, and unmount reject mountpoint arguments.
 - CLI: `rfs cleanup` refuses to reset local state while another process holds the active-session lock.
 - CLI: `rfs --help`, subcommand help, and invalid digest errors via `assert_cmd`.
 
@@ -448,7 +448,7 @@ Deliverables:
   only `session_metadata` and the `initializing`, `active`, and `closed`
   lifecycle states. Defer inode and directory-materialization tables until
   their first consumers.
-- Validate the root digest and require/canonicalize an existing mountpoint directory before creating session state.
+- Validate the root digest and require an existing mountpoint directory before creating session state; preserve the supplied path spelling.
 - Validate only fixed top-level and active-layout entries; never traverse cache shards or overlay data during startup. Create private files/directories and reject unsafe ownership, permissions, symlinks, and wrong entry types.
 - Wire the state owner into foreground `rfsd`; keep background daemon launch for the mount/FUSE step.
 - Add startup validation and lock handling so a second mount using the same `RFS_HOME` fails clearly while an active session is live.
@@ -467,7 +467,7 @@ Tests:
 - Unit: blob and directory cache path derivation is stable and includes hash prefix plus size.
 - Unit: migrations are idempotent.
 - Unit: metadata constraints and clean-session recognition reject malformed state.
-- Unit: mountpoint canonicalization requires an existing directory and resolves aliases/symlinks.
+- Unit: mountpoint validation rejects missing paths and non-directories before creating state, accepts directory symlinks, and preserves the supplied path through close and inspection.
 - Integration: create and cleanly close a session database.
 - Integration: clean unmount leaves active session state available for inspection.
 - Integration: the next daemon replaces valid closed state while retaining cache; stale active state blocks until cleanup.
@@ -1006,8 +1006,7 @@ Definition of done:
 
 Deliverables:
 
-- Implement `rfs snapshot [mountpoint]` by sending a request to the active `rfsd` discovered through `RFS_HOME`.
-- If a mountpoint is supplied, validate it matches the active session before sending the request.
+- Implement `rfs snapshot` by sending a request to the active `rfsd` discovered through `RFS_HOME`.
 - Require an active RemoteFS daemon session. Do not support `rfs snapshot <local-dir>` in the MVP; use `rfs upload <local-dir>` for ordinary directories.
 - Add a short snapshot barrier.
 - Fail snapshot if writable handles or in-flight mutations are active.

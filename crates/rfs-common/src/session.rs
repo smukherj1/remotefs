@@ -286,12 +286,9 @@ impl Session {
         blob_store: Box<dyn BlobStore>,
         runtime: Handle,
     ) -> Result<Self, SessionError> {
-        let mountpoint = canonicalize_mountpoint(mountpoint.as_ref()).with_context(|| {
-            format!(
-                "canonicalize session mountpoint {}",
-                mountpoint.as_ref().display()
-            )
-        })?;
+        let mountpoint = mountpoint.as_ref().to_path_buf();
+        validate_mountpoint(&mountpoint)
+            .with_context(|| format!("validate session mountpoint {}", mountpoint.display()))?;
         ensure_writable_home(&config).with_context(|| "set up writable session home".to_owned())?;
         let layout = SessionLayout::new(&config.rfs_home);
         let session_id = Uuid::new_v4().to_string();
@@ -545,33 +542,25 @@ impl Session {
     }
 }
 
-/// Resolves a mountpoint to a canonical existing directory.
-/// TODO: Refactor the mountpoint validation here and in cli.rs into a
-/// common location.
-pub(crate) fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, SessionError> {
-    let canonical = fs::canonicalize(path).map_err(|source| {
+/// Validates that `path` names an existing directory without changing its spelling.
+///
+/// Returns `()` for a directory, including a symlink to one. Returns a contextual
+/// session error when metadata cannot be read or the target is not a directory.
+/// This function reads filesystem metadata and does not create session state.
+pub(crate) fn validate_mountpoint(path: &Path) -> Result<(), SessionError> {
+    let metadata = fs::metadata(path).map_err(|source| {
         internal_error(format!(
-            "canonicalize mountpoint {}: {source}",
+            "unable to inspect mountpoint {}: {source}",
             path.display()
         ))
     })?;
-    if !fs::metadata(&canonical)
-        .map_err(|source| {
-            internal_error(format!(
-                "inspect mountpoint {} canonicalized to {}: {source}",
-                path.display(),
-                canonical.display()
-            ))
-        })?
-        .is_dir()
-    {
+    if !metadata.is_dir() {
         return Err(internal_error(format!(
-            "validate mountpoint {} canonicalized to {}: result is not a directory",
-            path.display(),
-            canonical.display()
+            "mountpoint {} is not a valid directory",
+            path.display()
         )));
     }
-    Ok(canonical)
+    Ok(())
 }
 
 const LOCK_RECORD_VERSION: u32 = 1;
@@ -1102,6 +1091,56 @@ mod tests {
             Session::inspect(&config)
                 .expect("inspect retained state")
                 .is_some()
+        );
+    }
+
+    /// Mountpoint validation happens before state creation and preserves accepted path spelling.
+    #[test]
+    fn mountpoint_validation_and_storage_preserve_the_supplied_path() {
+        init_test();
+        let temp = TempDir::new().expect("temporary test directory");
+        let config = Config {
+            rfs_home: temp.path().join("home"),
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let root = DirectoryBuilder::new().encode().expect("encode empty root");
+        let open = |mountpoint: &Path| {
+            Session::open(
+                config.clone(),
+                root.digest.clone(),
+                mountpoint,
+                Box::new(FakeBlobStore {
+                    blobs: HashMap::new(),
+                    streams: Mutex::new(0),
+                }),
+                runtime.handle().clone(),
+            )
+        };
+
+        // A missing path and a regular file must fail without creating RFS_HOME.
+        let missing = temp.path().join("missing");
+        assert!(open(&missing).is_err());
+        assert!(!config.rfs_home.exists());
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"not a directory").expect("create regular file");
+        assert!(open(&file).is_err());
+        assert!(!config.rfs_home.exists());
+
+        // A symlink to a directory is accepted, and its spelling survives every public boundary.
+        let directory = temp.path().join("directory");
+        std::fs::create_dir(&directory).expect("create mountpoint directory");
+        let supplied = temp.path().join("directory-link");
+        std::os::unix::fs::symlink(&directory, &supplied).expect("create mountpoint symlink");
+        let session = open(&supplied).expect("open session through directory symlink");
+        assert_eq!(session.info().mountpoint, supplied);
+        session.close().expect("close session cleanly");
+        drop(session);
+        assert_eq!(
+            Session::inspect(&config)
+                .expect("inspect retained session")
+                .expect("retained session exists")
+                .mountpoint,
+            supplied
         );
     }
 

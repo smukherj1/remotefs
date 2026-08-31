@@ -38,7 +38,7 @@ message StatusResponse {
   bool mounted = 1;
   // Canonical digest of the session's remote root.
   string root_digest = 2;
-  // Canonical local mountpoint path.
+  // User-supplied local mountpoint path.
   string mountpoint = 3;
   // Number of locally modified files.
   uint64 dirty_files = 4;

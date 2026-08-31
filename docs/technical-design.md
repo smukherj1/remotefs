@@ -106,9 +106,9 @@ error behavior.
 ```sh
 rfs upload <local-dir>
 rfs mount <root-digest> <mountpoint>
-rfs snapshot [mountpoint]
-rfs unmount [mountpoint]
-rfs status [mountpoint]
+rfs snapshot
+rfs unmount
+rfs status
 ```
 
 `rfsd` owns one immutable mount session. Its root digest and mountpoint are fixed
@@ -239,7 +239,10 @@ the inode that coordinates ownership. This simplifies daemon discovery and
 prevents two cooperating daemons from sharing the same writable session state
 root. Concurrent mounts require distinct `RFS_HOME` values.
 
-`rfs snapshot`, `rfs status`, and `rfs unmount` discover session state from `RFS_HOME`. Their mountpoint argument is optional in the MVP. If supplied, the CLI requires it to exist as a directory, canonicalizes it to an absolute path with symlinks resolved, and validates that it matches the canonical active-session mountpoint before sending the request.
+`rfs snapshot`, `rfs status`, and `rfs unmount` discover the sole session through
+`RFS_HOME` and do not accept a mountpoint. `Session` validates the mountpoint
+supplied to `rfs mount` as an existing directory before creating session state,
+then stores and reports its original spelling without canonicalizing it.
 
 `rfs status` reports only session state:
 
@@ -541,9 +544,9 @@ Mode rules:
 
 Mounted workspace snapshotting goes through the live `rfsd` process.
 
-`rfs snapshot [mountpoint]`:
+`rfs snapshot`:
 
-1. Discovers the active session from `RFS_HOME`, optionally validates the supplied mountpoint, and sends a snapshot request over the Unix control socket.
+1. Discovers the active session from `RFS_HOME` and sends a snapshot request over the Unix control socket.
 2. Daemon enters a short snapshot barrier.
 3. If writable handles or in-flight mutations are active, snapshot fails.
 4. Daemon walks the overlay graph and dirty ancestors.

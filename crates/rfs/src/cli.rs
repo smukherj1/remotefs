@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -85,20 +84,11 @@ enum Commands {
         mountpoint: PathBuf,
     },
     #[command(about = "Create a new snapshot of the mounted workspace")]
-    Snapshot {
-        #[arg(help = "Optional path to the mountpoint")]
-        mountpoint: Option<PathBuf>,
-    },
+    Snapshot,
     #[command(about = "Unmount a mounted RemoteFS workspace")]
-    Unmount {
-        #[arg(help = "Optional path to the mountpoint")]
-        mountpoint: Option<PathBuf>,
-    },
+    Unmount,
     #[command(about = "Report current active session status and counters")]
-    Status {
-        #[arg(help = "Optional path to the mountpoint")]
-        mountpoint: Option<PathBuf>,
-    },
+    Status,
 }
 
 impl Commands {
@@ -106,9 +96,9 @@ impl Commands {
         match self {
             Self::Upload { .. } => "upload",
             Self::Mount { .. } => "mount",
-            Self::Snapshot { .. } => "snapshot",
-            Self::Unmount { .. } => "unmount",
-            Self::Status { .. } => "status",
+            Self::Snapshot => "snapshot",
+            Self::Unmount => "unmount",
+            Self::Status => "status",
         }
     }
 }
@@ -164,8 +154,6 @@ pub enum CliError {
     InvalidConfig { message: String },
     #[error("invalid root digest `{value}`: {source}")]
     InvalidDigest { value: String, source: DigestError },
-    #[error("mountpoint `{supplied}` does not match active session mountpoint `{active}`")]
-    MountpointMismatch { supplied: PathBuf, active: PathBuf },
     #[error("{command} is not implemented yet")]
     NotImplemented { command: &'static str },
     #[error("{message}")]
@@ -181,7 +169,6 @@ impl CliError {
         match self {
             Self::InvalidConfig { .. } => "invalid_config",
             Self::InvalidDigest { .. } => "invalid_digest",
-            Self::MountpointMismatch { .. } => "mountpoint_mismatch",
             Self::NotImplemented { .. } => "not_implemented",
             Self::CommandFailed { category, .. } => category,
         }
@@ -257,19 +244,16 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
             )
             .await
         }
-        Commands::Snapshot { mountpoint } => {
-            validate_optional_mountpoint(mountpoint.as_deref(), None)?;
-            Err(CliError::NotImplemented {
-                command: "snapshot",
-            })
-        }
-        Commands::Unmount { mountpoint } => {
+        Commands::Snapshot => Err(CliError::NotImplemented {
+            command: "snapshot",
+        }),
+        Commands::Unmount => {
             let config = Config::new().map_err(config_error)?;
-            run_unmount(&config, mountpoint.as_deref()).await
+            run_unmount(&config).await
         }
-        Commands::Status { mountpoint } => {
+        Commands::Status => {
             let config = Config::new().map_err(config_error)?;
-            run_status(&config, mountpoint.as_deref(), cli.json_output()).await
+            run_status(&config, cli.json_output()).await
         }
     }
 }
@@ -281,7 +265,6 @@ async fn run_mount(
     log_level: LogLevel,
     output_format: OutputFormat,
 ) -> Result<(), CliError> {
-    let mountpoint = canonicalize_mountpoint(mountpoint)?;
     let daemon = daemon_executable()?;
     let mut child = Command::new(&daemon)
         .arg(digest.to_string())
@@ -393,11 +376,10 @@ async fn daemon_client(config: &Config) -> Result<DaemonClient, crate::daemon_cl
     DaemonClient::connect(ControlEndpoint(endpoint)).await
 }
 
-async fn run_status(config: &Config, supplied: Option<&Path>, json: bool) -> Result<(), CliError> {
+async fn run_status(config: &Config, json: bool) -> Result<(), CliError> {
     match daemon_client(config).await {
         Ok(mut client) => match client.status().await {
             Ok(status) => {
-                validate_supplied_mountpoint(supplied, &status.mountpoint)?;
                 render_active_status(status, json);
                 return Ok(());
             }
@@ -409,7 +391,6 @@ async fn run_status(config: &Config, supplied: Option<&Path>, json: bool) -> Res
     }
     match Session::inspect(config).map_err(state_error)? {
         None => {
-            validate_optional_mountpoint(supplied, None)?;
             if json {
                 println!(
                     "{}",
@@ -421,7 +402,6 @@ async fn run_status(config: &Config, supplied: Option<&Path>, json: bool) -> Res
             Ok(())
         }
         Some(session) => {
-            validate_supplied_mountpoint(supplied, &session.mountpoint)?;
             render_retained_status(session, json);
             Ok(())
         }
@@ -477,12 +457,9 @@ fn render_retained_status(session: SessionInfo, json: bool) {
     }
 }
 
-// TODO: unmount should not accept the path to unmount. It should just unmount the
-// currently mounted path.
-async fn run_unmount(config: &Config, supplied: Option<&Path>) -> Result<(), CliError> {
+async fn run_unmount(config: &Config) -> Result<(), CliError> {
     let mut client = daemon_client(config).await.map_err(client_error)?;
     let status = client.status().await.map_err(client_error)?;
-    validate_supplied_mountpoint(supplied, &status.mountpoint)?;
     let mountpoint = status.mountpoint;
     client.unmount().await.map_err(client_error)?;
     println!("unmounted {}", mountpoint.display());
@@ -494,44 +471,6 @@ fn client_error(error: crate::daemon_client::ClientError) -> CliError {
         category: error.code(),
         message: error.to_string(),
     }
-}
-
-fn validate_supplied_mountpoint(supplied: Option<&Path>, active: &Path) -> Result<(), CliError> {
-    let supplied = supplied.map(canonicalize_mountpoint).transpose()?;
-    validate_optional_mountpoint(supplied.as_deref(), Some(active))
-}
-
-/// Validates that a user-supplied mountpoint resolves to an existing directory.
-/// TODO: Refactor the mountpoint validation here and session.rs in rfs-common in
-/// one place.
-fn canonicalize_mountpoint(path: &Path) -> Result<PathBuf, CliError> {
-    let canonical = fs::canonicalize(path).map_err(|source| CliError::CommandFailed {
-        category: "state",
-        message: format!("canonicalize mountpoint {}: {source}", path.display()),
-    })?;
-    if !fs::metadata(&canonical)
-        .map_err(|source| CliError::CommandFailed {
-            category: "state",
-            message: format!(
-                "get metadata for mountpoint {} canonicalized to {}: {source}",
-                path.display(),
-                canonical.display()
-            ),
-        })?
-        .is_dir()
-    {
-        return Err(CliError::CommandFailed {
-            category: "state",
-            message: format!(
-                "validate mountpoint {} canonicalized to {}: result is not a directory",
-                path.display(),
-                canonical.display()
-            ),
-        });
-    }
-    // TODO: Prefer retaining the original user provided path if we decide to keep
-    // the unmount path provided during unmount.
-    Ok(canonical)
 }
 
 async fn run_upload(config: CliConfig, local_dir: PathBuf) -> Result<Digest, CliError> {
@@ -570,24 +509,6 @@ fn parse_root_digest(value: &str) -> Result<Digest, CliError> {
         value: value.to_string(),
         source,
     })
-}
-
-/// Validates a user-supplied mountpoint against known active-session metadata.
-///
-/// When no active mountpoint metadata is available, this accepts the supplied
-/// value so early command parsing can remain independent of the daemon state
-/// implementation.
-fn validate_optional_mountpoint(
-    supplied: Option<&Path>,
-    active: Option<&Path>,
-) -> Result<(), CliError> {
-    match (supplied, active) {
-        (Some(supplied), Some(active)) if supplied != active => Err(CliError::MountpointMismatch {
-            supplied: supplied.to_path_buf(),
-            active: active.to_path_buf(),
-        }),
-        _ => Ok(()),
-    }
 }
 
 /// Renders a CLI error as a one-line human message or JSON diagnostic.
@@ -673,14 +594,17 @@ mod tests {
         let mount = Cli::try_parse_from(["rfs", "mount", digest, "/mnt/rfs"]).unwrap();
         assert!(matches!(mount.command, Commands::Mount { .. }));
 
-        let snapshot = Cli::try_parse_from(["rfs", "snapshot", "/mnt/rfs"]).unwrap();
-        assert!(matches!(snapshot.command, Commands::Snapshot { .. }));
+        let snapshot = Cli::try_parse_from(["rfs", "snapshot"]).unwrap();
+        assert!(matches!(snapshot.command, Commands::Snapshot));
+        assert!(Cli::try_parse_from(["rfs", "snapshot", "/mnt/rfs"]).is_err());
 
         let unmount = Cli::try_parse_from(["rfs", "unmount"]).unwrap();
-        assert!(matches!(unmount.command, Commands::Unmount { .. }));
+        assert!(matches!(unmount.command, Commands::Unmount));
+        assert!(Cli::try_parse_from(["rfs", "unmount", "/mnt/rfs"]).is_err());
 
-        let status = Cli::try_parse_from(["rfs", "status", "/mnt/rfs"]).unwrap();
-        assert!(matches!(status.command, Commands::Status { .. }));
+        let status = Cli::try_parse_from(["rfs", "status"]).unwrap();
+        assert!(matches!(status.command, Commands::Status));
+        assert!(Cli::try_parse_from(["rfs", "status", "/mnt/rfs"]).is_err());
 
         assert!(Cli::try_parse_from(["rfs", "cleanup"]).is_err());
     }
@@ -812,17 +736,6 @@ mod tests {
     fn invalid_log_level_is_rejected_for_commands_without_cas_config() {
         let error = Cli::try_parse_from(["rfs", "--log-level", "bogus", "status"]).unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
-    }
-
-    #[test]
-    fn optional_mountpoint_matches_active_session_metadata() {
-        validate_optional_mountpoint(Some(Path::new("/mnt/rfs")), Some(Path::new("/mnt/rfs")))
-            .unwrap();
-        assert!(matches!(
-            validate_optional_mountpoint(Some(Path::new("/tmp/rfs")), Some(Path::new("/mnt/rfs"))),
-            Err(CliError::MountpointMismatch { .. })
-        ));
-        validate_optional_mountpoint(Some(Path::new("/tmp/rfs")), None).unwrap();
     }
 
     #[test]

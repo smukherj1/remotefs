@@ -36,7 +36,7 @@ pub(super) struct SessionMetadata {
     pub(super) state: SessionLifecycle,
     /// Immutable mounted root directory digest.
     pub(super) root_digest: Digest,
-    /// Canonical absolute mountpoint.
+    /// Original validated user-supplied mountpoint.
     pub(super) mountpoint: PathBuf,
 }
 
@@ -1053,7 +1053,7 @@ fn read_stored_session(
 /// Inputs: `row` freshly decoded by [`SessionMetadataRow::from_rusqlite_row`].
 /// Returns the [`SessionMetadata`] when every field passes its checks. Errors:
 /// `FailedPreconditionError` naming the first violated invariant (identity,
-/// lifecycle, close-time pairing, or mountpoint shape).
+/// lifecycle, or close-time pairing).
 fn validate_session(row: SessionMetadataRow) -> Result<SessionMetadata, SessionError> {
     let SessionMetadataRow {
         singleton,
@@ -1104,11 +1104,6 @@ fn validate_session(row: SessionMetadataRow) -> Result<SessionMetadata, SessionE
         }
     };
     let mountpoint = PathBuf::from(mountpoint);
-    if !mountpoint.is_absolute() {
-        return Err(failed_precondition(
-            "inspect session metadata: mountpoint is not absolute",
-        ));
-    }
     Ok(SessionMetadata {
         daemon_pid: u32::try_from(pid)
             .map_err(|_| failed_precondition("inspect session metadata: invalid daemon pid"))?,
