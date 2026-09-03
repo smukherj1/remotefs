@@ -340,7 +340,6 @@ The durable domain tables are:
 | --- | --- |
 | `session_metadata` | The single mount session and its lifecycle. |
 | `inodes` | The session-stable merged namespace, including remote, local, copied-up, and tombstoned entries. |
-| `directory_materializations` | Records which immutable remote directories have been fetched completely. |
 
 Fields are intentionally compact:
 
@@ -355,25 +354,25 @@ Fields are intentionally compact:
 |  | `created_at_seconds` | Session creation time in whole seconds. |
 |  | `closed_at_seconds` | Clean-close time in whole seconds; present only when closed. |
 |  | `log_level`, `log_format` | Effective daemon logging settings. |
-| `inodes` | `inode` | Synthetic primary key; root is always `1`. |
-|  | `parent_inode`, `name` | Parent and UTF-8 basename; unique together. Root alone has no parent and an empty name. |
+| `inodes` | `id` | Synthetic primary key; root is always `1`. |
+|  | `parent_id`, `name` | Parent and UTF-8 basename. At most one visible row uses a pair; tombstoned history may retain the same pair. Root alone has no parent and an empty name. |
 |  | `kind` | `file`, `directory`, or `symlink`. |
-|  | `remote_digest` | Original file or directory digest, when remote-backed. |
+|  | `file_remote_digest` | Immutable file-content digest while bytes remain remote-backed; null after copy-up and for other kinds. |
+|  | `directory_remote_digest` | Immutable serialized `Directory` digest while that representation remains reusable; null after the directory changes and for other kinds. |
 |  | `symlink_target` | Exact target for a symlink; null for other kinds. |
-|  | `overlay_file` | Relative overlay data filename for local content; never an absolute path. |
+|  | `file_overlay_path` | Relative overlay data filename for local file content; never an absolute path. |
 |  | `mode` | Preserved Unix permission and supported special bits. |
 |  | `mtime_seconds`, `mtime_nanos` | Signed mtime seconds and normalized nanoseconds. |
 |  | `tombstone` | Whether this entry hides the remote name. |
-|  | `content_dirty` | Whether file bytes must be hashed at snapshot. |
-|  | `tree_dirty` | Whether this inode or a descendant changes directory encoding. |
-| `directory_materializations` | `inode` | Primary/foreign key to a directory in `inodes`. |
-|  | `directory_digest` | Remote directory digest whose full child set was recorded. |
+|  | `file_content_dirty` | Whether file bytes must be hashed at snapshot; null for other kinds. |
+|  | `directory_loaded` | Whether a directory's complete child set is present in `inodes`; null for other kinds. |
+|  | `directory_tree_dirty` | Whether a directory must be re-encoded because it or a descendant changed; null for other kinds. |
 Boolean and closed-set fields use typed Rust enums or booleans at the state
 module boundary, not ad hoc strings in state operations. Rust validation
 enforces digest, timestamp, lifecycle, root-inode, kind-specific nullable-field,
-and clean-close invariants on reads and writes. SQL indexes enforce inode name
-uniqueness and lookup performance; foreign keys enforce the inode tree and
-materialization ownership.
+and clean-close invariants on reads and writes. SQL indexes enforce visible
+inode name uniqueness and lookup performance; foreign keys enforce the inode
+tree and parent ownership.
 
 ## FUSE Model
 
@@ -439,7 +438,7 @@ The mount daemon maintains an explicit durable overlay index in the SQLite
 The overlay index tracks:
 
 - Copied-up remote files.
-- New files and directories.
+- New files, directories, and symlinks.
 - Deletes as tombstones.
 - Renames.
 - Mode changes.
@@ -461,16 +460,33 @@ SQLite remains the source of truth for visible overlay state. Each logical files
 - Rename and delete directory mutations update all affected overlay rows and dirty ancestors in one SQLite transaction.
 - Snapshot opens a short read transaction only after the snapshot barrier passes, so it sees a consistent overlay graph.
 
+A remote digest remains present only while it still identifies the inode data
+that snapshot may reuse. A file-content mutation atomically replaces
+`file_remote_digest` with `file_overlay_path`. A directory metadata or child-set
+mutation first materializes the complete directory, then clears its
+`directory_remote_digest`; every dirty directory ancestor is likewise fully
+materialized and loses its stale digest. File rename and metadata-only changes
+retain `file_remote_digest` because the referenced bytes did not change, while
+the affected parent directory digests are cleared. REAPI symlinks have no
+standalone CAS object or digest: their target and metadata live in the parent
+`Directory`, so symlink replacement or metadata change clears the affected
+parent and ancestor directory digests.
+
 ## Copy-on-Write
 
 Remote snapshots are immutable.
 
-The first mutation of a remote-backed file performs whole-file copy-on-write:
+The first content mutation of a remote-backed file performs whole-file
+copy-on-write:
 
 1. Ensure the remote blob is present in the verified local cache.
 2. Copy the full blob into the session overlay data directory.
-3. Apply the write, truncate, or metadata mutation locally.
+3. Apply the write or truncate locally.
 4. Mark the file and affected ancestors dirty in SQLite.
+
+Metadata-only file mutations do not copy file bytes and retain the reusable
+file-content digest. They update the inode metadata and invalidate the affected
+directory encodings in one SQLite transaction.
 
 Whole-file COW is the only MVP write strategy. Large-file COW emits structured warnings by default and proceeds with copy-up; a configurable hard size guardrail can be added later as an explicit opt-in.
 

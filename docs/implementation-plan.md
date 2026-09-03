@@ -831,21 +831,37 @@ Definition of done:
 
 ### Step 6.1: Overlay Index and Merged View
 
+Detailed design and coverage are in
+[`step-6.1-program-design.md`](step-6.1-program-design.md) and
+[`step-6.1-test-cases.md`](step-6.1-test-cases.md).
+
 Deliverables:
 
-- Use the overlay fields already defined on the central SQLite `inodes` table
+- Complete and use the overlay fields on the central SQLite `inodes` table
   for:
   - New files and directories.
-  - Copied-up remote files.
+  - New symlinks.
   - Tombstones.
   - Renames.
   - Mode changes.
   - Mtime changes.
   - Dirty ancestors.
+- Keep remote-file content copy-up out of this step. Step 6.1 creates the
+  durable namespace and local-file representation that copy-up will use;
+  Step 6.2 performs the first content mutation and backing-store transition.
 - Implement merged lookup and readdir precedence:
   - Tombstones hide remote entries.
   - Local entries override remote entries at the same path.
   - Unchanged remote subtree references remain intact.
+- Before changing a remote directory's metadata or child set, materialize its
+  complete child set outside the mutation transaction. In the committing
+  transaction, clear that directory's stale remote digest and the stale remote
+  digests of dirty directory ancestors.
+- Preserve a remote file-content digest across rename, chmod, and mtime-only
+  changes because those operations do not change the bytes identified by that
+  digest. Symlinks have no standalone CAS digest; their target and metadata are
+  encoded in the parent `Directory`, so changing or replacing a symlink clears
+  the parent and ancestor directory digests.
 - Store local file contents in the session overlay data directory.
 - Implement transaction boundaries:
   - One SQLite transaction per logical filesystem metadata mutation.
@@ -865,9 +881,17 @@ Tests:
 - Unit: merged lookup precedence for remote, local, and tombstoned entries.
 - Unit: directory listings combine local and remote entries in stable order.
 - Unit: dirty ancestor marking is minimal and correct.
+- Unit: a directory metadata or child-set mutation clears its remote digest
+  only after its complete child set is materialized.
+- Unit: file rename and metadata-only mutation retain the file-content digest
+  while clearing affected directory digests.
+- Unit: symlink replacement clears affected directory digests; no per-symlink
+  digest is created.
 - Unit: failed SQLite commit after overlay file rename leaves no visible overlay entry.
 - Unit: unreferenced overlay files can be identified for cleanup.
-- Integration: reopen session database and preserve overlay state.
+- Integration: close a mutated session and verify retained inspection does not
+  change its database or overlay files; opening the next mount still replaces
+  the retained session tree per the fresh-session policy.
 
 Definition of done:
 
@@ -882,8 +906,12 @@ Deliverables:
   - Copy blob into a temporary overlay file.
   - Apply write or truncate to the temporary overlay file.
   - Atomically rename the temporary overlay file into session overlay data.
-  - Commit copied-up state, content dirty state, and dirty ancestors in one SQLite transaction.
-- Apply metadata-only copy-up triggers such as chmod or utimens with one SQLite transaction and no data-file copy unless content must become local.
+  - In one SQLite transaction, replace `file_remote_digest` with
+    `file_overlay_path`, set content dirty state, and clear the remote digests
+    of dirty directory ancestors.
+- Apply metadata-only updates such as chmod or utimens with one SQLite
+  transaction, no data-file copy, and no change to the reusable file-content
+  digest.
 - Support local-only creates, writes, truncates, and metadata updates.
 - Emit structured warnings for large-file copy-up and continue by default.
 
@@ -902,6 +930,8 @@ Tests:
 - Unit: failed remote fetch aborts mutation without creating partial overlay state.
 - Unit: copy-up keeps remote fetch and large file copy outside SQLite transactions.
 - Unit: copy-up commit records copied-up state and dirty ancestors atomically.
+- Unit: after copy-up, reads use only the overlay file and the inode no longer
+  retains its former remote file-content digest.
 - Integration: core model mutates uploaded fixture and verifies merged readback.
 
 Definition of done:
@@ -915,6 +945,7 @@ Deliverables:
 - Add FUSE mutation operations:
   - `create`
   - `mkdir`
+  - `symlink`
   - `write`
   - `flush` and `fsync` for local overlay byte synchronization and local IO error reporting
   - `setattr`
@@ -955,7 +986,8 @@ Tests:
 - Unit: rename over non-empty directory, file-over-directory, directory-over-file, and directory-into-descendant are rejected.
 - Unit: cross-mount rename maps to `EXDEV`.
 - Unit: open file handle remains usable after rename or path replacement.
-- E2E: create, edit, truncate, chmod, touch, delete, and rename through the mounted filesystem.
+- E2E: create files, directories, and symlinks; edit, truncate, chmod, touch,
+  delete, and rename through the mounted filesystem.
 - E2E: build-tool style write patterns, including temp-file write followed by rename.
 - E2E: remounting the original root shows remote snapshot was not modified.
 - E2E: writable mmap is rejected where detectable or covered by an explicit unsupported-behavior test.

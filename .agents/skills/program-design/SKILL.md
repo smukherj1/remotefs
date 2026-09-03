@@ -61,21 +61,28 @@ explicitly. Do not re-derive invariants the technical design already establishes
 
 The new version of the component's publicly visible structs as a code snippet:
 
-- One doc comment on the struct explaining its new purpose.
-- Every member with its own doc comment, using the real struct names from the codebase.
+- One doc comment on the struct explaining its purpose. Omit the comment if the purpose
+  is unchanged.
+- Every member with its own doc comment, using the real struct names from the codebase. Omit
+  members that haven't changed.
 - Supporting structs the component is built from, each with their own comments.
 - Real language and real type names; no pseudocode.
+- For structs or struct member whose behavior has changed, include a comment with
+  "Changes (DO NOT INCLUDE IN IMPLEMENTATION)" explaining the changes.
 
 ### `### Public API`
 
-The complete callable surface, code-snippet form. Each method is documented so
-an implementer can code to it without guessing:
+The complete callable surface, code-snippet form. Each new or changed method is documented so
+an implementer can code to it without guessing. Omit methods that haven't changed with a single
+"... other methods unchanged ... ":
 
 - What the method does.
 - What each argument represents.
 - What is returned and the error conditions.
 - Side effects: I/O, cache admission or admission removal, counter updates,
   durable writes, locking, lifecycle transitions.
+- For methods whose behavior has changed, include a comment with
+  "Changes (DO NOT INCLUDE IN IMPLEMENTATION)" explaining the changes.
 - When the refactor removes public names, list them explicitly (e.g.,
   "Removed from the public boundary: `X`, `Y`").
 
@@ -87,10 +94,17 @@ this subsection, using the module-private visibility as written.
 Only for components that own durable state (repositories, stores, daemons).
 Document:
 
-- The exact SQL for the new or changed tables and indexes.
+- Omit tables that haven't changed at all.
+- The exact SQL for the new or changed tables and indexes. Omit indexes that
+  haven't changed.
+- All the columns added, updated or removed within a table with comments
+  documenting their (potentially updated) purpose.
+- Omit columns that haven't changed.
 - The bulleted validation and enforcement rules applied by the private row
   decoder or write validator.
 - What is dropped or renamed, and whether existing data is migrated.
+- For tables, columns or indices that changed, include a comment with
+  "Changes (DO NOT INCLUDE IN IMPLEMENTATION)" explaining the changes.
 
 ### `### Unit tests`
 

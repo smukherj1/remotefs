@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS inodes (
     mtime_seconds           INTEGER,
     -- Normalized nanosecond fraction paired with mtime_seconds.
     mtime_nanos             INTEGER,
-    -- Boolean indicating the row hides its namespace entry.
+    -- Boolean indicating the inode was unlinked. However, any existing
+    -- open handles to the inode may still read the inode. An enhancement
+    -- would be to garbage collect the inode when the last open handle to
+    -- the inode closes it after it's been tombstoned / unlinked.
     tombstone               INTEGER NOT NULL,
     -- Immutable regular-file content digest; null for other kinds.
     file_remote_digest      TEXT,
