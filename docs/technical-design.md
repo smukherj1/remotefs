@@ -175,9 +175,8 @@ service adapter modules and are not CLI command/result types. `rusqlite` and
 SQLite row types do not escape the common session module.
 
 `rfs_common::session::Session` is the one concrete facade for local state used
-by the daemon filesystem. It owns a unified `BlobCache` and one
-`ActiveSession`; `ActiveSession` privately owns `SessionStore` and
-`OverlayStore`. Callers cannot access those children. `Session::open` owns
+by the daemon filesystem. It privately owns `CachedBlobStore`, `SessionStore`,
+and `OverlayStore`; callers cannot access those children. `Session::open` owns
 locking, unconditional replacement of the previous session tree, fresh active
 session creation, and explicit idempotent clean close. It does not validate,
 reuse, migrate, or repair a previous session. `Session::control_endpoint`
@@ -206,30 +205,30 @@ connection enables foreign keys and retains SQLite rollback-journal mode.
 Retained inspection opens a separate read-only connection and closes it after
 one validated result.
 
-The local hierarchy uses one contextual `SessionError`; private helpers attach
-the owning operation and stable entity while preserving I/O and SQLite sources.
-`FilesystemService` separately owns CAS, REAPI, and orchestration errors. The
-daemon maps failures to safe control responses; the client exposes stable error
-codes without tonic types; only the CLI renders command errors.
+The session hierarchy uses one contextual `SessionError`; private helpers attach
+the owning operation and stable entity while preserving local, CAS, and REAPI
+diagnostics. Every `SessionError` variant maps to a specific
+`FilesystemError` variant when `FilesystemService` calls `Session`.
+`FilesystemError` may also contain failures owned only by the higher-level
+filesystem component. The daemon maps failures to safe control responses; the
+client exposes stable error codes without tonic types; only the CLI renders
+command errors.
 
 `rfsd` constructs exactly one `FilesystemService` for the lifetime of its mount,
 and every FUSE filesystem operation is routed through that instance. The
-service is the synchronization and remote-orchestration layer around `Session`;
+service is the filesystem-policy layer around `Session`;
 constructing multiple services over the same session or cache is outside the
 daemon's supported concurrency model. SQLite remains authoritative for the
 namespace.
 
-The service's only mutable operation-coordination state is a keyed map that
-deduplicates in-progress remote blob downloads. A digest-specific lock
-serializes the cache-presence check, remote stream, verification, and admission
-for that digest. This makes a separate cache check followed by writer creation
-safe within the single-service daemon invariant; atomic no-clobber admission
-still protects the cache against an already-existing destination. `Session`
-exposes an opaque write-only `BlobWriter`; the service streams through
-`BlobStore::stream_blob` and then asks `Session` to verify, sync, and atomically
-admit the completed object. The async tonic implementation is bridged inside
-the remote-aware daemon layer and does not make the FUSE or local-session APIs
-asynchronous.
+`Session` owns a private synchronous `CachedBlobStore`. `CachedBlobStore` owns
+the remote `BlobStore`, the async-runtime bridge, and the keyed map that
+deduplicates in-progress downloads. On a cache miss it holds the digest-specific
+lock across the recheck, remote stream, verification, sync, and atomic
+no-clobber admission. REAPI directory decoding is also performed within the
+session hierarchy after the serialized directory blob is read. These details
+do not escape through the `Session` API, and neither the FUSE adapter nor
+`FilesystemService` performs CAS or REAPI orchestration.
 
 The MVP permits only one active mount session per `RFS_HOME`. Writable daemon
 session startup acquires `RFS_HOME/session.lock`; if another process holds that

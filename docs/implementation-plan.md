@@ -730,17 +730,15 @@ Deliverables:
 - Use the modern Rust module layout: keep the facade in `src/session.rs` and
   its private cache, overlay, store, and schema components under `src/session/`;
   keep the CLI module in `crates/rfs/src/cli.rs`.
-- Split private ownership into `BlobCache` and `ActiveSession`, with
-  `ActiveSession` privately owning `SessionStore` and `OverlayStore`. Do not
-  expose child accessors.
+- Give `Session` private ownership of `CachedBlobStore`, `SessionStore`, and
+  `OverlayStore`. Do not expose child accessors.
 - Replace the database worker, command enum, channels, capability traits, trait
   objects, and forwarding stores with one mutex-protected
   `rusqlite::Connection` and focused transactionally complete store methods.
 - Introduce the agreed boundary types: `InodeId`, shared `NodeKind`, `NodeTime`,
-  `Node`, `RemoteChild`, `RemoteContent`, lazy lookup/read outcomes, and the
-  opaque write-only `BlobWriter`. `FilesystemService` owns the digest-locked
-  cache check and remote stream; `Session::start_blob_download` creates the
-  writer after that check.
+  `Node`, `RemoteChild`, `RemoteContent`, and lazy lookup/read outcomes.
+  `Session` privately owns `CachedBlobStore`; that store owns the digest-locked
+  cache check, remote stream, verification, and admission.
 - Make SQLite authoritative for visible nodes. Remove daemon inode and decoded
   directory maps; lazily materialize complete remote child sets atomically and
   idempotently through `Session`.
@@ -768,20 +766,19 @@ Deliverables:
 - Keep every `Session` and `FilesystemService` operation synchronous. Construct
   exactly one `FilesystemService` for the lifetime of each `rfsd` mount and
   route every FUSE filesystem operation through it. `FilesystemService` remains
-  in `rfsd` as the synchronization layer around `Session`, owns the CAS and
-  REAPI orchestration, and uses a keyed map to serialize each digest's cache
-  check, remote download, verification, and admission. Multiple filesystem
-  services sharing one session or cache are outside the daemon concurrency
-  model.
+  in `rfsd` as filesystem policy around `Session`. `CachedBlobStore` remains
+  private to `Session`, owns the `BlobStore` and async-runtime bridge, and uses
+  a keyed map to serialize each digest's cache check, remote download,
+  verification, and admission.
 - Add `BlobStore::stream_blob`; implement `download_blob` as a collecting
-  convenience over it. Stream large downloads into a shard-local
-  `BlobWriter`, then verify, sync, and atomically admit them through
-  `Session::finalize_blob`.
+  convenience over it. `CachedBlobStore` streams downloads into a shard-local
+  temporary file, then verifies, syncs, and atomically admits them.
 - Use one contextual `SessionError` throughout the private local hierarchy.
-  Keep CAS, REAPI decoding, and remote orchestration errors owned by
-  `FilesystemService`. Represent impossible post-admission inode states with a
-  daemon-owned `FilesystemError::InvalidInode` and map them to `EIO`, rather
-  than fabricating path-based stale-session errors.
+  Keep CAS download and REAPI decoding errors within that session hierarchy.
+  Every `SessionError` variant maps to a specific `FilesystemError` variant;
+  the higher-level filesystem enum may additionally represent filesystem-only
+  failures. Represent impossible inode states with the daemon-owned
+  `FilesystemError::InvalidInode` and map them to `EIO`.
 - Compose live daemon status from `Session::info` plus daemon telemetry and
   feature state. Keep cache and session roots out of the control protocol and
   CLI JSON. Keep control-endpoint discovery separate from one-shot retained
@@ -803,13 +800,13 @@ Tests:
   without an in-memory namespace map.
 - Unit: mode and mtime absence remain durable while `Node` exposes the agreed
   effective defaults.
-- Unit: `BlobWriter` streams without seeking, rejects excess size, verifies
-  size and SHA-256, removes unfinished temporaries, and admits with atomic
-  no-clobber behavior.
+- Unit: `CachedBlobStore` streams into a temporary file, rejects excess size,
+  verifies size and SHA-256, removes unfinished temporaries, and admits with
+  atomic no-clobber behavior.
 - Unit: concurrent missing reads cause one remote stream through the
-  service-owned per-digest lock.
+  cache-owned per-digest lock.
 - Unit: complete directory objects use `read_blob`; large file content uses
-  inode-based range reads and `NeedsDownload` retry flow.
+  inode-based range reads after `CachedBlobStore` fills and admits a cache miss.
 - Integration: unified cache entries are reused by both directory decoding and
   file reads across sequential fresh sessions.
 - Integration: retained inspection remains best-effort and read-only, clean
