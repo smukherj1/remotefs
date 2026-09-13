@@ -268,7 +268,7 @@ async fn run_mount(
     let daemon = daemon_executable()?;
     let mut child = Command::new(&daemon)
         .arg(digest.to_string())
-        .arg(&mountpoint)
+        .arg(mountpoint)
         .arg("--cas-url")
         .arg(&cas.cas_url)
         .arg("--instance-name")

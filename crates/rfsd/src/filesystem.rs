@@ -10,6 +10,18 @@ use thiserror::Error;
 /// Errors from filesystem policy and session operations.
 #[derive(Debug, Error)]
 pub enum FilesystemError {
+    /// An unexpected failure in the session hierarchy.
+    #[error("filesystem internal error: {reason}")]
+    InternalError {
+        /// Description of the unexpected failure.
+        reason: String,
+    },
+    /// The session lifecycle prevents the requested operation.
+    #[error("current filesystem state does not permit this operation: {reason}")]
+    FailedPreconditionError {
+        /// State that prevented the operation.
+        reason: String,
+    },
     /// A requested inode or directory entry does not exist.
     #[error("not found: {reason}")]
     NotFound { reason: String },
@@ -22,15 +34,6 @@ pub enum FilesystemError {
     /// A filesystem request has invalid arguments.
     #[error("invalid filesystem argument: {reason}")]
     InvalidArgument { reason: String },
-    /// A session operation for an inode failed.
-    #[error("filesystem operation for inode {inode} failed: {source}")]
-    Session {
-        /// Inode that was the subject of the operation.
-        inode: InodeId,
-        /// Preserved session failure.
-        #[source]
-        source: SessionError,
-    },
     /// A visible inode has an impossible filesystem representation.
     #[error("inode {inode} has an invalid state: {reason}")]
     InvalidInode {
@@ -59,6 +62,28 @@ impl ResultContextError for FilesystemError {
     }
 }
 
+impl From<SessionError> for FilesystemError {
+    /// Preserves an existing session failure category and recursively maps context.
+    fn from(source: SessionError) -> Self {
+        match source {
+            SessionError::InternalError { reason } => Self::InternalError { reason },
+            SessionError::FailedPreconditionError { reason } => {
+                Self::FailedPreconditionError { reason }
+            }
+            SessionError::NotFound { reason } => Self::NotFound { reason },
+            SessionError::NotDirectory { reason } => Self::NotDirectory { reason },
+            SessionError::IsDirectory { reason } => Self::IsDirectory { reason },
+            source @ SessionError::Database { .. } => Self::InternalError {
+                reason: source.to_string(),
+            },
+            SessionError::Context { operation, source } => Self::Context {
+                operation,
+                source: Box::new(Self::from(*source)),
+            },
+        }
+    }
+}
+
 /// Synchronous daemon filesystem policy over one mounted `Session`.
 pub struct FilesystemService {
     /// Mounted-workspace facade that executes every namespace and content read.
@@ -83,7 +108,7 @@ impl FilesystemService {
     ) -> Result<Inode, FilesystemError> {
         self.session
             .lookup_child(dir_inode, child_name)
-            .map_err(|source| filesystem_error(dir_inode, source))
+            .map_err(FilesystemError::from)
             .with_context(|| format!("look up `{child_name}` in directory inode {dir_inode}"))
     }
 
@@ -91,7 +116,7 @@ impl FilesystemService {
     pub fn readdir(&self, inode: InodeId) -> Result<Vec<Inode>, FilesystemError> {
         self.session
             .list_directory(inode)
-            .map_err(|source| filesystem_error(inode, source))
+            .map_err(FilesystemError::from)
             .with_context(|| format!("read directory inode {inode}"))
     }
 
@@ -99,7 +124,7 @@ impl FilesystemService {
     pub fn getattr(&self, inode: InodeId) -> Result<Inode, FilesystemError> {
         self.session
             .get_inode(inode)
-            .map_err(|source| filesystem_error(inode, source))
+            .map_err(FilesystemError::from)
             .with_context(|| format!("read attributes for inode {inode}"))
     }
 
@@ -122,25 +147,12 @@ impl FilesystemService {
     pub fn read(&self, inode: InodeId, offset: u64, size: usize) -> Result<Bytes, FilesystemError> {
         self.session
             .read_range(inode, offset, size)
-            .map_err(|source| filesystem_error(inode, source))
+            .map_err(FilesystemError::from)
             .with_context(|| format!("read {size} bytes at offset {offset} from inode {inode}"))
     }
 
     /// Returns the session's point-in-time cache and download metrics.
     pub fn counters(&self) -> IoCounters {
         self.session.io_counters()
-    }
-}
-
-fn filesystem_error(inode: InodeId, source: SessionError) -> FilesystemError {
-    match source {
-        SessionError::Context { operation, source } => FilesystemError::Context {
-            operation,
-            source: Box::new(filesystem_error(inode, *source)),
-        },
-        SessionError::NotFound { reason } => FilesystemError::NotFound { reason },
-        SessionError::NotDirectory { reason } => FilesystemError::NotDirectory { reason },
-        SessionError::IsDirectory { reason } => FilesystemError::IsDirectory { reason },
-        source => FilesystemError::Session { inode, source },
     }
 }

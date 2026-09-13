@@ -175,30 +175,51 @@ pub struct IoCounters {
 pub enum SessionError {
     /// Unexpected local-session failure.
     #[error("session internal error: {reason}")]
-    InternalError { reason: String },
+    InternalError {
+        /// Description of the unexpected failure.
+        reason: String,
+    },
     /// Current state blocks the operation.
     #[error("current session state does not permit this operation: {reason}")]
-    FailedPreconditionError { reason: String },
+    FailedPreconditionError {
+        /// State that prevented the operation.
+        reason: String,
+    },
     /// Requested inode or entry is not visible.
     #[error("not found: {reason}")]
-    NotFound { reason: String },
+    NotFound {
+        /// Inode or entry that was not visible.
+        reason: String,
+    },
     /// Directory operation received another node kind.
     #[error("not a directory: {reason}")]
-    NotDirectory { reason: String },
+    NotDirectory {
+        /// Node whose kind did not satisfy the directory operation.
+        reason: String,
+    },
     /// Regular-file operation received a directory.
     #[error("is a directory: {reason}")]
-    IsDirectory { reason: String },
+    IsDirectory {
+        /// Directory supplied to a regular-file operation.
+        reason: String,
+    },
     /// A SQLite API operation failed.
     #[error("SQLite {operation} failed on db {dbpath}: {source}")]
     Database {
+        /// SQLite operation that failed.
         operation: String,
+        /// Database on which the operation failed.
         dbpath: PathBuf,
+        /// Original SQLite failure.
         #[source]
         source: rusqlite::Error,
     },
+    /// Adds the owning session operation to a failure.
     #[error("{operation}: {source}")]
     Context {
+        /// Session operation that failed.
         operation: String,
+        /// Original session failure.
         #[source]
         source: Box<SessionError>,
     },

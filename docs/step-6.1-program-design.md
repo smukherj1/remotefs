@@ -12,7 +12,7 @@ The order is normative. Each design starts from the completed preceding design.
 
 | Order | Mini-program design | `Session` change |
 | --- | --- | --- |
-| 6.1.1 | [Existing session error mapping](step-6.1/01-existing-error-mapping.md) | Align errors already returned by the read-only `Session` API. |
+| 6.1.1 | [Existing session error mapping](step-6.1/01-existing-error-mapping.md) | Complete — align errors already returned by the read-only `Session` API. |
 | 6.1.2 | [Visible child lookup](step-6.1/02-visible-child-lookup.md) | Update `Session::lookup_child` to select only the visible row. |
 | 6.1.3 | [Visible directory listing](step-6.1/03-visible-directory-listing.md) | Update `Session::list_directory` to omit tombstones. |
 | 6.1.4 | [Create an empty file](step-6.1/04-create-file.md) | Add `Session::create_file`. |

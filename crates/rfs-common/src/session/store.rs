@@ -102,6 +102,8 @@ impl SessionStore {
     /// Fetches one inode row without applying visibility policy.
     pub(super) fn inode(&self, inode: InodeId) -> Result<Option<Inode>, SessionError> {
         let connection = self.connection("read inode")?;
+        self.ensure_active(&connection)
+            .context("check session lifecycle before reading inode")?;
         self.get_inode_by_id(&connection, inode)
     }
 
@@ -114,6 +116,8 @@ impl SessionStore {
             )
         })?;
         let connection = self.connection("create sql db connection to read child")?;
+        self.ensure_active(&connection)
+            .context("check session lifecycle before reading child")?;
         self.lookup_child_in_dir_inode(&connection, parent, name)
     }
 
@@ -123,6 +127,8 @@ impl SessionStore {
         parent: InodeId,
     ) -> Result<Vec<Inode>, SessionError> {
         let connection = self.connection("list children")?;
+        self.ensure_active(&connection)
+            .context("check session lifecycle before listing children")?;
         self.get_directory_children_on(&connection, parent)
     }
 
@@ -140,6 +146,8 @@ impl SessionStore {
         children: &[Inode],
     ) -> Result<Vec<Inode>, SessionError> {
         self.with_transaction("get or create directory children", |transaction| {
+            self.ensure_active(transaction)
+                .context("check session lifecycle before materializing directory children")?;
             let parent_inode = self
                 .get_inode_by_id(transaction, parent)
                 .with_context(|| format!("read parent inode {parent} to create its children"))?
@@ -820,17 +828,16 @@ fn validate_file_inode(inode: &Inode) -> Result<(), SessionError> {
             inode.name
         )));
     }
-    match (&inode.file_remote_digest, &inode.file_overlay_path) {
-        (Some(digest), Some(overlay_path)) => {
-            return Err(internal_error(format!(
-                "file inode `{}` specified both remote digest {} and an overlay path {}, only one of these is permitted at a given time",
-                inode.name,
-                digest,
-                overlay_path.display()
-            )));
-        }
-        (_, _) => {}
-    };
+    if let (Some(digest), Some(overlay_path)) =
+        (&inode.file_remote_digest, &inode.file_overlay_path)
+    {
+        return Err(internal_error(format!(
+            "file inode `{}` specified both remote digest {} and an overlay path {}, only one of these is permitted at a given time",
+            inode.name,
+            digest,
+            overlay_path.display()
+        )));
+    }
     Ok(())
 }
 

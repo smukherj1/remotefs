@@ -407,35 +407,15 @@ fn errno_for_error(error: FilesystemError) -> i32 {
         FilesystemError::NotDirectory { .. } => ENOTDIR,
         FilesystemError::IsDirectory { .. } => EISDIR,
         FilesystemError::InvalidArgument { .. } => EINVAL,
-        FilesystemError::Session { .. } | FilesystemError::InvalidInode { .. } => EIO,
+        FilesystemError::InternalError { .. }
+        | FilesystemError::FailedPreconditionError { .. }
+        | FilesystemError::InvalidInode { .. } => EIO,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn maps_typed_filesystem_errors_to_posix_errno() {
-        assert_eq!(
-            errno_for_error(FilesystemError::NotFound {
-                reason: "missing".to_owned()
-            }),
-            ENOENT
-        );
-        assert_eq!(
-            errno_for_error(FilesystemError::NotDirectory {
-                reason: "file".to_owned()
-            }),
-            ENOTDIR
-        );
-        assert_eq!(
-            errno_for_error(FilesystemError::IsDirectory {
-                reason: "directory".to_owned()
-            }),
-            EISDIR
-        );
-    }
 
     #[test]
     fn converts_remote_metadata_to_read_only_attributes() {

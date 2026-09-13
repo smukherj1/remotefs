@@ -141,7 +141,7 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
 async fn reconstruct_directory(client: &CasClient, digest: &Digest, destination: &Path) {
     fs::create_dir_all(destination).unwrap();
     let bytes = client.download_blob(digest).await.unwrap();
-    let directory = decode_directory(&digest, bytes).unwrap();
+    let directory = decode_directory(digest, bytes).unwrap();
 
     for file in directory.files {
         let digest = Digest::from_reapi(file.digest.as_ref().unwrap()).unwrap();
