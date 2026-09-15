@@ -7,49 +7,54 @@ description: |
 
 # Coding Guidelines
 
-Write the simplest correct code. Expose control flow, ownership, invariants, and failures.
-
-## Workflow
-
-- Follow project and language rules when they conflict with this skill; report the tradeoff.
-- Before editing, identify operation boundaries, invariants, edge cases, and error identifiers. Inspect affected adjacent code, not only added lines.
-- Before handoff, audit the full diff, each changed source file's item order, and every changed function against all sections. Resolve violations or justify safer, clearer exceptions.
-- State audit completion and exceptions in the final response.
-- In reviews, report supported findings with location, impact, and remediation; omit unsupported style preferences.
-
 ## Public API
 
-- Keep items private unless another module needs them.
+- Keep methods, functions, structs, types, variables and constants private unless another module needs them.
+- Minimize the public API surface of a module to simplify dependencies.
 - Expose domain concepts, not transport plumbing.
-- Pass constructed resource owners across operational boundaries, not the paths,
-  connection details, or configuration used to create them. Restrict those
-  construction inputs to open/create/setup code.
-- Preserve compatibility unless the task includes migration.
 
 ## Structure
 
-- Keep one contiguous public API section at the top of each source file, followed by private implementation items; do not resume public declarations after private ones.
-- Give each function one operation or decision; use early returns to expose the main path.
+### File Structure
+
+- Put all file level constants, variables in a contiguous block at the top. Sequence: Public constants, private constants, public variables, private variables.
+- Keep one contiguous public API (types and functions) section at the top of each source file, followed by private implementation items; do not resume public declarations after private ones.
+- Once an invariant has been verified in a public API, avoid re-verifying it in deeper helpers or later non-public methods unless these helpers are used in another public API code path
+  that doesn't check the invariant.
+
+### Functions
+
+- Use comments to document functions as follows:
+  - What the function does.
+  - Each input argument, type and the expected value / constraints.
+  - The returned result(s) and what they contain. Explain how it's related
+    to the input if applicable.
+  - Any side effects if any.
+  - Possible errors.
+- Aim for a function to be single responsibility. Delegate to helpers if a
+  function does multiple things.
+- Prefer returning early at the top of the function for edge conditions.
+- Avoid nesting multiple levels of if/else or other control flow checks. Prefer
+  returning or delegating the nested control flow to a function. Also avoid more than
+  one level of nesting within a for loop wherever possible.
+- Similarly, audit functions longer than 50 lines and prefer breaking them into helper
+  functions.
 - Extract branches that form distinct workflows or obscure control flow.
-- Keep orchestration at one abstraction level: named phases, not phase internals.
-- Review functions over about 40 non-blank lines, nesting beyond two control-flow levels, or long conditional/match chains. These trigger judgment, not automatic extraction; prefer helpers, early exits, or policy types when they improve verification.
-- Dispatch heterogeneous loop items through a function returning a domain result; keep classification and side effects out of the loop body.
-- Separate request construction, I/O, response validation, and transformation when their boundaries matter.
-- Check an invariant once per function. Revalidate across boundaries only if data may change or the check prevents memory corruption, termination, or an invalid external operation.
-- Keep refactors within the ownership boundary of the change. Separate unrelated cleanup.
-- Prefer direct code over single-use abstractions that hide control flow.
+- Avoid abstractions (types or helper functions) that are only used in a single place unless
+  it's to shorten a function body, loop or control flow (if/else/match) condition below 10s of
+  lines.
 - ALWAYS use the modern rust module layout, i.e., NEVER create <module name>/mod.rs. Instead create <module name>.rs and <mod ulename>/<sub module>.rs files.
 
 ## Types, Configuration, and Data
 
 - Represent closed sets with enums or domain types, not strings.
-- Reuse an existing boundary or persistence type when its fields and semantics
-  match; introduce a second shape only for a distinct invariant or operation.
+- Minimize the number of public types, enums and constants.
+- Document the purpose and members/variant of every type and enum.
+- Document the purpose of every constant and module level variables.
 - Name shared limits and defaults as module level constants with comments documenting their purpose.
 - Validate configuration at construction; make invalid states unrepresentable when feasible.
-- Make lossy, truncating, overflowing, or semantic conversions explicit.
-- Clone only for ownership, async execution, retries, or API boundaries.
-- Borrow or stream large values; minimize retention.
+- Prefer reusing types when introducing new ones. Consider if refactoring out
+  common elements into a shared type is possible.
 
 ## Errors
 
