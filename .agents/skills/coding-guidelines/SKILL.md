@@ -61,7 +61,6 @@ description: |
 - Audit every propagation site (`?`, throw, rejection). Always add context on what was being attempted.
 - NEVER use raw ? to return errors without additional context. Implement the Context error enum variant
   allowing usage of the error_context module in rfs-common to add context for errors.
-- Include stable identifiers: paths, digests, operations, instances, resources, entries, environment variables, and proto paths.
 - Construct formatted or allocated context lazily.
 - Use `anyhow::Context` only in functions returning `anyhow::Result`. Use RemoteFS context helpers for typed errors such as `TreeError`, `CasError`, `UploadError`, `DigestError`, and `ConfigError`.
 - Preserve structured errors; use `map_err` to create identifier-bearing variants.
