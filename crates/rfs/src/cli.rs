@@ -12,8 +12,15 @@ use crate::bootstrap_upload::{BootstrapUploadConfig, BootstrapUploader};
 use crate::daemon_client::{ControlEndpoint, DaemonClient, SessionStatus};
 use rfs_common::config::{Config, ConfigError};
 use rfs_common::digest::{Digest, DigestError};
+use rfs_common::error_context::ResultContext;
 use rfs_common::logging::{self, LogFormat};
 use rfs_common::session::{Session, SessionError, SessionInfo};
+
+/// How long `rfs unmount` waits for the daemon process to exit after it
+/// accepted the shutdown request.
+const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay between checks for daemon process exit.
+const DAEMON_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -457,13 +464,83 @@ fn render_retained_status(session: SessionInfo, json: bool) {
     }
 }
 
+/// Shuts down the active daemon and confirms that it closed its session.
+///
+/// Reads the mountpoint and daemon PID from `status`, sends `shutdown`, waits
+/// up to `DAEMON_EXIT_TIMEOUT` for the process to exit, then inspects the
+/// retained session. Prints `unmounted <mountpoint>` only when the daemon
+/// exited and the retained session is `closed`.
+///
+/// Errors: daemon request failures; retained-state inspection failures; a
+/// `daemon_shutdown` failure when the daemon is still running after the
+/// timeout or exited without closing its session. Shutdown failures name the
+/// daemon log so the user can find the cause.
 async fn run_unmount(config: &Config) -> Result<(), CliError> {
     let mut client = daemon_client(config).await.map_err(client_error)?;
     let status = client.status().await.map_err(client_error)?;
-    let mountpoint = status.mountpoint;
-    client.unmount().await.map_err(client_error)?;
-    println!("unmounted {}", mountpoint.display());
-    Ok(())
+    client.shutdown().await.map_err(client_error)?;
+    let exited = wait_for_process_exit(status.daemon_pid).await;
+    let session = Session::inspect(config)
+        .context("getting session info")
+        .map_err(state_error)?;
+    let closed = session.as_ref().is_some_and(|session| session.closed);
+    if exited && closed {
+        println!("unmounted {}", status.mountpoint.display());
+        return Ok(());
+    }
+    let problem = if exited {
+        format!(
+            "daemon pid {} exited without closing its session",
+            status.daemon_pid
+        )
+    } else {
+        format!(
+            "daemon pid {} is still shutting down after {} seconds",
+            status.daemon_pid,
+            DAEMON_EXIT_TIMEOUT.as_secs()
+        )
+    };
+    // The session tree only disappears if something else removed it, so the
+    // log may be unavailable.
+    let message = match session {
+        Some(session) => format!("{problem}; inspect `{}`", session.log_path.display()),
+        None => format!("{problem}; retained session state is missing"),
+    };
+    Err(CliError::CommandFailed {
+        category: "daemon_shutdown",
+        message,
+    })
+}
+
+/// Waits until process `pid` no longer exists, for at most `DAEMON_EXIT_TIMEOUT`.
+///
+/// Returns `true` once the process is gone and `false` on timeout. Has no
+/// side effects on the process.
+async fn wait_for_process_exit(pid: u32) -> bool {
+    let deadline = Instant::now() + DAEMON_EXIT_TIMEOUT;
+    while process_exists(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DAEMON_EXIT_POLL_INTERVAL).await;
+    }
+    true
+}
+
+/// Returns whether process `pid` exists, using `kill(pid, 0)`.
+///
+/// Only `ESRCH` means the process is gone. Other failures, such as `EPERM`,
+/// mean the process exists but cannot be signalled, so they count as running.
+/// A PID that does not fit `pid_t` cannot name a process.
+fn process_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 performs only the existence and permission check.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn client_error(error: crate::daemon_client::ClientError) -> CliError {

@@ -155,6 +155,9 @@ pub struct SessionInfo {
     pub control_endpoint: PathBuf,
     /// Path to the retained daemon log file.
     pub log_path: PathBuf,
+    /// Whether the session completed its durable active-to-closed transition.
+    /// Always `false` for the active daemon's own view.
+    pub closed: bool,
 }
 
 /// Metrics for remote blob downloads and verified-cache hits.
@@ -372,7 +375,8 @@ impl Session {
         })
     }
 
-    /// Returns immutable startup facts without I/O.
+    /// Returns immutable startup facts without I/O. `closed` is always `false`
+    /// because the caller holds the open session.
     pub fn info(&self) -> SessionInfo {
         SessionInfo {
             root_digest: self.root_digest.clone(),
@@ -380,6 +384,7 @@ impl Session {
             daemon_pid: std::process::id(),
             control_endpoint: self.layout.control_endpoint.clone(),
             log_path: self.layout.log_path(),
+            closed: false,
         }
     }
 
@@ -390,6 +395,10 @@ impl Session {
     }
 
     /// Inspects retained session metadata without creating, locking, or modifying state.
+    ///
+    /// Returns `None` when no session tree exists. Otherwise returns the stored
+    /// facts, with `closed` set only when the stored lifecycle is `closed`. A
+    /// daemon that exited without closing leaves `closed` as `false`.
     pub fn inspect(config: &Config) -> Result<Option<SessionInfo>, SessionError> {
         ensure_reader_home(config)?;
         let layout = SessionLayout::new(&config.rfs_home);
@@ -403,6 +412,7 @@ impl Session {
             daemon_pid: stored.daemon_pid,
             control_endpoint: layout.control_endpoint.clone(),
             log_path: layout.log_path(),
+            closed: stored.state == SessionLifecycle::Closed,
         }))
     }
 

@@ -1128,6 +1128,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "googletest",
+ "libc",
  "predicates",
  "rfs-common",
  "serde",

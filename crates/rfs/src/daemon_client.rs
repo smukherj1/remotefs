@@ -187,10 +187,16 @@ impl DaemonClient {
             })
     }
 
-    /// Completes daemon teardown; this client is consumed after the request.
-    pub async fn unmount(mut self) -> Result<(), ClientError> {
+    /// Asks the daemon to shut down; this client is consumed by the request.
+    ///
+    /// Success means only that the daemon accepted the request. The daemon
+    /// releases its resources afterwards and then exits, so callers that need
+    /// a completed release must wait for the process and inspect retained
+    /// state. Errors: `Remote` with `daemon_unavailable` when the daemon is
+    /// already shutting down, or any other request failure.
+    pub async fn shutdown(mut self) -> Result<(), ClientError> {
         self.inner
-            .unmount(protocol::UnmountRequest {
+            .shutdown(protocol::ShutdownRequest {
                 protocol_version: PROTOCOL_VERSION,
             })
             .await

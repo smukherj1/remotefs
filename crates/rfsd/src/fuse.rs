@@ -59,7 +59,7 @@ impl FuseMount {
         Ok(Self { session })
     }
 
-    /// Unmounts synchronously so a successful control response means teardown completed.
+    /// Unmounts and joins the FUSE thread, blocking until teardown completes.
     pub(crate) fn unmount(self) {
         self.session.join();
     }

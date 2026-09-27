@@ -120,12 +120,20 @@ at startup. The daemon owns:
 - The shared local cache handles.
 - The active session SQLite database.
 - The active session overlay data directory.
-- The Unix control socket.
+- The Unix control socket, which serves the `CheckProtocol`, `Status`,
+  `Snapshot`, and `Shutdown` control RPCs.
 - Snapshot upload for the mounted workspace.
-- Graceful session close before a successful unmount response.
+- Graceful session close before exiting successfully. The `Shutdown` RPC, a
+  SIGINT or SIGTERM, or the control server exiting detaches the daemon's
+  resources exactly once. The daemon then unmounts FUSE, closes the session,
+  and removes the socket. If release fails, the daemon exits with an error and
+  leaves retained state for inspection. The `Shutdown` response confirms only
+  that the daemon accepted the request.
 
 The CLI owns parsing, presentation, daemon process startup, read-only retained
-session inspection, and calls through the command-oriented daemon client. The
+session inspection, and calls through the command-oriented daemon client.
+`rfs unmount` succeeds only after the daemon process exits and retained
+inspection reports the session `closed`. The
 only domain-work exception is bootstrap `rfs upload`, exposed through a narrow
 configured capability whose operation accepts a local path and returns a root
 digest. CAS clients, tree traversal, batching, and encoding are not CLI APIs.
@@ -178,7 +186,7 @@ SQLite row types do not escape the common session module.
 by the daemon filesystem. It privately owns `CachedBlobStore`, `SessionStore`,
 and `OverlayStore`; callers cannot access those children. `Session::open` owns
 locking, unconditional replacement of the previous session tree, fresh active
-session creation, and explicit idempotent clean close. It does not validate,
+session creation, and explicit one-shot clean close. It does not validate,
 reuse, migrate, or repair a previous session. `Session::control_endpoint`
 discovers the fixed socket without opening SQLite, and `Session::inspect`
 performs one-shot best-effort retained inspection without creating, locking,

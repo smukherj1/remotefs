@@ -8,9 +8,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use assert_cmd::cargo::cargo_bin;
+use rfs_common::config::Config;
+use rfs_common::session::Session;
 
 const LOCAL_CAS_ADDR: &str = "127.0.0.1:9092";
 
+/// Uploads a small tree to the local CAS, mounts it through `rfs mount`, reads
+/// it lazily through FUSE, then unmounts.
+///
+/// Setup: a fresh `RFS_HOME`, a source tree with a file, a nested file, and a
+/// symlink, and an empty mountpoint. Reads and mmap are expected to succeed;
+/// writes are expected to fail because the mount is read-only. `rfs unmount`
+/// is expected to succeed only after the daemon released everything, which
+/// the final checks confirm through retained inspection and the process table.
 #[test]
 fn upload_mount_lazy_read() -> Result<()> {
     verify_prerequisites();
@@ -62,6 +72,7 @@ fn upload_mount_lazy_read() -> Result<()> {
     assert!(fs::write(mountpoint.join("root.txt"), b"changed").is_err());
     assert!(fs::create_dir(mountpoint.join("new-directory")).is_err());
     unmount(&home)?;
+    assert_daemon_released(&home)?;
     Ok(())
 }
 
@@ -93,6 +104,34 @@ fn unmount(home: &std::path::Path) -> Result<()> {
         .arg("unmount")
         .assert()
         .success();
+    Ok(())
+}
+
+/// Checks that a successful `rfs unmount` left the daemon fully released: the
+/// daemon process has exited, the retained session is `closed`, and the
+/// control socket is gone. These are the guarantees `rfs unmount` promises,
+/// so they are read through public retained inspection rather than internals.
+fn assert_daemon_released(home: &std::path::Path) -> Result<()> {
+    let config = Config {
+        rfs_home: home.to_path_buf(),
+    };
+    let session = Session::inspect(&config)
+        .context("inspect retained session after unmount")?
+        .context("retained session is missing after unmount")?;
+    let pid = libc::pid_t::try_from(session.daemon_pid)?;
+    // SAFETY: signal 0 performs only the existence and permission check.
+    let alive = unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+    assert!(!alive, "daemon pid {pid} is still running after unmount");
+    assert!(
+        session.closed,
+        "retained session is not closed after unmount"
+    );
+    assert!(
+        !session.control_endpoint.exists(),
+        "control socket {} still exists after unmount",
+        session.control_endpoint.display()
+    );
     Ok(())
 }
 

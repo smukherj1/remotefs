@@ -10,8 +10,9 @@ service Control {
   rpc Status(StatusRequest) returns (StatusResponse);
   // Creates a remote snapshot of the active session.
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
-  // Requests a clean shutdown of the active session.
-  rpc Unmount(UnmountRequest) returns (UnmountResponse);
+  // Asks the daemon to release its resources and exit. The response confirms
+  // only that the daemon accepted the request, not that release finished.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
 
 // Requests protocol compatibility validation.
@@ -71,10 +72,11 @@ message SnapshotResponse {
 }
 
 // Requests a clean daemon shutdown.
-message UnmountRequest {
+message ShutdownRequest {
   // Control protocol version required by the client.
   uint32 protocol_version = 1;
 }
 
-// Confirms that the daemon accepted the shutdown request.
-message UnmountResponse {}
+// Confirms that the daemon accepted the shutdown request. Release of the
+// session, FUSE mount, and control socket may still be in progress.
+message ShutdownResponse {}

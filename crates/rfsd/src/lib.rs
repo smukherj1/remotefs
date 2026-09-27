@@ -1,6 +1,8 @@
 //! Daemon-owned startup, state lifecycle, and control service.
 
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -9,6 +11,9 @@ use rfs_common::config::Config;
 use rfs_common::digest::Digest;
 use rfs_common::logging::{self, LogFormat};
 use rfs_common::session::Session;
+use tokio::net::UnixListener;
+
+use crate::control_service::{DaemonResources, TerminationSignals};
 
 mod control_service;
 pub mod filesystem;
@@ -65,27 +70,48 @@ enum OutputFormat {
     Json,
 }
 
-/// Runs the foreground daemon until control shutdown or Ctrl-C completes.
+/// Installs signal handlers, constructs the daemon, and serves it until release.
+///
+/// Signal handlers are installed first so that a failed installation has
+/// nothing to clean up. Returns `Ok(())` only after every daemon resource was
+/// released and the session durably closed.
+///
+/// Errors: signal installation, any startup step (see `construct_daemon`),
+/// a control transport failure, or a failed release. After a failed release
+/// the daemon state is undefined and the process should exit.
 pub async fn run(cli: Cli) -> Result<()> {
+    let signals = TerminationSignals::install().context("install daemon termination signals")?;
+    let (resources, listener) = construct_daemon(cli).await.context("construct daemon")?;
+    if let Err(error) = control_service::serve(resources, listener, signals).await {
+        let error = anyhow::Error::from(error).context("serve and release daemon resources");
+        tracing::error!(operation = "daemon_stop", error = ?error, "daemon shutdown failed");
+        return Err(error);
+    }
+    tracing::info!(operation = "daemon_stop", "daemon session closed");
+    Ok(())
+}
+
+/// Constructs all daemon dependencies.
+///
+/// Steps, in order: resolve configuration and connect to CAS; open the
+/// session and initialize logging; validate the root directory; mount FUSE;
+/// bind the control socket and restrict its permissions.
+///
+/// Returns the complete resources and the bound control listener. On failure,
+/// drops anything acquired and returns the startup error: dropping the FUSE
+/// mount unmounts it and dropping the session releases the home lock. The
+/// session is not marked `closed`, so retained state looks like an unclean
+/// exit, which the next `Session::open` replaces.
+async fn construct_daemon(cli: Cli) -> Result<(DaemonResources, UnixListener)> {
     let digest: Digest = cli
         .root_digest
         .parse()
         .with_context(|| format!("parse daemon root digest {}", cli.root_digest))?;
-    let cas_url = cli
-        .cas_url
-        .or_else(|| std::env::var("RFS_CAS_URL").ok())
-        .context("missing CAS URL; pass --cas-url or set RFS_CAS_URL")?;
-    let instance_name = cli
-        .instance_name
-        .or_else(|| std::env::var("RFS_INSTANCE_NAME").ok())
-        .context("missing instance name; pass --instance-name or set RFS_INSTANCE_NAME")?;
-    let cas_config =
-        CasConfig::new(cas_url, instance_name).context("validate daemon CAS configuration")?;
-    let cas = CasClient::connect(cas_config)
+    let cas = connect_cas(cli.cas_url, cli.instance_name)
         .await
-        .context("connect daemon to CAS")?;
+        .context("set up daemon CAS client")?;
     let config = Config::new().context("load daemon state configuration")?;
-    let session = std::sync::Arc::new(
+    let session = Arc::new(
         Session::open(
             config,
             digest,
@@ -111,35 +137,62 @@ pub async fn run(cli: Cli) -> Result<()> {
         digest = %info.root_digest,
         "daemon session active"
     );
-    let filesystem_session = std::sync::Arc::clone(&session);
-    let filesystem = match tokio::task::spawn_blocking(move || {
-        filesystem::FilesystemService::new(filesystem_session)
-    })
-    .await
-    .context("join root-directory validation task")?
-    {
-        Ok(filesystem) => std::sync::Arc::new(filesystem),
-        Err(error) => {
-            session
-                .close()
-                .context("close daemon state after root validation failure")?;
-            return Err(error).context("validate root directory before FUSE mount");
-        }
-    };
-    let mount = match fuse::FuseMount::mount(std::sync::Arc::clone(&filesystem), &info.mountpoint) {
-        Ok(mount) => mount,
-        Err(error) => {
-            session
-                .close()
-                .context("close daemon state after FUSE mount failure")?;
-            return Err(error).with_context(|| {
-                format!("mount FUSE filesystem at {}", info.mountpoint.display())
-            });
-        }
-    };
-    control_service::serve(session, mount)
+    let filesystem_session = Arc::clone(&session);
+    let filesystem =
+        tokio::task::spawn_blocking(move || filesystem::FilesystemService::new(filesystem_session))
+            .await
+            .context("join root-directory validation task")?
+            .context("validate root directory before FUSE mount")?;
+    let mount = fuse::FuseMount::mount(Arc::new(filesystem), &info.mountpoint)
+        .with_context(|| format!("mount FUSE filesystem at {}", info.mountpoint.display()))?;
+    let listener = bind_control_socket(&info.control_endpoint).context("set up control socket")?;
+    Ok((
+        DaemonResources::new(session, mount, info.control_endpoint),
+        listener,
+    ))
+}
+
+/// Resolves CAS settings and connects to CAS.
+///
+/// Inputs: the `--cas-url` and `--instance-name` flags, which override
+/// `RFS_CAS_URL` and `RFS_INSTANCE_NAME`. Returns a connected client.
+///
+/// Errors: a missing or invalid setting, or a failed connection.
+async fn connect_cas(cas_url: Option<String>, instance_name: Option<String>) -> Result<CasClient> {
+    let cas_url = cas_url
+        .or_else(|| std::env::var("RFS_CAS_URL").ok())
+        .context("missing CAS URL; pass --cas-url or set RFS_CAS_URL")?;
+    let instance_name = instance_name
+        .or_else(|| std::env::var("RFS_INSTANCE_NAME").ok())
+        .context("missing instance name; pass --instance-name or set RFS_INSTANCE_NAME")?;
+    let cas_config =
+        CasConfig::new(cas_url, instance_name).context("validate daemon CAS configuration")?;
+    CasClient::connect(cas_config)
         .await
-        .context("serve active daemon control socket")?;
-    tracing::info!(operation = "daemon_stop", "daemon session closed");
-    Ok(())
+        .context("connect daemon to CAS")
+}
+
+/// Binds the control socket at `socket` and makes it owner-only (0600).
+///
+/// Side effects: creates the socket file. If setting permissions fails, the
+/// socket just created is removed before returning. A failed bind never
+/// removes an existing path.
+///
+/// Errors: the bind or permission change failed.
+fn bind_control_socket(socket: &Path) -> Result<UnixListener> {
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("bind control socket {}", socket.display()))?;
+    if let Err(error) = std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)) {
+        if let Err(remove_error) = std::fs::remove_file(socket) {
+            tracing::warn!(
+                operation = "daemon_start",
+                socket = %socket.display(),
+                error = %remove_error,
+                "could not remove control socket after permission failure"
+            );
+        }
+        return Err(error)
+            .with_context(|| format!("restrict control socket permissions {}", socket.display()));
+    }
+    Ok(listener)
 }
