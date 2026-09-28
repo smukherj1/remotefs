@@ -246,6 +246,12 @@ the inode that coordinates ownership. This simplifies daemon discovery and
 prevents two cooperating daemons from sharing the same writable session state
 root. Concurrent mounts require distinct `RFS_HOME` values.
 
+`rfs mount` fails early, without touching any file, when a daemon already
+answers on the control socket. This check is not atomic with the spawn.
+Running more than one `rfs mount` or `rfsd` on the same `RFS_HOME` at the
+same time is undefined behavior: the session lock still protects session
+state, but log contents are undefined.
+
 `rfs snapshot`, `rfs status`, and `rfs unmount` discover the sole session through
 `RFS_HOME` and do not accept a mountpoint. `Session` validates the mountpoint
 supplied to `rfs mount` as an existing directory before creating session state,
@@ -276,12 +282,13 @@ Default state root:
 ```text
 $HOME/.rfs/
   session.lock
+  rfsd.log                 # daemon trace log, truncated per mount
+  rfsd_stdout_stderr.log   # daemon stdout and stderr, truncated per mount
   cache/
     <2-hex-prefix>/
       <sha256-hex>-<size>
   session/
     session.db
-    session.log
     overlay/
       data/
       tmp/
@@ -321,7 +328,7 @@ Active session state is isolated under `RFS_HOME/session/`:
 - SQLite overlay/session database.
 - Local files for copied-up and newly created file contents.
 - Control socket.
-- Session logs and SQLite-backed session metadata.
+- SQLite-backed session metadata.
 
 Only one active session may exist for an `RFS_HOME` at a time. Clean unmount
 transactionally marks the session `closed`, then leaves `RFS_HOME/session/` in
@@ -332,7 +339,12 @@ and unsupported session state. A new mount never reuses, migrates, validates,
 or repairs retained session data. The stable lock and shared cache are outside
 the removed tree and remain in place, so verified blobs may still be reused
 across mounts. Consequently, starting a new mount after an unclean exit
-discards the previous unsnapshotted overlay and its session log.
+discards the previous unsnapshotted overlay and truncates the daemon trace
+log.
+
+Daemon log files live directly under `RFS_HOME`, outside the session tree,
+and are owned by `rfs_common::logging`. See
+[logging-improvements.md](logging-improvements.md).
 
 Local cache eviction is deferred. The earliest MVP may provide manual pruning only. Remote CAS eviction is a deployment concern and must be disabled or capacity-provisioned during MVP evaluation.
 
@@ -614,15 +626,19 @@ The completed architecture-boundary slice supports:
 - Four standard levels: error, warn, info, and debug.
 - Text or JSON Lines process logging configured once at startup.
 - CLI logs on stderr and command results on stdout.
-- Daemon logs in `RFS_HOME/session/session.log` after state layout establishment.
+- Daemon trace logs in `RFS_HOME/rfsd.log`, truncated once the session lock
+  is held.
+- Daemon stdout and stderr in `RFS_HOME/rfsd_stdout_stderr.log`, truncated by
+  `rfs mount` before spawn. Final daemon errors and panics land there. The CLI
+  never reads daemon output; its failure messages name both files.
 - Lifecycle and upload-summary events with structured operation fields.
 - No routine per-file lookup, traversal, cache-probe, read, or write event stream.
 
 The later MVP observability work should extend this with:
 
 - CLI logs go to stderr only. Command results and JSON summaries go to stdout.
-- `rfsd` logs remain inspectable with the active or retained session until the
-  next mount replaces that session tree or the user manually removes it.
+- `rfsd` logs remain inspectable until the next mount truncates them or the
+  user manually removes them.
 - Human-readable compact text logs by default.
 - JSON Lines logs and JSON command summaries via `--output-format json`; text logs and human command summaries via `--output-format text`.
 - `--log-level` and `--output-format` apply to both `rfs` and any `rfsd` process spawned by `rfs mount`.

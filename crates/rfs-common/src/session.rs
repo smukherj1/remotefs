@@ -153,8 +153,6 @@ pub struct SessionInfo {
     pub daemon_pid: u32,
     /// Path to the Unix control socket.
     pub control_endpoint: PathBuf,
-    /// Path to the retained daemon log file.
-    pub log_path: PathBuf,
     /// Whether the session completed its durable active-to-closed transition.
     /// Always `false` for the active daemon's own view.
     pub closed: bool,
@@ -337,8 +335,6 @@ impl Session {
             .with_context(|| format!("replace session directory {}", layout.session.display()))?;
         create_dir_if_absent(&layout.session)
             .with_context(|| format!("create session directory {}", layout.session.display()))?;
-        create_empty_file(&layout.log_path())
-            .with_context(|| format!("create session log {}", layout.log_path().display()))?;
         create_empty_file(&layout.database_path()).with_context(|| {
             format!(
                 "create session database {}",
@@ -383,7 +379,6 @@ impl Session {
             mountpoint: self.mountpoint.clone(),
             daemon_pid: std::process::id(),
             control_endpoint: self.layout.control_endpoint.clone(),
-            log_path: self.layout.log_path(),
             closed: false,
         }
     }
@@ -411,7 +406,6 @@ impl Session {
             mountpoint: stored.mountpoint,
             daemon_pid: stored.daemon_pid,
             control_endpoint: layout.control_endpoint.clone(),
-            log_path: layout.log_path(),
             closed: stored.state == SessionLifecycle::Closed,
         }))
     }
@@ -908,9 +902,6 @@ impl SessionLayout {
     }
     fn overlay_path(&self) -> PathBuf {
         self.session.join("overlay")
-    }
-    fn log_path(&self) -> PathBuf {
-        self.session.join("session.log")
     }
 }
 

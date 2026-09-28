@@ -8,7 +8,7 @@ These are recommendations, in decreasing order of importance, not implemented
 changes. Findings come from source inspection; tests were not run for this
 document.
 
-## 1. Give daemon teardown one owner and one completion condition
+## 1. Give daemon teardown one owner and one completion condition (DONE)
 
 Evidence: [control_service.rs](../crates/rfsd/src/control_service.rs),
 particularly `ControlService::unmount` and `serve`, repeats mount teardown and
@@ -69,13 +69,13 @@ injection is useful when the operation and assertions exercise that boundary.
 
 The clearest changes are:
 
-| Current test or suite | Recommended change |
-| --- | --- |
-| Cache `failed_fill_keeps_the_digest_cohort_until_waiting_readers_leave` | Replace manual acquire/release and `Arc::ptr_eq` assertions with overlapping calls to `read_blob` through a controllable fake store. Check that a failed fill permits a successful retry without concurrent fills for that digest. |
-| Cache `no_clobber_admission_preserves_an_existing_entry` | Race reads through two cache instances sharing a directory. Hold both remote streams at a barrier and verify successful reads and preservation of the first admitted file's identity. The current same-bytes assertion would also pass after an overwrite. |
-| Filesystem `maps_every_existing_session_error_to_its_filesystem_category` | Keep coverage of the public `From<SessionError>` contract, but use compact input/expected cases instead of reproducing the production match in the test. Retain a focused context/source-preservation case. |
-| `readonly_integration.rs` | Move synthetic failure and ordinary wrong-kind/missing-entry cases into local filesystem-service tests. Keep the real-CAS workflow for upload-to-session interoperability. Assert error category and useful context, not an exact number of nested `Context` variants. |
-| Planned Step 6.1 tests | Let the store own atomicity, allocation, dirty ancestors, and visibility queries; Session own loading, overlay publication, and merged reads; filesystem own policy; FUSE own errno and kernel-visible behavior. Avoid repeating a complete mutation matrix at all four layers. |
+| Current test or suite                                                     | Recommended change                                                                                                                                                                                                                                                              |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cache `failed_fill_keeps_the_digest_cohort_until_waiting_readers_leave`   | Replace manual acquire/release and `Arc::ptr_eq` assertions with overlapping calls to `read_blob` through a controllable fake store. Check that a failed fill permits a successful retry without concurrent fills for that digest.                                              |
+| Cache `no_clobber_admission_preserves_an_existing_entry`                  | Race reads through two cache instances sharing a directory. Hold both remote streams at a barrier and verify successful reads and preservation of the first admitted file's identity. The current same-bytes assertion would also pass after an overwrite.                      |
+| Filesystem `maps_every_existing_session_error_to_its_filesystem_category` | Keep coverage of the public `From<SessionError>` contract, but use compact input/expected cases instead of reproducing the production match in the test. Retain a focused context/source-preservation case.                                                                     |
+| `readonly_integration.rs`                                                 | Move synthetic failure and ordinary wrong-kind/missing-entry cases into local filesystem-service tests. Keep the real-CAS workflow for upload-to-session interoperability. Assert error category and useful context, not an exact number of nested `Context` variants.          |
+| Planned Step 6.1 tests                                                    | Let the store own atomicity, allocation, dirty ancestors, and visibility queries; Session own loading, overlay publication, and merged reads; filesystem own policy; FUSE own errno and kernel-visible behavior. Avoid repeating a complete mutation matrix at all four layers. |
 
 Keep cache integrity, persistence validation, and transaction rollback coverage.
 The managed-home trust policy does not make those tests irrelevant. Keep the

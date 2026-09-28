@@ -1,12 +1,17 @@
 //! Small process-level logging configuration shared by the CLI and daemon.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
 
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
+
+/// File name of the daemon `tracing` log under `RFS_HOME`.
+const DAEMON_TRACE_LOG: &str = "rfsd.log";
+/// File name of the daemon stdout and stderr log under `RFS_HOME`.
+const DAEMON_STDIO_LOG: &str = "rfsd_stdout_stderr.log";
 
 /// Supported process log formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,8 +25,8 @@ pub enum LogFormat {
 /// Logging initialization failures.
 #[derive(Debug, Error)]
 pub enum LoggingError {
-    /// The daemon log could not be opened.
-    #[error("open daemon log `{path}`: {source}")]
+    /// The daemon trace log could not be created or truncated.
+    #[error("open daemon trace log `{path}`: {source}")]
     Open {
         /// Requested log path.
         path: PathBuf,
@@ -32,6 +37,28 @@ pub enum LoggingError {
     /// A process-global subscriber was already installed.
     #[error("logging is already initialized: {0}")]
     AlreadyInitialized(#[from] tracing::subscriber::SetGlobalDefaultError),
+}
+
+/// Daemon log files under `RFS_HOME`. Neither lives in the session tree, so
+/// replacing the session tree never removes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLogPaths {
+    /// Daemon stdout and stderr. The launcher (`rfs mount`) truncates it
+    /// before spawning the daemon and passes it as fd 1 and fd 2.
+    pub stdio: PathBuf,
+    /// Daemon `tracing` output, truncated when the daemon starts logging.
+    pub trace: PathBuf,
+}
+
+/// Returns the daemon log paths for the RemoteFS home `home`.
+///
+/// `home` is the configured `RFS_HOME`, used as given. Both returned paths are
+/// direct children of `home`. Performs no I/O and cannot fail.
+pub fn daemon_log_paths(home: &Path) -> DaemonLogPaths {
+    DaemonLogPaths {
+        stdio: home.join(DAEMON_STDIO_LOG),
+        trace: home.join(DAEMON_TRACE_LOG),
+    }
 }
 
 /// Initializes CLI logging to stderr.
@@ -57,15 +84,23 @@ pub fn init_cli(level: &str, format: LogFormat) -> Result<(), LoggingError> {
     Ok(())
 }
 
-/// Initializes daemon logging by appending to the active session log.
-pub fn init_daemon(path: &Path, level: &str, format: LogFormat) -> Result<(), LoggingError> {
-    let file = OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|source| LoggingError::Open {
-            path: path.to_path_buf(),
-            source,
-        })?;
+/// Creates or truncates the daemon trace log and installs the global subscriber.
+///
+/// Inputs: `home` is the configured `RFS_HOME` and must already exist;
+/// `level` is an `EnvFilter` directive such as `info`; `format` selects text
+/// or JSON Lines events.
+///
+/// Precondition: the caller holds the session lock. Truncating without the
+/// lock could wipe the trace log of a live daemon.
+///
+/// Side effects: truncates `daemon_log_paths(home).trace` (creating it if
+/// missing) and installs the process-global `tracing` subscriber.
+///
+/// Errors: `LoggingError::Open` if the trace log cannot be created, and
+/// `LoggingError::AlreadyInitialized` if a global subscriber already exists.
+pub fn init_daemon(home: &Path, level: &str, format: LogFormat) -> Result<(), LoggingError> {
+    let path = daemon_log_paths(home).trace;
+    let file = File::create(&path).map_err(|source| LoggingError::Open { path, source })?;
     let filter = EnvFilter::new(level);
     match format {
         LogFormat::Text => install_file_subscriber(file, filter, false)?,

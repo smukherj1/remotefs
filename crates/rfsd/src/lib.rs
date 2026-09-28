@@ -78,15 +78,15 @@ enum OutputFormat {
 ///
 /// Errors: signal installation, any startup step (see `construct_daemon`),
 /// a control transport failure, or a failed release. After a failed release
-/// the daemon state is undefined and the process should exit.
+/// the daemon state is undefined and the process should exit. The caller
+/// reports the error on stderr, which `rfs mount` points at the daemon
+/// stdout/stderr log.
 pub async fn run(cli: Cli) -> Result<()> {
     let signals = TerminationSignals::install().context("install daemon termination signals")?;
     let (resources, listener) = construct_daemon(cli).await.context("construct daemon")?;
-    if let Err(error) = control_service::serve(resources, listener, signals).await {
-        let error = anyhow::Error::from(error).context("serve and release daemon resources");
-        tracing::error!(operation = "daemon_stop", error = ?error, "daemon shutdown failed");
-        return Err(error);
-    }
+    control_service::serve(resources, listener, signals)
+        .await
+        .context("serve and release daemon resources")?;
     tracing::info!(operation = "daemon_stop", "daemon session closed");
     Ok(())
 }
@@ -111,6 +111,7 @@ async fn construct_daemon(cli: Cli) -> Result<(DaemonResources, UnixListener)> {
         .await
         .context("set up daemon CAS client")?;
     let config = Config::new().context("load daemon state configuration")?;
+    let rfs_home = config.rfs_home.clone();
     let session = Arc::new(
         Session::open(
             config,
@@ -122,15 +123,16 @@ async fn construct_daemon(cli: Cli) -> Result<(DaemonResources, UnixListener)> {
         .with_context(|| format!("create daemon session for {}", cli.mountpoint.display()))?,
     );
     let info = session.info();
+    // Holding the session lock makes it safe to truncate the trace log.
     logging::init_daemon(
-        &info.log_path,
+        &rfs_home,
         cli.log_level.as_str(),
         match cli.output_format {
             OutputFormat::Text => LogFormat::Text,
             OutputFormat::Json => LogFormat::Json,
         },
     )
-    .context("initialize daemon session logging")?;
+    .with_context(|| format!("initialize daemon logging under {}", rfs_home.display()))?;
     tracing::info!(
         operation = "daemon_start",
         mountpoint = %info.mountpoint.display(),

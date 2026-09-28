@@ -1,5 +1,6 @@
 use std::env;
-use std::io::Read;
+use std::fs::{self, File};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,6 +22,10 @@ use rfs_common::session::{Session, SessionError, SessionInfo};
 const DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay between checks for daemon process exit.
 const DAEMON_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How long `rfs mount` waits for a spawned daemon to serve its mount.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Delay between `rfs mount` readiness probes.
+const DAEMON_READY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Parsed `rfs` command line.
 #[derive(Parser, Debug, Clone)]
@@ -265,6 +270,20 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
+/// Starts `rfsd` for `digest` at `mountpoint` and waits until it is ready.
+///
+/// Inputs: the parsed root digest, the user's mountpoint spelling, resolved
+/// CAS settings, and the log level and output format passed on to `rfsd`.
+///
+/// Side effects: creates `RFS_HOME` if missing, truncates the daemon
+/// stdout/stderr log, spawns `rfsd` in the background, and prints the mount
+/// summary on success. The daemon keeps running after this returns `Ok`.
+///
+/// Errors: `invalid_config` if `RFS_HOME` cannot be resolved; `session_active`
+/// if a daemon already answers on the control socket; a client error if the
+/// active-daemon check fails for any other reason; `daemon_start` if the home
+/// or log cannot be prepared, the daemon cannot start, exits early, reports a
+/// different mount, or is not ready in time.
 async fn run_mount(
     digest: Digest,
     mountpoint: &Path,
@@ -272,7 +291,17 @@ async fn run_mount(
     log_level: LogLevel,
     output_format: OutputFormat,
 ) -> Result<(), CliError> {
+    let config = Config::new().map_err(config_error)?;
+    create_home(&config.rfs_home)?;
+    ensure_no_active_daemon(&config).await?;
     let daemon = daemon_executable()?;
+    let stdio_log = open_daemon_stdio_log(&config.rfs_home)?;
+    let stdout_log = stdio_log
+        .try_clone()
+        .map_err(|source| CliError::CommandFailed {
+            category: "daemon_start",
+            message: format!("duplicate daemon stdout/stderr log handle: {source}"),
+        })?;
     let mut child = Command::new(&daemon)
         .arg(digest.to_string())
         .arg(mountpoint)
@@ -285,27 +314,131 @@ async fn run_mount(
         .arg("--output-format")
         .arg(output_format.as_str())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_log))
+        .stderr(Stdio::from(stdio_log))
         .spawn()
         .map_err(|source| CliError::CommandFailed {
             category: "daemon_start",
             message: format!("start daemon `{}`: {source}", daemon.display()),
         })?;
+    let status = wait_for_daemon_ready(&mut child, &config, &digest, mountpoint).await?;
+    if output_format == OutputFormat::Json {
+        println!(
+            "{}",
+            serde_json::json!({"schema_version":1,"command":"mount","ok":true,"data":{"mountpoint":mountpoint,"root_digest":digest,"daemon_pid":status.daemon_pid}})
+        );
+    } else {
+        println!("mounted {} at {}", digest, mountpoint.display());
+    }
+    Ok(())
+}
 
-    let deadline = Instant::now() + Duration::from_secs(15);
+/// Creates the RemoteFS home `home` with owner-only permissions if it is missing.
+///
+/// An existing home is used as is. `rfs mount` needs the home before spawn
+/// because the daemon stdout/stderr log lives directly beneath it.
+///
+/// Errors: `daemon_start` if the directory cannot be created.
+fn create_home(home: &Path) -> Result<(), CliError> {
+    // Checked first so an existing home keeps its permissions.
+    if home.exists() {
+        return Ok(());
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(home)
+        .map_err(|source| CliError::CommandFailed {
+            category: "daemon_start",
+            message: format!("create RemoteFS home `{}`: {source}", home.display()),
+        })
+}
+
+/// Fails if a daemon already answers on the control socket of `config`'s home.
+///
+/// Sends the same `Status` probe that `rfs status` makes first. It protects
+/// the live daemon's stdout/stderr log from truncation and gives a clearer
+/// error than a lock failure. It is not atomic with the later spawn, and it
+/// does not replace the session lock.
+///
+/// Errors: `session_active` when a daemon answers; the client error when the
+/// probe fails for a reason other than "no daemon", because something is
+/// answering on the socket and truncating its log is not safe.
+async fn ensure_no_active_daemon(config: &Config) -> Result<(), CliError> {
+    let probe = match daemon_client(config).await {
+        Ok(mut client) => client.status().await,
+        Err(error) => Err(error),
+    };
+    match probe {
+        Ok(status) => Err(CliError::CommandFailed {
+            category: "session_active",
+            message: format!(
+                "a RemoteFS session is already active at {} (daemon pid {}); run `rfs unmount` first",
+                status.mountpoint.display(),
+                status.daemon_pid
+            ),
+        }),
+        // No socket, a stale socket, or a daemon that no longer serves: no
+        // daemon is active.
+        Err(error) if error.is_unavailable() => Ok(()),
+        Err(error) => Err(client_error(error)),
+    }
+}
+
+/// Creates or truncates the daemon stdout/stderr log under `home`.
+///
+/// Returns the open file, ready to become the daemon's fd 1 and fd 2. Both fds
+/// share one open file description, so they share one offset and never
+/// overwrite each other.
+///
+/// Errors: `daemon_start` if the file cannot be created.
+fn open_daemon_stdio_log(home: &Path) -> Result<File, CliError> {
+    let path = logging::daemon_log_paths(home).stdio;
+    File::create(&path).map_err(|source| CliError::CommandFailed {
+        category: "daemon_start",
+        message: format!(
+            "open daemon stdout/stderr log `{}`: {source}",
+            path.display()
+        ),
+    })
+}
+
+/// Polls until the spawned daemon `child` serves the requested mount.
+///
+/// Inputs: the spawned daemon, the home it uses, and the digest and
+/// mountpoint it was asked to mount. Returns the daemon's first successful
+/// `Status` response.
+///
+/// Side effects: kills and reaps the child when its identity does not match
+/// or when `DAEMON_READY_TIMEOUT` elapses.
+///
+/// Errors: `daemon_start` if the child cannot be inspected, exits before it
+/// is ready, reports another mount, or times out. Exit and timeout errors
+/// name both daemon log files; this function never reads daemon output.
+async fn wait_for_daemon_ready(
+    child: &mut Child,
+    config: &Config,
+    digest: &Digest,
+    mountpoint: &Path,
+) -> Result<SessionStatus, CliError> {
+    let deadline = Instant::now() + DAEMON_READY_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().map_err(|source| CliError::CommandFailed {
             category: "daemon_start",
             message: format!("inspect daemon process: {source}"),
         })? {
-            return Err(daemon_exit_error(&mut child, status));
+            return Err(CliError::CommandFailed {
+                category: "daemon_start",
+                message: format!(
+                    "daemon exited before mount readiness with status {status}; {}",
+                    daemon_logs_hint(&config.rfs_home)
+                ),
+            });
         }
-        if let Ok(config) = Config::new()
-            && let Ok(mut client) = daemon_client(&config).await
+        if let Ok(mut client) = daemon_client(config).await
             && let Ok(status) = client.status().await
         {
-            if status.root_digest != digest || status.mountpoint != mountpoint {
+            if status.root_digest != *digest || status.mountpoint != mountpoint {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(CliError::CommandFailed {
@@ -313,15 +446,7 @@ async fn run_mount(
                     message: "daemon readiness identity did not match requested mount".to_owned(),
                 });
             }
-            if output_format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    serde_json::json!({"schema_version":1,"command":"mount","ok":true,"data":{"mountpoint":mountpoint,"root_digest":digest,"daemon_pid":status.daemon_pid}})
-                );
-            } else {
-                println!("mounted {} at {}", digest, mountpoint.display());
-            }
-            return Ok(());
+            return Ok(status);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -329,13 +454,25 @@ async fn run_mount(
             return Err(CliError::CommandFailed {
                 category: "daemon_start",
                 message: format!(
-                    "daemon did not validate the root, mount FUSE, and open its control socket within 15 seconds; inspect `{}`",
-                    mountpoint.display()
+                    "daemon did not validate the root, mount FUSE, and open its control socket within {} seconds; {}",
+                    DAEMON_READY_TIMEOUT.as_secs(),
+                    daemon_logs_hint(&config.rfs_home)
                 ),
             });
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(DAEMON_READY_POLL_INTERVAL).await;
     }
+}
+
+/// Returns the hint that names both daemon log files under `home`, for
+/// appending to a failure message. Performs no I/O.
+fn daemon_logs_hint(home: &Path) -> String {
+    let logs = logging::daemon_log_paths(home);
+    format!(
+        "inspect daemon logs: {}, {}",
+        logs.stdio.display(),
+        logs.trace.display()
+    )
 }
 
 fn daemon_executable() -> Result<PathBuf, CliError> {
@@ -354,22 +491,6 @@ fn daemon_executable() -> Result<PathBuf, CliError> {
                 daemon.display()
             ),
         })
-    }
-}
-
-fn daemon_exit_error(child: &mut Child, status: std::process::ExitStatus) -> CliError {
-    let mut stderr = String::new();
-    if let Some(mut stream) = child.stderr.take() {
-        let _ = stream.read_to_string(&mut stderr);
-    }
-    let detail = stderr.trim();
-    CliError::CommandFailed {
-        category: "daemon_start",
-        message: if detail.is_empty() {
-            format!("daemon exited before mount readiness with status {status}")
-        } else {
-            format!("daemon exited before mount readiness with status {status}: {detail}")
-        },
     }
 }
 
@@ -473,8 +594,8 @@ fn render_retained_status(session: SessionInfo, json: bool) {
 ///
 /// Errors: daemon request failures; retained-state inspection failures; a
 /// `daemon_shutdown` failure when the daemon is still running after the
-/// timeout or exited without closing its session. Shutdown failures name the
-/// daemon log so the user can find the cause.
+/// timeout or exited without closing its session. Shutdown failures name
+/// both daemon log files so the user can find the cause.
 async fn run_unmount(config: &Config) -> Result<(), CliError> {
     let mut client = daemon_client(config).await.map_err(client_error)?;
     let status = client.status().await.map_err(client_error)?;
@@ -500,11 +621,12 @@ async fn run_unmount(config: &Config) -> Result<(), CliError> {
             DAEMON_EXIT_TIMEOUT.as_secs()
         )
     };
-    // The session tree only disappears if something else removed it, so the
-    // log may be unavailable.
+    // The logs live outside the session tree, so they are named even when
+    // something else removed the retained session.
+    let logs = daemon_logs_hint(&config.rfs_home);
     let message = match session {
-        Some(session) => format!("{problem}; inspect `{}`", session.log_path.display()),
-        None => format!("{problem}; retained session state is missing"),
+        Some(_) => format!("{problem}; {logs}"),
+        None => format!("{problem}; retained session state is missing; {logs}"),
     };
     Err(CliError::CommandFailed {
         category: "daemon_shutdown",
