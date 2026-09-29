@@ -435,4 +435,11 @@ mod tests {
         assert_eq!(attr.perm, 0o755);
         assert_eq!(attr.mtime, UNIX_EPOCH + Duration::new(123, 456));
     }
+
+    /// Inode 0 is never issued by the kernel; the adapter maps its `InodeId::new`
+    /// rejection to EINVAL, so construction must fail.
+    #[test]
+    fn inode_zero_is_rejected() {
+        assert!(InodeId::new(0).is_err());
+    }
 }

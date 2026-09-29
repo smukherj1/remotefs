@@ -32,7 +32,7 @@ down twice; signal-driven shutdown also closes state. Do not duplicate lifecycle
 row tests here. This becomes more valuable when writable handles and snapshot
 work must also finish or be rejected during shutdown.
 
-## 2. Stop constructing new remote children as invalid stored inodes
+## 2. Stop constructing new remote children as invalid stored inodes (DONE)
 
 Evidence: `remote_file`, `remote_directory`, and `remote_symlink` in
 [session.rs](../crates/rfs-common/src/session.rs) construct the full private

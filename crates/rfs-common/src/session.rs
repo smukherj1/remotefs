@@ -29,15 +29,13 @@ use crate::tree::decode_directory;
 pub use crate::tree::NodeKind;
 use cache::CachedBlobStore;
 use overlay::OverlayStore;
-use store::{Inode as StoreInode, SessionStore};
+use store::{Inode as StoreInode, NewRemoteInode, RemoteContent, SessionStore};
 
 /// Session-stable inode identity that is positive and representable by SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct InodeId(i64);
 
 impl InodeId {
-    /// Default inode ID.
-    pub const INVALID: Self = Self(0);
     /// Root inode shared by every mounted workspace.
     pub const ROOT: Self = Self(1);
 
@@ -48,6 +46,11 @@ impl InodeId {
                 "validate external inode value {value}: outside the supported range"
             ))
         })?;
+        if value == 0 {
+            return Err(internal_error(
+                "validate external inode value 0: inode is not positive",
+            ));
+        }
         Ok(Self(value))
     }
 
@@ -634,114 +637,68 @@ fn project_inode(stored: StoreInode) -> Result<Inode, SessionError> {
     })
 }
 
+/// Decodes a REAPI `Directory` into store inputs for its remote children.
+///
+/// Returns one [`NewRemoteInode`] per file, directory, and symlink node.
+/// Errors: missing or untranslatable digests, or malformed node properties.
 fn decoded_directory_children(
     directory: crate::reapi::remote_execution::Directory,
-) -> Result<Vec<StoreInode>, SessionError> {
+) -> Result<Vec<NewRemoteInode>, SessionError> {
     let mut children = Vec::with_capacity(
         directory.files.len() + directory.directories.len() + directory.symlinks.len(),
     );
     for node in directory.files {
-        let name = node.name;
-        children.push(remote_file(
-            name.clone(),
-            node.digest.as_ref().ok_or_else(|| {
-                internal_error(format!("decode file node `{name}`: missing digest"))
-            })?,
-            node.node_properties.as_ref(),
-        )?);
+        let (mode, mtime) = node_metadata(node.node_properties.as_ref())?;
+        let digest = remote_digest("file", &node.name, node.digest.as_ref())?;
+        children.push(NewRemoteInode {
+            name: node.name,
+            mode,
+            mtime,
+            content: RemoteContent::File { digest },
+        });
     }
     for node in directory.directories {
-        let name = node.name;
-        children.push(remote_directory(
-            name.clone(),
-            node.digest.as_ref().ok_or_else(|| {
-                internal_error(format!("decode directory node `{name}`: missing digest"))
-            })?,
-            node.node_properties.as_ref(),
-        )?);
+        let (mode, mtime) = node_metadata(node.node_properties.as_ref())?;
+        let digest = remote_digest("directory", &node.name, node.digest.as_ref())?;
+        children.push(NewRemoteInode {
+            name: node.name,
+            mode,
+            mtime,
+            content: RemoteContent::Directory { digest },
+        });
     }
     for node in directory.symlinks {
-        children.push(remote_symlink(
-            node.name,
-            node.target,
-            node.node_properties.as_ref(),
-        )?);
+        let (mode, mtime) = node_metadata(node.node_properties.as_ref())?;
+        children.push(NewRemoteInode {
+            name: node.name,
+            mode,
+            mtime,
+            content: RemoteContent::Symlink {
+                target: node.target,
+            },
+        });
     }
     Ok(children)
 }
 
-fn remote_file(
-    name: String,
-    digest: &crate::reapi::remote_execution::Digest,
-    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
-) -> Result<StoreInode, SessionError> {
-    let (mode, mtime) = node_metadata(properties)?;
-    Ok(StoreInode {
-        id: InodeId::INVALID,
-        parent: None,
-        name: name.clone(),
-        kind: NodeKind::File,
-        mode,
-        mtime,
-        tombstone: false,
-        file_remote_digest: Some(Digest::from_reapi(digest).map_err(|error| {
-            internal_error(format!(
-                "error translating digest of file node {name} from REAPI digest: {error}"
-            ))
-        })?),
-        file_overlay_path: None,
-        file_content_dirty: Some(false),
-        symlink_target: None,
-        directory_remote_digest: None,
-        directory_loaded: None,
+/// Translates the REAPI digest of a file or directory node named `name`.
+///
+/// `kind` is "file" or "directory" and only appears in error text. Errors:
+/// the digest is missing or cannot be translated.
+fn remote_digest(
+    kind: &str,
+    name: &str,
+    digest: Option<&crate::reapi::remote_execution::Digest>,
+) -> Result<Digest, SessionError> {
+    let digest = digest
+        .ok_or_else(|| internal_error(format!("decode {kind} node `{name}`: missing digest")))?;
+    Digest::from_reapi(digest).map_err(|error| {
+        internal_error(format!(
+            "error translating digest of {kind} node {name} from REAPI digest: {error}"
+        ))
     })
 }
-fn remote_directory(
-    name: String,
-    digest: &crate::reapi::remote_execution::Digest,
-    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
-) -> Result<StoreInode, SessionError> {
-    let (mode, mtime) = node_metadata(properties)?;
-    Ok(StoreInode {
-        id: InodeId::INVALID,
-        parent: None,
-        name: name.clone(),
-        kind: NodeKind::Directory,
-        mode,
-        mtime,
-        tombstone: false,
-        file_remote_digest: None,
-        file_overlay_path: None,
-        file_content_dirty: None,
-        symlink_target: None,
-        directory_remote_digest: Some(Digest::from_reapi(digest).map_err(|error| {
-            internal_error(format!("decode child `{name}` directory digest: {error}"))
-        })?),
-        directory_loaded: Some(false),
-    })
-}
-fn remote_symlink(
-    name: String,
-    target: String,
-    properties: Option<&crate::reapi::remote_execution::NodeProperties>,
-) -> Result<StoreInode, SessionError> {
-    let (mode, mtime) = node_metadata(properties)?;
-    Ok(StoreInode {
-        id: InodeId::INVALID,
-        parent: None,
-        name,
-        kind: NodeKind::Symlink,
-        mode,
-        mtime,
-        tombstone: false,
-        file_remote_digest: None,
-        file_overlay_path: None,
-        file_content_dirty: None,
-        symlink_target: Some(target),
-        directory_remote_digest: None,
-        directory_loaded: None,
-    })
-}
+
 fn node_metadata(
     properties: Option<&crate::reapi::remote_execution::NodeProperties>,
 ) -> Result<(Option<u32>, Option<NodeTime>), SessionError> {
