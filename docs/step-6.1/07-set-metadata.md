@@ -75,14 +75,13 @@ No schema change.
   standalone blob request.
 - Apply absent and already-effective values; expect the same inode and no
   observable dirtying.
-- Closed-session and invalid-metadata failures leave state unchanged.
+- Invalid-metadata failures leave state unchanged.
+- Add a set-metadata row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 
-- Update every node kind in a session containing remote and local entries,
-  close it, record database and overlay bytes, and run retained inspection
-  repeatedly. Expect exact metadata in the final merged reads and no bytes
-  changed by inspection.
+- Update every node kind in a session containing remote and local entries.
+  Expect exact metadata in the final merged reads.
 
 ## `SessionStore`
 

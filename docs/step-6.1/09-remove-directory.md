@@ -73,14 +73,14 @@ No schema change.
   blob read before success and immediate invisibility afterward.
 - Attempt an initially unloaded non-empty remote directory; expect one read,
   `DirectoryNotEmpty`, and unchanged target and children.
-- Reject a file with `NotDirectory`, a missing name with `NotFound`, and a
-  closed session with `FailedPreconditionError`; every failure is atomic.
+- Reject a file with `NotDirectory` and a missing name with `NotFound`; assert
+  only the category and unchanged lookup and listing.
+- Add a remove-directory row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 
-- Mix successful empty-directory removal with failed non-empty removal, close
-  the session, and verify retained inspection leaves the database and cache
-  bytes unchanged.
+- Mix successful empty-directory removal with failed non-empty removal and
+  verify the final merged namespace.
 
 ## `SessionStore`
 
@@ -169,8 +169,7 @@ No schema change.
 
 ### Unit tests
 
-- Convert direct and context-wrapped `DirectoryNotEmpty` and assert the exact
-  filesystem variant.
+- Add one table row for `DirectoryNotEmpty`.
 
 ### Integration tests
 
@@ -197,8 +196,8 @@ No schema change.
 
 ### Unit tests
 
-- Assert `ENOTEMPTY` for direct and context-wrapped
-  `FilesystemError::DirectoryNotEmpty`.
+- No unit test for the `ENOTEMPTY` arm; it is exercised once writable
+  callbacks land in Step 6.3.
 
 ### Integration tests
 

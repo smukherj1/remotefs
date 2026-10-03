@@ -21,6 +21,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+rfs-common = { path = "../rfs-common", features = ["test-support"] }
 assert_cmd = "2.0"
 googletest = "0.14.3"
 predicates = "3.1"

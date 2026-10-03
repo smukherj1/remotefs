@@ -5,6 +5,8 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::Duration;
 
 use bytes::Bytes;
 use sha2::{Digest as _, Sha256};
@@ -27,6 +29,9 @@ pub(super) struct CachedBlobStore {
     runtime: Handle,
     /// Per-digest locks that coalesce simultaneous cache misses.
     download_locks: Mutex<HashMap<Digest, Arc<DownloadLock>>>,
+    /// Test hook fired once a reader has registered for a digest and before it waits on the gate.
+    #[cfg(test)]
+    registered: Option<Arc<dyn Fn(&Digest) + Send + Sync>>,
 }
 
 impl CachedBlobStore {
@@ -47,6 +52,8 @@ impl CachedBlobStore {
             blob_store,
             runtime,
             download_locks: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            registered: None,
         })
     }
 
@@ -82,6 +89,10 @@ impl CachedBlobStore {
 
         // TODO: Consider a RAII Guard to acquire and release download lock.
         let lock = self.acquire_download_lock(digest)?;
+        #[cfg(test)]
+        if let Some(registered) = &self.registered {
+            registered(digest);
+        }
         let guard = match lock.gate.lock() {
             Ok(guard) => guard,
             Err(_) => {
@@ -333,63 +344,15 @@ pub(super) fn read_file_range(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Barrier;
+    use std::sync::mpsc;
     use std::thread;
 
-    use async_trait::async_trait;
-
-    use crate::cas::{Blob, CasError, CasOperation, UploadStats};
+    use crate::testing::{BlobResult, InMemoryBlobStore};
 
     use super::*;
 
-    /// Fake remote store whose streams can be counted and held at a test barrier.
-    #[derive(Clone)]
-    struct FakeBlobStore {
-        /// Objects served by digest.
-        blobs: Arc<Mutex<HashMap<Digest, Bytes>>>,
-        /// Number of streaming calls made by digest.
-        streams: Arc<Mutex<HashMap<Digest, usize>>>,
-        /// One optional stream error consumed by the next remote read.
-        failure: Arc<Mutex<Option<CasError>>>,
-        /// Optional stream rendezvous proving reads reached remote storage concurrently.
-        barrier: Arc<Mutex<Option<Arc<Barrier>>>>,
-    }
-
-    #[async_trait]
-    impl BlobStore for FakeBlobStore {
-        async fn find_missing_blobs(&self, _digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
-            Ok(Vec::new())
-        }
-
-        async fn upload_blobs(&self, _blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
-            Ok(UploadStats::default())
-        }
-
-        async fn stream_blob(
-            &self,
-            digest: &Digest,
-            destination: &mut (dyn Write + Send),
-        ) -> Result<(), CasError> {
-            *self
-                .streams
-                .lock()
-                .unwrap()
-                .entry(digest.clone())
-                .or_default() += 1;
-            if let Some(error) = self.failure.lock().unwrap().take() {
-                return Err(error);
-            }
-            let barrier = self.barrier.lock().unwrap().clone();
-            if let Some(barrier) = barrier {
-                barrier.wait();
-            }
-            destination
-                .write_all(self.blobs.lock().unwrap().get(digest).unwrap())
-                .unwrap();
-            Ok(())
-        }
-    }
+    /// Time given to a reader that must NOT start a stream before the test releases the fill.
+    const NO_STREAM_WINDOW: Duration = Duration::from_millis(200);
 
     /// Creates a cache using a multi-thread runtime suitable for concurrent synchronous reads.
     fn cache(
@@ -397,31 +360,41 @@ mod tests {
         blobs: impl IntoIterator<Item = (Digest, Bytes)>,
     ) -> (
         Arc<CachedBlobStore>,
-        Arc<FakeBlobStore>,
+        InMemoryBlobStore,
         tokio::runtime::Runtime,
     ) {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-        let store = Arc::new(FakeBlobStore {
-            blobs: Arc::new(Mutex::new(blobs.into_iter().collect())),
-            streams: Arc::new(Mutex::new(HashMap::new())),
-            failure: Arc::new(Mutex::new(None)),
-            barrier: Arc::new(Mutex::new(None)),
-        });
-        (
-            Arc::new(
-                CachedBlobStore::open(
-                    temp.path().to_path_buf(),
-                    Box::new(store.as_ref().clone()),
-                    runtime.handle().clone(),
-                )
-                .unwrap(),
-            ),
-            store,
-            runtime,
+        let store = InMemoryBlobStore::new(blobs);
+        let cache = CachedBlobStore::open(
+            temp.path().to_path_buf(),
+            Box::new(store.clone()),
+            runtime.handle().clone(),
         )
+        .unwrap();
+        (Arc::new(cache), store, runtime)
+    }
+
+    /// Like `cache`, but reports each reader's registration on the returned channel.
+    fn cache_with_registration_events(
+        temp: &tempfile::TempDir,
+        blobs: impl IntoIterator<Item = (Digest, Bytes)>,
+    ) -> (
+        Arc<CachedBlobStore>,
+        InMemoryBlobStore,
+        mpsc::Receiver<()>,
+        tokio::runtime::Runtime,
+    ) {
+        let (cache, store, runtime) = cache(temp, blobs);
+        let (sender, receiver) = mpsc::channel();
+        let sender = Mutex::new(sender);
+        let mut cache = Arc::into_inner(cache).expect("sole cache owner");
+        cache.registered = Some(Arc::new(move |_| {
+            let _ = sender.lock().unwrap().send(());
+        }));
+        (Arc::new(cache), store, receiver, runtime)
     }
 
     #[test]
@@ -490,15 +463,12 @@ mod tests {
             results.iter().filter(|(_, downloaded)| !downloaded).count(),
             1
         );
-        assert_eq!(
-            fake_blob_store.streams.lock().unwrap().get(&digest),
-            Some(&1)
-        );
+        assert_eq!(fake_blob_store.streams(&digest), 1);
     }
 
     #[test]
     fn readers_of_different_digests_stream_concurrently() {
-        // Set up two distinct misses and require both remote streams to rendezvous.
+        // Set up two distinct misses and hold both remote streams open.
         let temp = tempfile::tempdir().unwrap();
         let first_digest = Digest::for_bytes(b"first");
         let second_digest = Digest::for_bytes(b"second");
@@ -509,48 +479,77 @@ mod tests {
                 (second_digest.clone(), Bytes::from_static(b"second")),
             ],
         );
-        *fake_blob_store.barrier.lock().unwrap() = Some(Arc::new(Barrier::new(2)));
+        let first_hold = fake_blob_store.hold_streams(&first_digest);
+        let second_hold = fake_blob_store.hold_streams(&second_digest);
 
-        // Both reads complete only if their distinct digest locks allow concurrent streaming.
+        // Both streams can be started before either is released only if the distinct
+        // digest locks allow concurrent streaming.
         let first_cache = Arc::clone(&cache);
         let first = thread::spawn(move || first_cache.read_blob(&first_digest).unwrap());
         let second_cache = Arc::clone(&cache);
         let second = thread::spawn(move || second_cache.read_blob(&second_digest).unwrap());
+        first_hold.wait_arrivals(1);
+        second_hold.wait_arrivals(1);
+        first_hold.release();
+        second_hold.release();
         assert!(first.join().unwrap().1);
         assert!(second.join().unwrap().1);
     }
 
     #[test]
-    fn failed_fill_keeps_the_digest_cohort_until_waiting_readers_leave() {
-        // Set up one remote failure and manually join two readers to the same digest cohort.
+    fn failed_fill_is_retried_by_a_waiting_reader_without_concurrent_fills() {
+        // Set up one remote blob whose streams are held. The first stream will fail, and the
+        // second will succeed.
         let temp = tempfile::tempdir().unwrap();
         let digest = Digest::for_bytes(b"retry");
-        let (cache, fake_blob_store, _runtime) =
-            cache(&temp, [(digest.clone(), Bytes::from_static(b"retry"))]);
-        *fake_blob_store.failure.lock().unwrap() = Some(CasError::BlobStatus {
-            operation: CasOperation::ByteStreamRead,
-            digest: digest.clone(),
-            message: "transient test failure".to_string(),
-        });
-        let first = cache.acquire_download_lock(&digest).unwrap();
-        let waiting = cache.acquire_download_lock(&digest).unwrap();
+        let (cache, store, registered, _runtime) =
+            cache_with_registration_events(&temp, [(digest.clone(), Bytes::from_static(b"retry"))]);
+        store.set_result(digest.clone(), BlobResult::Fail);
+        let hold = store.hold_streams(&digest);
+        let spawn_reader = || {
+            let cache = Arc::clone(&cache);
+            let digest = digest.clone();
+            thread::spawn(move || cache.read_blob(&digest))
+        };
 
-        // The first reader fails, but its departure must not remove the waiting reader's cohort.
-        let guard = first.gate.lock().unwrap();
-        assert!(matches!(
-            cache.fill_cache_after_lock(&digest),
-            Err(SessionError::InternalError { .. })
-        ));
-        drop(guard);
-        cache.release_download_lock(&digest, &first).unwrap();
-        let waiting_guard = waiting.gate.lock().unwrap();
+        // Reader A starts streaming. Reader B registers and waits behind A.
+        let reader_a = spawn_reader();
+        hold.wait_arrivals(1);
+        registered.recv().unwrap();
+        let reader_b = spawn_reader();
+        registered.recv().unwrap();
 
-        // A third reader joins the waiting cohort instead of creating a concurrent retry lock.
-        let third = cache.acquire_download_lock(&digest).unwrap();
-        assert!(Arc::ptr_eq(&waiting, &third));
-        drop(waiting_guard);
-        cache.release_download_lock(&digest, &waiting).unwrap();
-        cache.release_download_lock(&digest, &third).unwrap();
+        // A's stream reads the failure, so B takes over and starts the second stream. A is
+        // joined before the result changes, so A cannot read the new result.
+        hold.release();
+        assert!(reader_a.join().unwrap().is_err());
+        hold.wait_arrivals(2);
+        store.set_result(
+            digest.clone(),
+            BlobResult::Contents(Bytes::from_static(b"retry")),
+        );
+
+        // Reader C registers while B's stream is held. It must keep waiting and start no
+        // stream of its own; the window bounds how long we watch for that mistake.
+        let reader_c = spawn_reader();
+        registered.recv().unwrap();
+        let deadline = std::time::Instant::now() + NO_STREAM_WINDOW;
+        while store.streams(&digest) < 3 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        hold.release();
+
+        // B downloads the blob, C reads B's admitted entry, and only two streams ever ran.
+        // A third stream would mean a fill overlapped B's.
+        assert_eq!(
+            reader_b.join().unwrap().unwrap(),
+            (Bytes::from_static(b"retry"), true)
+        );
+        assert_eq!(
+            reader_c.join().unwrap().unwrap(),
+            (Bytes::from_static(b"retry"), false)
+        );
+        assert_eq!(store.streams(&digest), 2);
     }
 
     #[test]
@@ -574,40 +573,17 @@ mod tests {
             0
         );
 
-        // A source-preserving remote error also leaves no entry, after which valid bytes retry successfully.
-        *fake_blob_store.failure.lock().unwrap() = Some(CasError::BlobStatus {
-            operation: CasOperation::ByteStreamRead,
-            digest: digest.clone(),
-            message: "test stream failure".to_string(),
-        });
+        // A remote error also leaves no entry, after which valid bytes retry successfully.
+        fake_blob_store.set_result(digest.clone(), BlobResult::Fail);
         assert!(matches!(
             cache.read_blob(&digest),
             Err(SessionError::InternalError { .. })
         ));
         assert!(!cache.path(&digest).exists());
-        fake_blob_store
-            .blobs
-            .lock()
-            .unwrap()
-            .insert(digest.clone(), Bytes::from_static(b"expected"));
+        fake_blob_store.set_result(
+            digest.clone(),
+            BlobResult::Contents(Bytes::from_static(b"expected")),
+        );
         assert!(cache.read_blob(&digest).unwrap().1);
-    }
-
-    #[test]
-    fn no_clobber_admission_preserves_an_existing_entry() {
-        // Set up a pending blob and independently admit the same valid object first.
-        let temp = tempfile::tempdir().unwrap();
-        let digest = Digest::for_bytes(b"same");
-        let (cache, _fake_blob_store, _runtime) =
-            cache(&temp, [(digest.clone(), Bytes::from_static(b"same"))]);
-        let mut pending = cache.start_pending_blob(&digest).unwrap();
-        pending.write_all(b"same").unwrap();
-        let destination = cache.path(&digest);
-        fs::create_dir_all(destination.parent().unwrap()).unwrap();
-        fs::write(&destination, b"same").unwrap();
-
-        // This private admission check is intentional: it verifies the atomic no-clobber invariant.
-        cache.admit_pending_blob(pending).unwrap();
-        assert_eq!(fs::read(&destination).unwrap(), b"same");
     }
 }

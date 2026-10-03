@@ -61,9 +61,9 @@ version-1 state still permits at most one row per parent/name.
 
 ### Integration tests
 
-- Open a session over the remote fixture, look up every node kind, close it,
-  and verify the read-only workflow has stable inode IDs and unchanged remote
-  download behavior.
+- Open a session over the remote fixture, look up every node kind, and verify
+  the read-only workflow has stable inode IDs and unchanged remote download
+  behavior.
 
 ## `SessionStore`
 

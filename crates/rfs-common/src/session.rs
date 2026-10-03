@@ -865,52 +865,20 @@ impl SessionLayout {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::io::Write;
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{Arc, Barrier};
 
-    use async_trait::async_trait;
     use prost_types::Timestamp;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::cas::{Blob, CasError, UploadStats};
     use crate::logging::init_test;
+    use crate::testing::InMemoryBlobStore;
     use crate::tree::{DirectoryBuilder, DirectoryEntry, FileEntry, NodeMetadata};
 
-    /// In-memory backing store used to exercise the public Session boundary.
-    struct FakeBlobStore {
-        blobs: HashMap<Digest, Bytes>,
-        streams: Mutex<u64>,
-    }
-
-    #[async_trait]
-    impl BlobStore for FakeBlobStore {
-        async fn find_missing_blobs(&self, digests: &[Digest]) -> Result<Vec<Digest>, CasError> {
-            Ok(digests
-                .iter()
-                .filter(|digest| !self.blobs.contains_key(*digest))
-                .cloned()
-                .collect())
-        }
-
-        async fn upload_blobs(&self, _blobs: Vec<Blob>) -> Result<UploadStats, CasError> {
-            Ok(UploadStats::default())
-        }
-
-        async fn stream_blob(
-            &self,
-            digest: &Digest,
-            destination: &mut (dyn Write + Send),
-        ) -> Result<(), CasError> {
-            let bytes = self.blobs.get(digest).ok_or_else(|| {
-                CasError::InvalidInstanceName("fake".to_owned(), "missing blob".to_owned())
-            })?;
-            *self.streams.lock().expect("test stream mutex") += 1;
-            destination
-                .write_all(bytes)
-                .expect("test destination is writable");
-            Ok(())
-        }
+    /// Inode 0 is never issued by the kernel, so external inode validation rejects it.
+    #[test]
+    fn inode_zero_is_rejected() {
+        assert!(InodeId::new(0).is_err());
     }
 
     /// Opens a session with one remote file exposed by its root directory.
@@ -943,10 +911,7 @@ mod tests {
             },
             root.digest,
             mountpoint.path(),
-            Box::new(FakeBlobStore {
-                blobs,
-                streams: Mutex::new(0),
-            }),
+            Box::new(InMemoryBlobStore::new(blobs)),
             runtime.handle().clone(),
         )
         .expect("open test session");
@@ -1031,13 +996,10 @@ mod tests {
             },
             root.digest.clone(),
             mountpoint.path(),
-            Box::new(FakeBlobStore {
-                blobs: HashMap::from([
-                    (root.digest, root.bytes),
-                    (child_directory.digest, child_directory.bytes),
-                ]),
-                streams: Mutex::new(0),
-            }),
+            Box::new(InMemoryBlobStore::new([
+                (root.digest, root.bytes),
+                (child_directory.digest, child_directory.bytes),
+            ])),
             runtime.handle().clone(),
         )
         .expect("open session");
@@ -1088,10 +1050,7 @@ mod tests {
                 config.clone(),
                 root.digest.clone(),
                 mountpoint,
-                Box::new(FakeBlobStore {
-                    blobs: HashMap::new(),
-                    streams: Mutex::new(0),
-                }),
+                Box::new(InMemoryBlobStore::default()),
                 runtime.handle().clone(),
             )
         };
@@ -1138,10 +1097,7 @@ mod tests {
                 },
                 root.digest.clone(),
                 mountpoint.path(),
-                Box::new(FakeBlobStore {
-                    blobs: HashMap::from([(root.digest, root.bytes)]),
-                    streams: Mutex::new(0),
-                }),
+                Box::new(InMemoryBlobStore::new([(root.digest, root.bytes)])),
                 runtime.handle().clone(),
             )
             .expect("open empty session"),
@@ -1181,10 +1137,7 @@ mod tests {
             },
             root.clone(),
             mountpoint.path(),
-            Box::new(FakeBlobStore {
-                blobs: HashMap::from([(root, malformed)]),
-                streams: Mutex::new(0),
-            }),
+            Box::new(InMemoryBlobStore::new([(root, malformed)])),
             runtime.handle().clone(),
         )
         .expect("open malformed session");
@@ -1212,10 +1165,10 @@ mod tests {
             },
             root.clone(),
             mountpoint.path(),
-            Box::new(FakeBlobStore {
-                blobs: HashMap::from([(root, Bytes::from_static(b"wrong directory"))]),
-                streams: Mutex::new(0),
-            }),
+            Box::new(InMemoryBlobStore::new([(
+                root,
+                Bytes::from_static(b"wrong directory"),
+            )])),
             runtime.handle().clone(),
         )
         .expect("open mismatched session");
@@ -1256,10 +1209,10 @@ mod tests {
                 },
                 root.digest.clone(),
                 mountpoint.path(),
-                Box::new(FakeBlobStore {
-                    blobs: HashMap::from([(root.digest, root.bytes), (digest, bytes)]),
-                    streams: Mutex::new(0),
-                }),
+                Box::new(InMemoryBlobStore::new([
+                    (root.digest, root.bytes),
+                    (digest, bytes),
+                ])),
                 runtime.handle().clone(),
             )
             .expect("open shared session"),

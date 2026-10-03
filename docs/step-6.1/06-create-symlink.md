@@ -61,8 +61,9 @@ No schema change.
 - Expect exact target, target byte length, metadata, and stable inode ID from
   create and later lookup.
 - Expect no standalone CAS request or overlay identity.
-- Invalid names, duplicate names, and closed sessions fail without a visible
-  child.
+- Invalid and duplicate names fail without a visible child; assert the
+  category and unchanged lookup and listing only.
+- Add a create-symlink row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 

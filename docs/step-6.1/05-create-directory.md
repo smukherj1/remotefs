@@ -56,13 +56,16 @@ No schema change after 6.1.4.
 - Create below the remote root and list the returned inode; expect an empty
   result without a CAS request.
 - Expect exact metadata and immediate visibility in the parent's sorted list.
-- Duplicate, wrong-parent-kind, and closed-session failures change nothing.
+- Duplicate and wrong-parent-kind failures assert only the category and that
+  lookup and listing results are unchanged; failure atomicity is a
+  `SessionStore` test.
+- Add a create-directory row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 
-- Create nested local directories, interleave lookups and listings, close the
-  session, and verify retained inspection succeeds without changing database
-  or overlay bytes.
+- Create nested local directories and interleave lookups and listings.
+  Retained inspection is covered once by
+  `info_control_endpoint_and_inspect_are_read_only`.
 
 ## `SessionStore`
 

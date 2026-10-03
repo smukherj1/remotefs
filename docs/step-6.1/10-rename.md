@@ -76,10 +76,11 @@ No schema change.
   either path.
 - Reject moving a directory below itself or a descendant with
   `InvalidArgument` and an unchanged complete tree.
-- Closed-session rename returns `FailedPreconditionError`.
+- Add a rename row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 
+- These three workflows are the single end-to-end `Session` check for Step 6.1.
 - Run the complete Step 6.1 workflow: materialize remote directories; create
   every local kind; update metadata; unlink; remove an empty directory; and
   rename across directories. Re-read every affected inode and directory and

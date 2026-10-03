@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{self, SyncSender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use bytes::Bytes;
 use fuser::{
     BackgroundSession, FileAttr, FileType, Filesystem, KernelConfig, MountOption, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -83,6 +84,78 @@ impl FuseAdapter {
         let inode = InodeId::new(inode).map_err(|_| EINVAL)?;
         self.filesystem.getattr(inode).map_err(errno_for_error)
     }
+
+    /// Returns every readdir entry from `offset` onward as `(inode, next_offset, kind, name)`.
+    ///
+    /// Entry 0 is `.`, entry 1 is `..`, followed by the children in basename order. An
+    /// entry's `next_offset` is its index plus one, so the kernel resumes after it.
+    /// Fails with `EINVAL` for a negative offset or invalid inode, `ENOTDIR` for a
+    /// non-directory, and the mapped filesystem errno otherwise.
+    fn directory_entries(
+        &self,
+        inode: u64,
+        offset: i64,
+    ) -> Result<Vec<(u64, i64, FileType, String)>, i32> {
+        if offset < 0 {
+            return Err(EINVAL);
+        }
+        let node = self.node(inode)?;
+        if node.kind != NodeKind::Directory {
+            return Err(ENOTDIR);
+        }
+        let children = self
+            .filesystem
+            .readdir(node.inode)
+            .map_err(errno_for_error)?;
+        let entries = [
+            (inode, FileType::Directory, ".".to_owned()),
+            (node.parent.get(), FileType::Directory, "..".to_owned()),
+        ]
+        .into_iter()
+        .chain(
+            children
+                .into_iter()
+                .map(|child| (child.inode.get(), file_type(child.kind), child.name)),
+        );
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        Ok(entries
+            .enumerate()
+            .skip(start)
+            .map(|(index, (entry_inode, kind, name))| {
+                let next_offset = i64::try_from(index + 1).unwrap_or(i64::MAX);
+                (entry_inode, next_offset, kind, name)
+            })
+            .collect())
+    }
+
+    /// Admits only read-only opens of regular files.
+    ///
+    /// Write, append, and truncate flags fail with `EROFS` before the inode is looked
+    /// up. A directory fails with `EISDIR`, a symlink with `EINVAL`, and lookup
+    /// failures with their mapped errno.
+    fn open_file(&self, inode: u64, flags: i32) -> Result<(), i32> {
+        if flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & (libc::O_APPEND | libc::O_TRUNC) != 0
+        {
+            return Err(EROFS);
+        }
+        let node = self.node(inode)?;
+        match node.kind {
+            NodeKind::File => Ok(()),
+            NodeKind::Directory => Err(EISDIR),
+            NodeKind::Symlink => Err(EINVAL),
+        }
+    }
+
+    /// Reads up to `size` bytes at `offset`; a negative offset or invalid inode is `EINVAL`.
+    fn read_bytes(&self, inode: u64, offset: i64, size: u32) -> Result<Bytes, i32> {
+        let offset = u64::try_from(offset).map_err(|_| EINVAL)?;
+        let inode = InodeId::new(inode).map_err(|_| EINVAL)?;
+        let size = usize::try_from(size).expect("u32 read size fits usize on supported targets");
+        self.filesystem
+            .read(inode, offset, size)
+            .map_err(errno_for_error)
+    }
 }
 
 impl Filesystem for FuseAdapter {
@@ -115,48 +188,15 @@ impl Filesystem for FuseAdapter {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        if offset < 0 {
-            reply.error(EINVAL);
-            return;
-        }
-        let node = match self.node(inode) {
-            Ok(node) if node.kind == NodeKind::Directory => node,
-            Ok(_) => {
-                reply.error(ENOTDIR);
-                return;
-            }
+        let entries = match self.directory_entries(inode, offset) {
+            Ok(entries) => entries,
             Err(errno) => {
                 reply.error(errno);
                 return;
             }
         };
-        let inode_id = match InodeId::new(inode) {
-            Ok(inode) => inode,
-            Err(_) => {
-                reply.error(EINVAL);
-                return;
-            }
-        };
-        let children = match self.filesystem.readdir(inode_id) {
-            Ok(children) => children,
-            Err(error) => {
-                reply.error(errno_for_error(error));
-                return;
-            }
-        };
-        let entries = [
-            (inode, FileType::Directory, ".".to_owned()),
-            (node.parent.get(), FileType::Directory, "..".to_owned()),
-        ]
-        .into_iter()
-        .chain(
-            children
-                .into_iter()
-                .map(|child| (child.inode.get(), file_type(child.kind), child.name)),
-        );
-        let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        for (index, (entry_inode, kind, name)) in entries.enumerate().skip(start) {
-            let next_offset = i64::try_from(index + 1).unwrap_or(i64::MAX);
+        for (entry_inode, next_offset, kind, name) in entries {
+            // A full reply buffer stops the listing; the kernel resumes from the last offset.
             if reply.add(entry_inode, next_offset, kind, name) {
                 break;
             }
@@ -165,16 +205,8 @@ impl Filesystem for FuseAdapter {
     }
 
     fn open(&mut self, _request: &Request<'_>, inode: u64, flags: i32, reply: ReplyOpen) {
-        if flags & libc::O_ACCMODE != libc::O_RDONLY
-            || flags & (libc::O_APPEND | libc::O_TRUNC) != 0
-        {
-            reply.error(EROFS);
-            return;
-        }
-        match self.node(inode) {
-            Ok(node) if node.kind == NodeKind::File => reply.opened(0, 0),
-            Ok(node) if node.kind == NodeKind::Directory => reply.error(EISDIR),
-            Ok(_) => reply.error(EINVAL),
+        match self.open_file(inode, flags) {
+            Ok(()) => reply.opened(0, 0),
             Err(errno) => reply.error(errno),
         }
     }
@@ -190,24 +222,9 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let offset = match u64::try_from(offset) {
-            Ok(offset) => offset,
-            Err(_) => {
-                reply.error(EINVAL);
-                return;
-            }
-        };
-        let inode = match InodeId::new(inode) {
-            Ok(inode) => inode,
-            Err(_) => {
-                reply.error(EINVAL);
-                return;
-            }
-        };
-        let size = usize::try_from(size).expect("u32 read size fits usize on supported targets");
-        match self.filesystem.read(inode, offset, size) {
+        match self.read_bytes(inode, offset, size) {
             Ok(bytes) => reply.data(&bytes),
-            Err(error) => reply.error(errno_for_error(error)),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -415,6 +432,10 @@ fn errno_for_error(error: FilesystemError) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::ffi::OsStrExt;
+
+    use crate::filesystem::test_support::{FILE_CONTENTS, fixture_store, service};
+
     use super::*;
 
     #[test]
@@ -436,10 +457,135 @@ mod tests {
         assert_eq!(attr.mtime, UNIX_EPOCH + Duration::new(123, 456));
     }
 
-    /// Inode 0 is never issued by the kernel; the adapter maps its `InodeId::new`
-    /// rejection to EINVAL, so construction must fail.
+    /// Builds an adapter over the fixture; the returned guards keep the session alive.
+    fn adapter() -> (
+        FuseAdapter,
+        std::sync::Arc<rfs_common::session::Session>,
+        impl Sized,
+    ) {
+        let (store, root) = fixture_store();
+        let (temp, runtime, session, service) = service(store, root);
+        let adapter = FuseAdapter {
+            filesystem: Arc::new(service),
+            ready: None,
+        };
+        (adapter, session, (temp, runtime))
+    }
+
+    /// Returns the raw inode of `name` under the root.
+    fn raw_child(adapter: &FuseAdapter, name: &str) -> u64 {
+        adapter
+            .lookup_node(InodeId::ROOT.get(), OsStr::new(name))
+            .unwrap()
+            .inode
+            .get()
+    }
+
     #[test]
-    fn inode_zero_is_rejected() {
-        assert!(InodeId::new(0).is_err());
+    fn readdir_lists_dot_entries_then_children_and_resumes_from_offset() {
+        // Open the fixture: root holds `dir`, `file.txt`, `link`; `dir` is empty.
+        let (adapter, _session, _guards) = adapter();
+        let root = InodeId::ROOT.get();
+        let dir = raw_child(&adapter, "dir");
+
+        // From offset 0 the root lists `.`, `..`, then children in name order with kinds.
+        let entries = adapter.directory_entries(root, 0).unwrap();
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|(_, _, kind, name)| (name.as_str(), *kind))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (".", FileType::Directory),
+                ("..", FileType::Directory),
+                ("dir", FileType::Directory),
+                ("file.txt", FileType::RegularFile),
+                ("link", FileType::Symlink),
+            ]
+        );
+        assert_eq!((entries[0].0, entries[1].0), (root, root));
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.1, i64::try_from(index + 1).unwrap());
+        }
+
+        // A subdirectory's `..` is its parent, and `.` is itself.
+        let nested = adapter.directory_entries(dir, 0).unwrap();
+        assert_eq!((nested[0].0, nested[1].0), (dir, root));
+        assert_eq!(nested.len(), 2);
+
+        // Resuming from each next offset yields exactly the remaining suffix.
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(
+                adapter.directory_entries(root, entry.1).unwrap(),
+                entries[index + 1..]
+            );
+        }
+
+        // An offset past the end lists nothing.
+        assert!(adapter.directory_entries(root, 99).unwrap().is_empty());
+
+        // Invalid requests fail: negative offset is EINVAL, a file is ENOTDIR.
+        assert_eq!(adapter.directory_entries(root, -1).unwrap_err(), EINVAL);
+        let file = raw_child(&adapter, "file.txt");
+        assert_eq!(adapter.directory_entries(file, 0).unwrap_err(), ENOTDIR);
+    }
+
+    #[test]
+    fn open_admits_only_read_only_file_opens() {
+        // Open the fixture and pick a file, a directory, a symlink, and a missing inode.
+        let (adapter, _session, _guards) = adapter();
+        let file = raw_child(&adapter, "file.txt");
+        let dir = raw_child(&adapter, "dir");
+        let link = raw_child(&adapter, "link");
+        let missing = 9999;
+
+        // Each row is (inode, flags, expected result); write-style flags fail before lookup.
+        let rows = [
+            (file, libc::O_RDONLY, Ok(())),
+            (file, libc::O_WRONLY, Err(EROFS)),
+            (file, libc::O_RDWR, Err(EROFS)),
+            (file, libc::O_RDONLY | libc::O_APPEND, Err(EROFS)),
+            (file, libc::O_RDONLY | libc::O_TRUNC, Err(EROFS)),
+            (missing, libc::O_WRONLY, Err(EROFS)),
+            (dir, libc::O_RDONLY, Err(EISDIR)),
+            (link, libc::O_RDONLY, Err(EINVAL)),
+            (missing, libc::O_RDONLY, Err(ENOENT)),
+        ];
+        for (inode, flags, expected) in rows {
+            assert_eq!(
+                adapter.open_file(inode, flags),
+                expected,
+                "inode {inode} flags {flags:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn inode_and_offset_arguments_are_validated_before_the_service() {
+        // Open the fixture; inode 0 and negative offsets never reach the service.
+        let (adapter, session, _guards) = adapter();
+        let file = raw_child(&adapter, "file.txt");
+
+        // Invalid arguments fail with EINVAL; a non-UTF-8 name is simply not found.
+        assert_eq!(adapter.node(0).unwrap_err(), EINVAL);
+        assert_eq!(adapter.directory_entries(0, 0).unwrap_err(), EINVAL);
+        assert_eq!(adapter.read_bytes(0, 0, 1).unwrap_err(), EINVAL);
+        assert_eq!(adapter.read_bytes(file, -1, 1).unwrap_err(), EINVAL);
+        let bad_name = OsStr::from_bytes(&[0xff, 0xfe]);
+        assert_eq!(
+            adapter
+                .lookup_node(InodeId::ROOT.get(), bad_name)
+                .unwrap_err(),
+            ENOENT
+        );
+
+        // A valid read succeeds, and a service failure after close reaches the kernel as EIO.
+        assert_eq!(
+            adapter.read_bytes(file, 0, 5).unwrap().as_ref(),
+            &FILE_CONTENTS[..5]
+        );
+        session.close().unwrap();
+        assert_eq!(adapter.node(InodeId::ROOT.get()).unwrap_err(), EIO);
     }
 }

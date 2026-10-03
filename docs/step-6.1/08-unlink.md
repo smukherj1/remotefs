@@ -59,13 +59,12 @@ No schema change.
 - Unlink a local file and expect its overlay bytes still readable through its
   retained identity at the store/overlay layers.
 - Reject missing names and directories without observable changes.
-- Closed-session unlink returns `FailedPreconditionError`.
+- Add an unlink row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 
 - Unlink a remote file, create a new local file at the same name, and expect
-  only the new inode in lookup and listing with a different inode ID. Close and
-  inspect without mutating the retained files.
+  only the new inode in lookup and listing with a different inode ID.
 
 ## `SessionStore`
 

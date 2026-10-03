@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 #[test]
@@ -40,9 +40,12 @@ fn workspace_dependencies<'a>(
     packages: &'a BTreeMap<&str, Vec<&str>>,
     package: &str,
 ) -> Vec<&'a str> {
-    packages[package]
+    // A crate may list the same package as a normal and a dev-dependency (for example, to
+    // enable a test-only feature), so collapse duplicates.
+    let unique: BTreeSet<_> = packages[package]
         .iter()
         .copied()
         .filter(|dependency| packages.contains_key(dependency))
-        .collect()
+        .collect();
+    unique.into_iter().collect()
 }

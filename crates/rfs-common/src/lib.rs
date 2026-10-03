@@ -12,6 +12,9 @@ pub mod session;
 pub mod tree;
 pub mod upload;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
+
 #[cfg(test)]
 pub(crate) mod test_env {
     use std::sync::{Mutex, MutexGuard, OnceLock};

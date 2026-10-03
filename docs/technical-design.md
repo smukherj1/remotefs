@@ -447,7 +447,7 @@ The first read:
 
 Partial/range serving before full verification is out of scope for MVP.
 
-Verified cache entries are trusted by default after admission; the client does not re-hash every cached blob on read or daemon startup. A future explicit cache verification command may re-check cached content. Concurrent cache fills use per-digest in-process locks and atomic rename; duplicate downloads across separate daemon processes are tolerated in the MVP. Cached blob files are opened per FUSE `open` and the file descriptor is kept only for that FUSE file handle lifetime. A global cached-file-handle pool is deferred.
+Verified cache entries are trusted by default after admission; the client does not re-hash every cached blob on read or daemon startup. A future explicit cache verification command may re-check cached content. Concurrent cache fills within the daemon use per-digest locks and atomic rename. Only one daemon uses an `RFS_HOME` at a time, so the cache has no cross-process coordination. Cached blob files are opened per FUSE `open` and the file descriptor is kept only for that FUSE file handle lifetime. A global cached-file-handle pool is deferred.
 
 ## Overlay Model
 

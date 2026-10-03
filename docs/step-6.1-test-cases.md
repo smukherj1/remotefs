@@ -10,7 +10,7 @@ specification.
 
 | Order | Test specification | Primary coverage |
 | --- | --- | --- |
-| 6.1.1 | [Existing session error mapping](step-6.1/01-existing-error-mapping.md#unit-tests) | Existing session-to-filesystem mappings and FUSE errno preservation. |
+| 6.1.1 | [Existing session error mapping](step-6.1/01-existing-error-mapping.md#unit-tests) | Existing session-to-filesystem mappings and preserved FUSE callback policy. |
 | 6.1.2 | [Visible child lookup](step-6.1/02-visible-child-lookup.md#unit-tests) | Visible-row selection by parent and name. |
 | 6.1.3 | [Visible directory listing](step-6.1/03-visible-directory-listing.md#unit-tests) | Tombstone filtering and stable basename order. |
 | 6.1.4 | [Create an empty file](step-6.1/04-create-file.md#unit-tests) | Schema version 2, dirty propagation, overlay publication, file creation, and orphan discovery. |
@@ -30,10 +30,24 @@ future `Session` method.
 - Use a fake `BlobStore` whose remote tree has a regular file, a non-empty
   directory, an empty directory, and a symlink. Give every file and directory a
   distinct digest and record every requested digest.
-- A component unit test calls only that component's API. `SessionStore` tests
-  do not use raw SQLite connections, private row decoders, or transaction
-  helpers. `OverlayStore` tests use `OverlayFileId`, not constructed paths
-  beneath `data/`.
+- A component unit test calls only that component's API. Private setup may
+  arrange corrupt or otherwise unreachable state (for example
+  `seed_directory_state` and `inode_reads_validate_persisted_values`), but the
+  operation under test and the assertions go through the component API.
+  `OverlayStore` tests use `OverlayFileId`, not constructed paths beneath
+  `data/`.
+- Each layer owns its behavior and does not re-test another layer's. See
+  [simplifications-3.md](simplifications-3.md) for the ownership table:
+  `CachedBlobStore` owns fills and verification; `SessionStore` owns
+  atomicity, inode allocation, visibility, and dirty ancestors; `Session` owns
+  lazy loading, overlay publication, merged reads, lifecycle checks, and
+  counters; `FilesystemService` owns error mapping and service policy; the FUSE
+  adapter owns kernel-facing callback policy; real-CAS/FUSE suites own
+  interoperability only.
+- One table-driven `Session` test,
+  `mutations_after_close_fail_with_failed_precondition`, covers every mutation
+  on a closed session. Each mini-design adds one row for its method instead of
+  its own closed-session case.
 - After a failed mutation, read the same state again through component APIs and
   verify that no partial inode, tombstone, digest, or dirty-state change is
   visible.

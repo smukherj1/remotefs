@@ -99,16 +99,18 @@ No schema change.
 
 ### Unit tests
 
-- Construct every existing variant and a nested `Context`; pass each through
-  the filesystem conversion and assert its exact filesystem category.
+- A compact table of `(SessionError, expected category)` rows, one per
+  variant except `Database`, checked with `matches!`; plus one nested
+  `Context { operation, source: NotFound }` case that keeps the operation and
+  the original reason.
 - Exercise an existing closed-session call and assert
   `FailedPreconditionError`, not an opaque wrapper.
 
 ### Integration tests
 
-- Through `FilesystemService`, trigger existing not-found, wrong-kind,
-  closed-session, and fake-CAS/internal failures and verify that each category
-  survives the real `Session` boundary.
+- `FilesystemService` unit tests over an in-memory session cover not-found,
+  wrong-kind, closed-session, and failing-store cases. The real-CAS suite
+  keeps only the read workflow.
 
 ## `FilesystemService`
 
@@ -117,6 +119,10 @@ No schema change.
 - `FilesystemError::Session` is removed.
 - Existing session failures map exhaustively to identically named filesystem
   variants; `Context` maps its nested source recursively.
+- `SessionError::Database` maps to `FilesystemError::InternalError` whose
+  `reason` is the session error's display text (SQLite operation, database
+  path, and message). No filesystem `Database` variant exists, so SQLite types
+  do not reach the filesystem boundary.
 - `InvalidInode`, `InvalidArgument`, and filesystem `Context` remain
   filesystem-owned. `InvalidArgument` is not yet a session mapping.
 - Dependencies remain `Session`, session domain types, `Bytes`, and error
@@ -155,11 +161,6 @@ pub enum FilesystemError {
         /// Directory supplied to a regular-file operation.
         reason: String,
     },
-    /// A session database operation failed; maps to `EIO`.
-    Database {
-        /// Preserved `SessionError::Database` source.
-        source: SessionError,
-    },
     // ... filesystem-only variants unchanged ...
     /// Adds an operation and delegates errno selection to `source`.
     Context {
@@ -195,9 +196,10 @@ No schema change.
 
 ### Unit tests
 
-- The exhaustive `From<SessionError>` test must require an explicit match-arm
-  update whenever the session enum changes.
-- Preserve the original SQLite source inside `FilesystemError::Database`.
+- The compiler already forces the `From<SessionError>` match to be exhaustive,
+  so the test does not repeat it. A new session variant adds one table row.
+- `SessionError::Database` becomes `InternalError`; its `reason` carries the
+  session error's display text.
 
 ### Integration tests
 
@@ -208,7 +210,8 @@ No schema change.
 
 ### Changed behavior and dependencies
 
-- Map `InternalError`, `FailedPreconditionError`, and `Database` to `EIO`.
+- Map `InternalError` (including converted session database failures) and
+  `FailedPreconditionError` to `EIO`.
 - Continue mapping `NotFound`, `NotDirectory`, and `IsDirectory` to `ENOENT`,
   `ENOTDIR`, and `EISDIR`.
 - `Context` delegates to its nested error. No callback changes.
@@ -228,8 +231,9 @@ No schema change.
 
 ### Unit tests
 
-- Assert the documented errno for every filesystem variant available at this
-  point, including nested `Context`.
+- Test callback policy, not the errno table: readdir offsets and `.`/`..`,
+  open flags, and argument validation, through private `FuseAdapter` methods
+  that return `Result<T, i32>`. Errno arms are exercised as a side effect.
 
 ### Integration tests
 

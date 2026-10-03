@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
+[features]
+# Exposes shared test doubles in `rfs_common::testing` to dependent crates' tests.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

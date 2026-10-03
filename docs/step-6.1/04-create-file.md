@@ -89,10 +89,10 @@ impl Session {
 - Create below an unloaded remote root; expect one parent materialization, a
   zero-size regular-file inode with exact metadata, and stable lookup/listing.
 - Read the returned inode and receive empty bytes without a file CAS request.
-- Race two creates for one name; expect one success, one `AlreadyExists`, and
-  one visible inode.
-- Close a session before creation; expect `FailedPreconditionError` and no
-  visible name or published referenced file.
+- Create the same name twice in sequence; expect `AlreadyExists` for the
+  second call and one visible inode. The concurrent race is a `SessionStore`
+  test.
+- Add a create row to `mutations_after_close_fail_with_failed_precondition`.
 
 ### Integration tests
 
@@ -244,7 +244,8 @@ enforce:
 - An unloaded dirty ancestor rejects creation atomically.
 - Two visible rows are rejected without consuming observable inode state.
 - `referenced_overlay_files` returns every referenced local file identity.
-- Concurrent creates serialize complete transactions and allocate unique IDs.
+- Concurrent creates of one name serialize complete transactions: one
+  succeeds, one gets `AlreadyExists`, and IDs are unique.
 
 ### Integration tests
 
@@ -387,8 +388,8 @@ No schema change.
 
 ### Unit tests
 
-- Assert exact conversion for both new session variants, including when nested
-  in `Context`.
+- Add one table row per new variant (`AlreadyExists`, `InvalidArgument`); no
+  per-variant `Context` case.
 
 ### Integration tests
 
@@ -419,8 +420,9 @@ No schema change.
 
 ### Unit tests
 
-- Assert `EEXIST` for direct and context-wrapped `AlreadyExists` and retain the
-  existing `EINVAL` assertion for `InvalidArgument`.
+- No unit test for the `EEXIST` arm; it is exercised once writable callbacks
+  land in Step 6.3. The existing `EINVAL` behavior stays covered by the
+  callback-policy tests.
 
 ### Integration tests
 
